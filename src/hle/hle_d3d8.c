@@ -764,6 +764,10 @@ static uint32_t g_shadow_vs;             /* guest handle last selected */
 static int      g_shadow_vs_is_program;  /* bit 0 set: a shader object */
 static int      g_shadow_vs_kind;        /* its kind, or -1 if never created */
 static int      g_shadow_vs_slot = -1;   /* its g_programs entry, or -1 */
+/* The program address SelectVertexShader named with it (SHADOW_PROGRAM_SLOTS
+ * for SetVertexShader), so a later LoadVertexShaderProgram into that address
+ * can replace the running program as it does on the NV2A. */
+static uint32_t g_shadow_vs_address = 0xFFFFFFFFu;
 
 /* The guest object of the vertex program selected now, its declaration at +20;
  * 0 under an FVF. For hle_d3d8_vertex.c's draws from title-pushed arrays. */
@@ -803,6 +807,7 @@ static int shadow_program_find(uint32_t guest)
 static DWORD g_slot_host[SHADOW_PROGRAM_SLOTS];
 static int   g_slot_loaded[SHADOW_PROGRAM_SLOTS];
 static unsigned long g_slot_reloads;   /* loads answered from the program cache */
+static unsigned long g_slot_rebinds;   /* loads that replaced the selected program */
 
 /* Host programs by microcode. A title on this API rotates a few programs
  * through the same slots -- TimeSplitters 2 puts three different programs
@@ -865,6 +870,7 @@ static void shadow_select_vertex_shader(uint32_t handle, uint32_t address)
 
     hle_d3d8_push_arrays_off();
     g_shadow_vs = handle;
+    g_shadow_vs_address = address;
     g_shadow_vs_is_program = (handle & 1) != 0;
     if (!g_shadow_vs_is_program) {
         g_shadow_vs_kind = -1;
@@ -2171,7 +2177,8 @@ static void frame_end_shadow(void)
             hle_d3d8_interp_report();
             if (g_slot_reloads)
                 fprintf(stderr, "[HLE-D3D8] shadow vertex programs: %lu loads answered from "
-                        "the %d cached host programs\n", g_slot_reloads, g_slot_program_count);
+                        "the %d cached host programs; %lu replaced the selected program\n",
+                        g_slot_reloads, g_slot_program_count, g_slot_rebinds);
             if (g_target_sets)
                 fprintf(stderr, "[HLE-D3D8] shadow render targets: %lu set, %lu to a "
                         "scratch target, %lu failed\n", g_target_sets,
@@ -2856,6 +2863,25 @@ HLE_EXPORT(D3DDevice_LoadVertexShaderProgram)
             host_vsh_delete_shader(g_slot_host[address]);
         g_slot_loaded[address] = SUCCEEDED(hr);
         g_slot_host[address] = SUCCEEDED(hr) ? host : 0;
+        /* The NV2A runs whatever sits at the address the selection named, so
+         * a program loaded there after SelectVertexShader replaces the running
+         * one at once, under the declaration already selected. TimeSplitters:
+         * Future Perfect selects a vertex format at slot 0 and then loads
+         * each mesh's program there, selecting again only when the format
+         * changes; bound only at selection, those meshes were drawn with the
+         * previous mesh's program -- skinned hands and soldiers with a rigid
+         * program (the hands floated in front of the guns), rigid meshes with
+         * a skinning program reading bone indices their format lacks. */
+        if (SUCCEEDED(hr) && address == g_shadow_vs_address && g_shadow_vs_slot >= 0 &&
+            g_programs[g_shadow_vs_slot].from_slot &&
+            g_programs[g_shadow_vs_slot].host != host) {
+            g_programs[g_shadow_vs_slot].host = host;
+            g_programs[g_shadow_vs_slot].kind = SHADER_HOST_PROGRAM;
+            g_shadow_vs_kind = SHADER_HOST_PROGRAM;
+            shadow_read_declaration(g_shadow_vs_slot, g_shadow_vs);
+            host_SetVertexShader(g_shadow, host);
+            g_slot_rebinds++;
+        }
         if (!valid || !slot_program_cached(host) || g_slot_programs[g_slot_program_count - 1].host == host) {
             /* a new program, or one that could not be made: worth a line */
             if (logged < 64 && !(valid && hr == S_OK && g_slot_reloads && slot_program_cached(host) &&
