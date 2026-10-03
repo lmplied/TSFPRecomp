@@ -100,6 +100,7 @@ typedef struct Stream {
     uint32_t iface;                  /* IDirectSoundStream the title holds */
     uint32_t object;                 /* CDirectSoundStream, bound at first use */
     uint32_t tag, channels, rate, bits, align;
+    uint32_t freq;                   /* SetFrequency: playback rate, 0 = the format's */
     uint32_t max_packets;
     uint32_t callback, context;      /* LPFNXMEDIAOBJECTCALLBACK, its context */
     int      output;                 /* the host can play this format */
@@ -184,9 +185,14 @@ static uint32_t slot_of(const Stream *s) { return SLOT_BASE + (uint32_t)(s - g_s
 /* Decoded bytes per second and per frame. Output is 16-bit for ADPCM. */
 static uint32_t out_bits(const Stream *s) { return s->tag == TAG_ADPCM ? 16u : s->bits; }
 static uint32_t frame_bytes(const Stream *s) { return s->channels * out_bits(s) / 8u; }
+/* The rate the samples are played at: the format's, unless SetFrequency set
+ * another. The clock and the host voice both run on this one, so a stream
+ * the title pitches up or down also completes its packets faster or slower,
+ * as the console's would. */
+static uint32_t play_rate(const Stream *s) { return s->freq ? s->freq : s->rate; }
 static uint64_t bytes_per_ms_x1000(const Stream *s)
 {
-    return (uint64_t)s->rate * frame_bytes(s);      /* bytes per second */
+    return (uint64_t)play_rate(s) * frame_bytes(s);  /* bytes per second */
 }
 static uint64_t ms_to_bytes(const Stream *s, uint64_t ms)
 {
@@ -437,7 +443,7 @@ static void pump(Stream *s, uint64_t now)
           * normal -- the lead is deliberately more than one chunk -- and
           * stepping over the refusal would delete that sound from the stream
           * and leave everything after it late by its length. */
-        if (!recomp_audio_output_submit(slot_of(s), pcm, bytes, s->rate, s->channels,
+        if (!recomp_audio_output_submit(slot_of(s), pcm, bytes, play_rate(s), s->channels,
                                         out_bits(s), s->volume))
             break;
         s->sent += bytes;
@@ -493,6 +499,73 @@ void hle_dsound_stream_tick(uint64_t now)
     unlock();
 }
 
+/* The WAVEFORMATEX at `wfx` into the stream's format fields, and whether the
+ * host can play it. */
+static void read_format(Stream *s, uint32_t wfx)
+{
+    s->tag      = HLE_MEM32(wfx) & 0xFFFFu;
+    s->channels = HLE_MEM32(wfx) >> 16;
+    s->rate     = HLE_MEM32(wfx + 4u);
+    s->align    = HLE_MEM32(wfx + 12u) & 0xFFFFu;
+    s->bits     = HLE_MEM32(wfx + 12u) >> 16;
+    s->output   = s->channels >= 1u && s->channels <= 2u &&
+                  s->rate >= 1000u && s->rate <= 200000u &&
+                  ((s->tag == TAG_PCM && (s->bits == 8u || s->bits == 16u)) ||
+                   (s->tag == TAG_ADPCM && s->bits == 4u));
+}
+
+/* The stream changes how its bytes play: settle the clock in the old terms,
+ * drop what the host voice holds (it plays the old rate), and lay what is
+ * still queued out again from the consumed position in the new terms. The
+ * timeline is decoded bytes, so a packet's span depends on the format; a
+ * change of rate alone leaves the spans and moves only the clock. */
+static void relayout(Stream *s, uint64_t now, uint32_t new_freq, uint32_t wfx)
+{
+    uint64_t c, pos;
+    int i;
+
+    complete_passed(s, now);
+    c = consumed(s, now);
+    recomp_audio_output_reset_voice(slot_of(s));
+    if (wfx)
+        read_format(s, wfx);
+    s->freq = new_freq;
+    pos = c;
+    for (i = 0; i < s->count; i++) {
+        Packet *p = &s->packets[(s->head + i) % MAX_PACKETS];
+        if (wfx) {
+            p->start = pos;
+            p->end   = pos + decoded_size(s, p->size);
+        }
+        pos = p->end;
+    }
+    if (wfx || pos > s->queued)
+        s->queued = pos;
+    s->consumed_base = c;
+    s->sent          = c;
+    s->play_origin   = c;
+    s->play_anchored = 0;
+    s->resumed_ms    = (!s->paused && s->count > 0) ? now : 0u;
+    pump(s, now);
+}
+
+static void note_format(const Stream *s, const char *what, uint32_t old_tag,
+                        uint32_t old_ch, uint32_t old_rate, uint32_t old_freq)
+{
+    static unsigned long n, next = 1;
+    if (++n > 24 && n < next)
+        return;
+    if (n > 24)
+        next *= 2;
+    else if (n == 24)
+        next = 32;
+    fprintf(stderr, "[DSOUND] stream %08X: %s #%lu: %04X %u ch %u Hz (play %u) -> "
+            "%04X %u ch %u Hz (play %u), %d queued\n", s->iface, what, n, old_tag,
+            old_ch, old_rate, old_freq ? old_freq : old_rate, s->tag, s->channels,
+            s->rate, play_rate(s), s->count);
+    fflush(stderr);
+}
+
 /* Record a stream the title just created, from its DSSTREAMDESC:
  *   +0 dwFlags  +4 dwMaxAttachedPackets  +8 lpwfxFormat  +C lpMixBins
  *   +10 lpfnCallback  +14 lpvContext
@@ -527,18 +600,10 @@ static void record_stream(uint32_t iface, uint32_t desc)
     }
     memset(s, 0, sizeof *s);
     s->iface       = iface;
-    s->tag         = HLE_MEM32(wfx) & 0xFFFFu;
-    s->channels    = HLE_MEM32(wfx) >> 16;
-    s->rate        = HLE_MEM32(wfx + 4u);
-    s->align       = HLE_MEM32(wfx + 12u) & 0xFFFFu;
-    s->bits        = HLE_MEM32(wfx + 12u) >> 16;
+    read_format(s, wfx);
     s->max_packets = max_packets && max_packets < MAX_PACKETS ? max_packets : MAX_PACKETS;
     s->callback    = callback;
     s->context     = context;
-    s->output = s->channels >= 1u && s->channels <= 2u &&
-                s->rate >= 1000u && s->rate <= 200000u &&
-                ((s->tag == TAG_PCM && (s->bits == 8u || s->bits == 16u)) ||
-                 (s->tag == TAG_ADPCM && s->bits == 4u));
     if (said < 8) {
         said++;
         fprintf(stderr, "[DSOUND] stream %08X: tag %04X %u ch %u Hz %u bit align %u, "
@@ -552,6 +617,8 @@ static void record_stream(uint32_t iface, uint32_t desc)
 HLE_ORIGINAL(DirectSoundCreateStream);
 HLE_ORIGINAL(CDirectSound_CreateSoundStream);
 HLE_ORIGINAL(CDirectSoundStream_SetVolume);
+HLE_ORIGINAL(CDirectSoundStream_SetFormat);
+HLE_ORIGINAL(CDirectSoundStream_SetFrequency);
 
 /* HRESULT DirectSoundCreateStream(LPCDSSTREAMDESC pdssd,
  *     LPDIRECTSOUNDSTREAM *ppStream) */
@@ -780,4 +847,71 @@ HLE_EXPORT(CDirectSoundStream_SetVolume)
         return;
     }
     HLE_RETURN(DS_OK);
+}
+
+/* HRESULT CDirectSoundStream::SetFormat(this, LPCWAVEFORMATEX pwfx), `ret 8`.
+ *
+ * A stream's format is not fixed at creation. TimeSplitters: Future Perfect
+ * creates its streams as 44100 Hz Xbox ADPCM and, each time one starts a
+ * sound (sub_000299C0), builds the WAVEFORMATEX for that sound -- its own rate
+ * and channel count -- and sets it here. The model kept the creation format,
+ * so every sound recorded at a lower rate played on the host at 44100 Hz, too
+ * fast and too high, and its packets completed early by the same ratio.
+ *
+ * The XDK's own body runs first (its voice and its pitch follow the new rate:
+ * CDirectSoundVoice_SetFormat recomputes the pitch from nSamplesPerSec), then
+ * the model takes the new format, with any SetFrequency override dropped for
+ * the same reason. */
+HLE_EXPORT(CDirectSoundStream_SetFormat)
+{
+    uint32_t object = HLE_ARG(0), wfx = HLE_ARG(1);
+    uint64_t now = now_ms();
+    Stream *s;
+
+    if (hle_original_CDirectSoundStream_SetFormat)
+        HLE_CALL_ORIGINAL(CDirectSoundStream_SetFormat);
+    else
+        g_eax = DS_OK;
+    if ((int32_t)g_eax < 0 || !wfx || !guest_readable(wfx, 16u))
+        return;
+    lock();
+    s = find_by_object(object);
+    if (s) {
+        uint32_t tag = HLE_MEM32(wfx) & 0xFFFFu, ch = HLE_MEM32(wfx) >> 16;
+        uint32_t rate = HLE_MEM32(wfx + 4u), bits = HLE_MEM32(wfx + 12u) >> 16;
+        if (tag != s->tag || ch != s->channels || rate != s->rate || bits != s->bits ||
+            s->freq) {
+            uint32_t ot = s->tag, oc = s->channels, orate = s->rate, of = s->freq;
+            relayout(s, now, 0u, wfx);
+            note_format(s, "SetFormat", ot, oc, orate, of);
+        }
+    }
+    unlock();
+}
+
+/* HRESULT CDirectSoundStream::SetFrequency(this, DWORD dwFrequency), `ret 8`.
+ * The rate the stream's samples play at; 0 (DSBFREQUENCY_ORIGINAL) goes back
+ * to the format's. Pitch and speed together, as on the console. */
+HLE_EXPORT(CDirectSoundStream_SetFrequency)
+{
+    uint32_t object = HLE_ARG(0), freq = HLE_ARG(1);
+    uint64_t now = now_ms();
+    Stream *s;
+
+    if (hle_original_CDirectSoundStream_SetFrequency)
+        HLE_CALL_ORIGINAL(CDirectSoundStream_SetFrequency);
+    else
+        g_eax = DS_OK;
+    if ((int32_t)g_eax < 0)
+        return;
+    if (freq && freq < 1000u) freq = 1000u;          /* the host's range */
+    if (freq > 200000u) freq = 200000u;
+    lock();
+    s = find_by_object(object);
+    if (s && freq != s->freq && !(freq == s->rate && s->freq == 0u)) {
+        uint32_t of = s->freq;
+        relayout(s, now, freq == s->rate ? 0u : freq, 0u);
+        note_format(s, "SetFrequency", s->tag, s->channels, s->rate, of);
+    }
+    unlock();
 }
