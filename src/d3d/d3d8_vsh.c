@@ -605,18 +605,38 @@ static void emit_ilu_op(StrBuf *sb, const NV2AVshInstruction *inst)
         break;
 
     case NV2A_VSH_ILU_EXP:
-        /* dst = exp2(C.x).xxxx */
-        sb_append(&expr, "exp2(");
+        /* The NV2A's EXP is D3D's expp, four results at once:
+         *   dst = (2^floor(C.x), C.x - floor(C.x), 2^C.x, 1)
+         * (xemu vsh-prog.c _EXP; Cxbx-Reloaded x_expp). A program that reads
+         * .y gets the fraction: TimeSplitters: Future Perfect's particle
+         * program wraps its rotation angle into [0,1) that way before a
+         * sine/cosine series, and with 2^x there the series ran at angles up
+         * to ~15 radians and its sprites came out as screen-sized sheets. */
+        sb_append(&expr, "float4(exp2(floor(");
         emit_source(&expr, &inst->ilu_src, 1);
-        sb_append(&expr, ").xxxx");
+        sb_append(&expr, ")), ");
+        emit_source(&expr, &inst->ilu_src, 1);
+        sb_append(&expr, " - floor(");
+        emit_source(&expr, &inst->ilu_src, 1);
+        sb_append(&expr, "), exp2(");
+        emit_source(&expr, &inst->ilu_src, 1);
+        sb_append(&expr, "), 1.0)");
         break;
 
     case NV2A_VSH_ILU_LOG: {
-        /* dst = log2(abs(C.x)).xxxx
-         * Guard against log2(0) which is -inf on NV2A -> clamp to large negative */
-        sb_append(&expr, "log2(max(abs(");
+        /* D3D's logp, four results at once (xemu vsh-prog.c _LOG):
+         *   dst = (floor(log2|C.x|), |C.x| / 2^floor(log2|C.x|), log2|C.x|, 1)
+         * log2(0) is -inf on the NV2A; |C.x| is held at the smallest normal
+         * float instead, as before. */
+        sb_append(&expr, "float4(floor(log2(max(abs(");
         emit_source(&expr, &inst->ilu_src, 1);
-        sb_append(&expr, "), 1.175494e-38)).xxxx");
+        sb_append(&expr, "), 1.175494e-38))), max(abs(");
+        emit_source(&expr, &inst->ilu_src, 1);
+        sb_append(&expr, "), 1.175494e-38) / exp2(floor(log2(max(abs(");
+        emit_source(&expr, &inst->ilu_src, 1);
+        sb_append(&expr, "), 1.175494e-38)))), log2(max(abs(");
+        emit_source(&expr, &inst->ilu_src, 1);
+        sb_append(&expr, "), 1.175494e-38)), 1.0)");
         break;
     }
 

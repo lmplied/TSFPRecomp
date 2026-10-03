@@ -601,12 +601,31 @@ static int vsh_do_ilu(NV2AVshIluOp op, const float c[4], float r[4])
         vsh_splat(r, m == 0.0f ? FLT_MAX : 1.0f / sqrtf(m));
         break;
     }
-    case NV2A_VSH_ILU_EXP:
-        vsh_splat(r, powf(2.0f, x));
+    case NV2A_VSH_ILU_EXP: {
+        /* D3D's expp: (2^floor(x), x - floor(x), 2^x, 1), as d3d8_vsh.c
+         * emits it (xemu vsh-prog.c _EXP). */
+        float f = floorf(x);
+        r[0] = powf(2.0f, f);
+        r[1] = x - f;
+        r[2] = powf(2.0f, x);
+        r[3] = 1.0f;
         break;
+    }
     case NV2A_VSH_ILU_LOG: {
+        /* D3D's logp: (exponent, mantissa, log2|x|, 1) (xemu vsh-prog.c
+         * _LOG); log2(0) stays -FLT_MAX, with the mantissa 1 as xemu has it. */
         float m = x < 0.0f ? -x : x;
-        vsh_splat(r, m == 0.0f ? -FLT_MAX : log2f(m));
+        if (m == 0.0f) {
+            r[0] = -FLT_MAX;
+            r[1] = 1.0f;
+            r[2] = -FLT_MAX;
+        } else {
+            float e = floorf(log2f(m));
+            r[0] = e;
+            r[1] = m / powf(2.0f, e);
+            r[2] = log2f(m);
+        }
+        r[3] = 1.0f;
         break;
     }
     case NV2A_VSH_ILU_LIT: {

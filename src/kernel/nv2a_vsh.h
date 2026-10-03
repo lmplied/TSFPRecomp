@@ -73,8 +73,8 @@ typedef enum NV2AVshIluOp {
     NV2A_VSH_ILU_RCP = 2,   /* dst = 1.0 / C.x (scalar, replicated) */
     NV2A_VSH_ILU_RCC = 3,   /* dst = clamp(1.0/C.x, 5.42101e-20, 1.8446744e+19) */
     NV2A_VSH_ILU_RSQ = 4,   /* dst = 1.0 / sqrt(abs(C.x)) */
-    NV2A_VSH_ILU_EXP = 5,   /* dst = exp2(C.x) */
-    NV2A_VSH_ILU_LOG = 6,   /* dst = log2(abs(C.x)) */
+    NV2A_VSH_ILU_EXP = 5,   /* dst = (2^floor(C.x), frac(C.x), 2^C.x, 1): expp */
+    NV2A_VSH_ILU_LOG = 6,   /* dst = (exponent, mantissa, log2|C.x|, 1): logp */
     NV2A_VSH_ILU_LIT = 7,   /* dst = lighting helper */
     NV2A_VSH_ILU_COUNT = 8,
 } NV2AVshIluOp;
