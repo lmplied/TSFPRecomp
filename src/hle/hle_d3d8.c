@@ -2202,6 +2202,21 @@ HLE_EXPORT(D3DDevice_Swap)
 {
     static int seen;
 
+    /* D3DSWAP_FINISH (4) without D3DSWAP_COPY (1) or D3DSWAP_BYPASSCOPY (2)
+     * only finishes the frame: the XDK's Swap (Flags 0 means 5) counts a new
+     * frame only when one of the low two bits is set. TimeSplitters: Future
+     * Perfect's pause and game-over screens call Swap(2) and then Swap(4)
+     * with nothing drawn between; presented, gated to a vblank and counted
+     * as a frame of its own, that second call put an empty frame between
+     * every two of the title's -- the screen behind those menus flickered
+     * black at 30 Hz. The title's own body still runs. */
+    if (HLE_ARG(0) != 0 && !(HLE_ARG(0) & 3u)) {
+        first_call(&seen, "D3DDevice_Swap", HLE_ARG(0));
+        if (original_missing(hle_original_D3DDevice_Swap, "D3DDevice_Swap"))
+            HLE_RETURN(0x80004005u);
+        HLE_CALL_ORIGINAL(D3DDevice_Swap);
+        return;
+    }
     /* Counted before anything else here runs, so RECOMP_FPS means the same
      * thing whatever is switched on below. */
     xbox_FpsCountSwap();
