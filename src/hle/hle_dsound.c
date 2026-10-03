@@ -43,6 +43,7 @@
  * (critical sections, GetTickCount64) elsewhere. */
 #include "platform/xbox_winnt.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "hle.h"
@@ -83,6 +84,12 @@ typedef struct Buffer {
     uint32_t paused_flags;
     RecompDsoundBufferModel model;        /* what the game is told */
     RecompDsoundBufferModel output_model; /* what has been sent */
+    /* Latency bookkeeping: when the sound was started (QPC microseconds,
+     * 0 = nothing awaited), and whether the host voice has been fed since
+     * it was last reset (a dry voice after that is an underrun). */
+    uint64_t play_us;
+    int      fed;
+    int32_t  level;              /* the volume last sent, hundredths of a dB */
 } Buffer;
 
 static Buffer g_buffers[SLOTS];
@@ -103,6 +110,65 @@ static void lock(void)
 }
 
 static void unlock(void) { LeaveCriticalSection(&g_lock); }
+
+/* ── The clock and the lead ────────────────────────────────────────
+ *
+ * The output model used to submit exactly what the host clock had consumed
+ * since the last pump: a sound started by Play reached the host only at the
+ * next pump at least 10 ms later, with nothing queued behind it, and every
+ * later chunk arrived as the one before it ran out. On the GetTickCount64
+ * clock (15.6 ms steps) and a title that calls DirectSoundDoWork once a frame
+ * (Future Perfect: 60 a second), each pump fed ~16 ms of sound just in time,
+ * so the voice ran dry whenever a pump came late, and every dry spell pushed
+ * the rest of the sound later still.
+ *
+ * Now the output model runs LEAD milliseconds ahead of the game's model, on
+ * a millisecond performance-counter clock, and Play feeds the host at once:
+ * the sound starts within XAudio2's own latency and the queue always holds
+ * the lead. What the title sees (status, cursor) is the game model, as
+ * before. RECOMP_DSOUND_LEAD_MS sets the lead (default 40); 0 restores the
+ * old behaviour exactly (tick clock, no lead), for comparison. */
+static uint32_t g_lead_ms = 0xFFFFFFFFu;
+
+static uint32_t lead_ms(void)
+{
+    if (g_lead_ms == 0xFFFFFFFFu) {
+        const char *v = getenv("RECOMP_DSOUND_LEAD_MS");
+        g_lead_ms = 40u;
+        if (v && *v) {
+            long ms = strtol(v, NULL, 10);
+            g_lead_ms = ms < 0 ? 0u : ms > 90 ? 90u : (uint32_t)ms;
+        }
+        fprintf(stderr, "[DSOUND] buffers: output %u ms ahead of the clock%s\n",
+                g_lead_ms, g_lead_ms ? " (performance counter)"
+                                     : " -- the old just-in-time feed (tick clock)");
+        fflush(stderr);
+    }
+    return g_lead_ms;
+}
+
+static uint64_t qpc_us(void)
+{
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER t;
+    if (!freq.QuadPart)
+        QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t);
+    return (uint64_t)((double)t.QuadPart * 1000000.0 / (double)freq.QuadPart);
+}
+
+static uint64_t now_ms(void)
+{
+    return lead_ms() ? qpc_us() / 1000u : GetTickCount64();
+}
+
+/* What the buffers did since start, for the five-second line. */
+static struct {
+    uint64_t plays, first_sent, first_us_sum, first_us_max;
+    uint64_t submits, underruns, resets;
+    uint64_t freq_calls, freq_same, freq_changed, freq_changed_playing;
+    uint64_t commits_3d, commits_original;
+} g_stat;
 
 /* Buffer settings: [iface] = [object + 0x1C]. Voice settings: [object + 0x10],
  * i.e. [iface - 0x0C]. */
@@ -142,22 +208,218 @@ static uint32_t setting(uint32_t iface, uint32_t offset)
 
 static uint32_t slot_of(const Buffer *b) { return (uint32_t)(b - g_buffers); }
 
+/* Drop what the host voice holds; the next submission starts a new one. */
+static void reset_output(Buffer *b)
+{
+    recomp_audio_output_reset_voice(slot_of(b));
+    b->fed = 0;
+    g_stat.resets++;
+}
+
 static void retire(Buffer *b)
 {
     recomp_audio_output_reset_voice(slot_of(b));
     memset(b, 0, sizeof *b);
 }
 
-/* Send the samples the output clock has consumed since the last pump. */
+/* ── Mix bins and 3D ──────────────────────────────────────────────
+ *
+ * A voice is heard at its volume plus what its mix bins and, for a 3D voice,
+ * its 3D state add (recomp_dsound_mix_adjust). On the console both reach the
+ * sound only through the chip: CMcpxVoiceClient_SetVolume works the voice's
+ * per-bin hardware volumes out of the settings object and the 3D data block,
+ * and CMcpxVoiceClient_Commit3dSettings computes that block -- but only for a
+ * voice that is running on the chip ((client+0x12 & 3) == 3), and none is
+ * here, since IDirectSoundBuffer_Play is replaced. So every 3D sound played
+ * at its plain volume wherever it was: Future Perfect's effects were all as
+ * loud near as far (play-test 3).
+ *
+ * Commit3dSettings is replaced below to compute the block for a 3D voice
+ * anyway, by the XDK's own CDirectSound3DCalculator, and the level is read
+ * at every submission. Both read the voice layout of the XDK they were
+ * written against (5849, Future Perfect): the replacement acts, and the
+ * level includes the mix bins, only when the title's own code for these
+ * functions is that code byte for byte (call displacements aside), checked
+ * once. Any other title keeps the old behaviour exactly. */
+HLE_IMPORT_VAR(CMcpxVoiceClient_Commit3dSettings_0);
+HLE_IMPORT_VAR(CMcpxVoiceClient_SetVolume);
+HLE_IMPORT_VAR(CDirectSoundVoice_SetVolume);
+HLE_IMPORT_VAR(CDirectSoundStream_SetVolume);
+HLE_IMPORT_VAR(CDirectSound3DCalculator_Calculate3D);
+HLE_IMPORT_VAR(CDirectSound3DCalculator_GetVoiceData);
+
+/* CMcpxVoiceClient_Commit3dSettings_0: client+0x12 & 3 == 3, then
+ * Calculate3D(listener = [[client+8]+0xC]+0x30, params = [settings+0xB4]) and
+ * GetVoiceData(listener, params, [[client+8]+0xC]+0x80, params+0x7C,
+ * [settings+0xB8]), settings = [client+0x70]; then the change flags cleared
+ * and the chip programmed. */
+static const char k_commit_code[] =
+    "558bec51568bf18d4dfce8........8a461224033c0375628b4670ffb0b40000008b4608"
+    "8b400c83c03050e8........8b4670ffb0b80000008b90b40000008b4e088b490c8d427c"
+    "508d8180000000505283c13051e8........8b46708b80b40000008320008b46708b80b4"
+    "00000083607c008bcee8........";
+/* CMcpxVoiceClient_SetVolume's first 38 bytes: the call at +0x21 is the
+ * helper that computes the per-bin hardware volumes. */
+static const char k_setvol_code[] =
+    "558bec83ec2c8365fc00568bf18d4df8e8........f646120174708d45d4508bcee8........";
+/* That helper up to its per-bin store: the 3D sums over the data block at
+ * [settings+0xB8] (when settings+0xB bit 0 is set), the mix bins at
+ * settings+0x24 (count), +0x28 (bins), +0x30 (volumes by bin), the volume at
+ * +0x1C, and which sum each bin takes. recomp_dsound_mix_adjust mirrors it. */
+static const char k_helper_code[] =
+    "558bec83ec4c8365dc00538b597083bbb8000000005657894dd40f84cc000000f6430b01"
+    "0f84c20000008bc38b80b80000008b7808037804b8f0d8ffff3bf8897df07d048bf8eb06"
+    "85ff7e0533ff897df08b51708b92b80000008b721c03721403720c03f73bf08975f47d05"
+    "8945f4eb0885f67e048365f4008b51708bb2b80000008b561c03561003d73bd08955f87d"
+    "058945f8eb0885d27e048365f8008b51708b92b80000008b721c03721803720c03f73bf0"
+    "8975ec7d058945eceb0885f67e048365ec008b93b80000008b522003d73bd08955fc7d05"
+    "8945fceb0885d27e048365fc00c745dc010000000fb679648b432433d2f7f733f685ff89"
+    "75e48945e00f863d010000bfff0f000033db8bc60faf45e0895de88945d8eb038b45d83b"
+    "d80f82240100008d46010faf45e03bd80f83150100008b51700fb6441a288b4482300342"
+    "1c8d749db4f7d8837ddc00890674368a5c132880fb02742880fb05761e80fb07761480fb"
+    "09760a80fb0a750f2b45fceb122b45f8eb0d2b45f4eb082b45f0eb032b45ec8906";
+/* CDirectSoundVoice_SetVolume: settings = [voice+0x10], volume at +0x1C is
+ * the argument less the headroom at +0x20, client = [voice+0xC]. */
+static const char k_voice_setvol_code[] =
+    "8b4c24048b41108b5424082b502089501c8b490ce8........";
+/* CDirectSoundStream_SetVolume at +0x28: the stream's voice is stream+4. */
+static const char k_stream_setvol_code[] = "8b44240857ff74241083c00450e8........";
+
+static int hex_digit(char c)
+{
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+}
+
+/* 1 when the guest code at `va` is `pattern` (hex pairs, ".." = any byte). */
+static int code_matches(uint32_t va, const char *pattern)
+{
+    uint32_t n = (uint32_t)(strlen(pattern) / 2u), i;
+
+    if (!va || !guest_readable(va, n))
+        return 0;
+    for (i = 0; i < n; i++) {
+        const char *p = pattern + 2u * i;
+        if (p[0] == '.')
+            continue;
+        if (((const volatile uint8_t *)HLE_PTR(va))[i] !=
+            (uint8_t)(hex_digit(p[0]) << 4 | hex_digit(p[1])))
+            return 0;
+    }
+    return 1;
+}
+
+static uint32_t call_target(uint32_t call_va)
+{
+    return call_va + 5u + HLE_MEM32(call_va + 1u);
+}
+
+static int g_layout = -1;          /* the voice layout above: 1 yes, 0 no */
+static int g_stream_layout = -1;   /* and streams' voice at +4 */
+
+static int voice_layout(void)
+{
+    if (g_layout < 0) {
+        uint32_t commit = hle_var_CMcpxVoiceClient_Commit3dSettings_0;
+        uint32_t setvol = hle_var_CMcpxVoiceClient_SetVolume, helper = 0u;
+        const char *why = NULL;
+
+        if (!commit || !setvol || !hle_var_CDirectSoundVoice_SetVolume ||
+            !hle_var_CDirectSound3DCalculator_Calculate3D ||
+            !hle_var_CDirectSound3DCalculator_GetVoiceData)
+            why = "one of the functions is not in this title";
+        else if (!code_matches(commit, k_commit_code) ||
+                 call_target(commit + 0x2Bu) != hle_var_CDirectSound3DCalculator_Calculate3D ||
+                 call_target(commit + 0x55u) != hle_var_CDirectSound3DCalculator_GetVoiceData)
+            why = "Commit3dSettings is other code";
+        else if (!code_matches(setvol, k_setvol_code) ||
+                 !code_matches(helper = call_target(setvol + 0x21u), k_helper_code))
+            why = "the volume helper is other code";
+        else if (!code_matches(hle_var_CDirectSoundVoice_SetVolume, k_voice_setvol_code))
+            why = "CDirectSoundVoice_SetVolume is other code";
+        g_layout = why == NULL;
+        if (why)
+            fprintf(stderr, "[DSOUND] 3D voices: not the XDK 5849 voice layout (%s); "
+                            "mix bins and 3D settings are not applied\n", why);
+        else
+            fprintf(stderr, "[DSOUND] 3D voices: XDK 5849 voice layout (Commit3dSettings "
+                            "0x%08X, volume helper 0x%08X): 3D attenuation and mix-bin "
+                            "volumes reach the host\n", commit, helper);
+        fflush(stderr);
+    }
+    return g_layout;
+}
+
+static int stream_voice_layout(void)
+{
+    if (g_stream_layout < 0)
+        g_stream_layout = voice_layout() &&
+            code_matches(hle_var_CDirectSoundStream_SetVolume + 0x28u, k_stream_setvol_code);
+    return g_stream_layout;
+}
+
+/* What the voice whose settings object is `settings` adds to its volume for
+ * its mix bins and 3D state; 0 outside the checked layout. `is3d`, when
+ * given, says whether its 3D data counted. */
+static int32_t voice_adjust(uint32_t settings, int *is3d)
+{
+    uint8_t bins[8];
+    int32_t volumes[32], data3d[9];
+    uint32_t count, vd;
+    int use3d = 0;
+
+    if (is3d)
+        *is3d = 0;
+    if (!voice_layout() || !guest_readable(settings, 0xBCu))
+        return 0;
+    count = HLE_MEM32(settings + 0x24u);
+    if (count == 0u || count > 8u)
+        return 0;
+    memcpy(bins, HLE_PTR(settings + 0x28u), sizeof bins);
+    memcpy(volumes, HLE_PTR(settings + 0x30u), sizeof volumes);
+    vd = HLE_MEM32(settings + 0xB8u);
+    if (vd && (((const volatile uint8_t *)HLE_PTR(settings))[0x0B] & 1u) &&
+        guest_readable(vd, sizeof data3d)) {
+        memcpy(data3d, HLE_PTR(vd), sizeof data3d);
+        use3d = 1;
+    }
+    if (is3d)
+        *is3d = use3d;
+    return recomp_dsound_mix_adjust(bins, count, volumes, use3d ? data3d : NULL);
+}
+
+/* A stream's adjustment, for hle_dsound_stream.c: its voice is stream+4,
+ * whose settings object is at voice+0x10. */
+int32_t hle_dsound_stream_adjust(uint32_t stream_object, int *is3d)
+{
+    if (is3d)
+        *is3d = 0;
+    if (!stream_voice_layout() || !guest_readable(stream_object + 0x14u, 4u))
+        return 0;
+    return voice_adjust(HLE_MEM32(stream_object + 0x14u), is3d);
+}
+
+/* The level a buffer is heard at: its volume (the settings word the XDK's
+ * SetVolume keeps, headroom applied) plus its mix bins and 3D state. */
+static int32_t buffer_level(const Buffer *b, int *is3d)
+{
+    int32_t volume = (int32_t)setting(b->iface, SET_VOLUME);
+    uint32_t settings = guest_readable(b->iface - 0x0Cu, 4u) ? HLE_MEM32(b->iface - 0x0Cu) : 0u;
+
+    return volume + (settings ? voice_adjust(settings, is3d) : 0);
+}
+
+/* Send what the output clock has consumed since the last pump: up to the
+ * lead ahead of the game's clock (see lead_ms). */
 static void pump(Buffer *b, uint64_t now)
 {
     RecompDsoundBufferModel *out = &b->output_model;
-    uint32_t channels, bits, offset = 0u, bytes;
-    int adpcm;
+    uint32_t channels, bits, offset = 0u, bytes, queued = 0u;
+    uint64_t until = now + lead_ms();
+    int adpcm, is3d;
     static uint8_t pcm[80000];
 
-    if (!b->output || !out->playing || now <= out->last_ms ||
-        now - out->last_ms < 10u)
+    if (!b->output || !out->playing || until <= out->last_ms ||
+        until - out->last_ms < 10u)
         return;
     if (b->data != setting(b->iface, SET_DATA) ||
         b->size != setting(b->iface, SET_SIZE) ||
@@ -168,7 +430,7 @@ static void pump(Buffer *b, uint64_t now)
     channels = (b->format >> 16) & 0xFFu;
     bits = b->format >> 24;
     adpcm = (b->format & 0xFFFFu) == TAG_ADPCM;
-    bytes = recomp_dsound_buffer_consume(out, now, &offset);
+    bytes = recomp_dsound_buffer_consume(out, until, &offset);
     if (bytes == 0u || b->data == 0u || bytes > sizeof pcm)
         return;
 
@@ -185,7 +447,7 @@ static void pump(Buffer *b, uint64_t now)
                     (const uint8_t *)HLE_PTR(b->data + offset / decoded_bytes * block_bytes),
                     block_bytes, channels, decoded, XBOX_ADPCM_BLOCK_SAMPLES * 2u)) {
                 b->output = 0;          /* bad data: keep the clock, stop the sound */
-                recomp_audio_output_reset_voice(slot_of(b));
+                reset_output(b);
                 return;
             }
             memcpy(pcm + written, (uint8_t *)decoded + within, count);
@@ -205,9 +467,71 @@ static void pump(Buffer *b, uint64_t now)
             if (offset == out->size_bytes) offset = out->loop_start_bytes;
         }
     }
-    recomp_audio_output_submit(slot_of(b), pcm, bytes, out->sample_rate,
-                               channels, bits,
-                               (int32_t)setting(b->iface, SET_VOLUME));
+    /* A voice that was fed and now holds nothing ran dry: an underrun, a gap
+     * that makes the rest of the sound late. */
+    if (b->fed && recomp_audio_output_position(slot_of(b), NULL, &queued) && queued == 0u)
+        g_stat.underruns++;
+    b->level = buffer_level(b, &is3d);
+    if (!recomp_audio_output_submit(slot_of(b), pcm, bytes, out->sample_rate,
+                                    channels, bits, b->level))
+        return;
+    b->fed = 1;
+    g_stat.submits++;
+    if (b->play_us) {
+        /* The first sound of a Play: how long after the call it was sent. */
+        static unsigned said, said3d;
+        uint64_t us = qpc_us() - b->play_us;
+        uint32_t frame = channels * (bits / 8u);
+        g_stat.first_sent++;
+        g_stat.first_us_sum += us;
+        if (us > g_stat.first_us_max)
+            g_stat.first_us_max = us;
+        b->play_us = 0;
+        {
+            uint32_t settings = HLE_MEM32(b->iface - 0x0Cu);
+            /* In full: the first 40 and then powers of two, and the first
+             * 16 3D voices and 6 others with their mix bins and 3D data. */
+            int detail = is3d ? said3d < 16u : said < 6u;
+            if (said < 40u || (said & (said - 1u)) == 0u || detail)
+                fprintf(stderr, "[DSOUND] play #%llu slot %u: first sound sent %.1f ms after "
+                        "Play (%u ms of it), %u Hz, level %d (volume %d, %s %d)\n",
+                        (unsigned long long)g_stat.plays, slot_of(b), (double)us / 1000.0,
+                        frame && out->sample_rate ? bytes / frame * 1000u / out->sample_rate : 0u,
+                        out->sample_rate, b->level, (int32_t)setting(b->iface, SET_VOLUME),
+                        is3d ? "3D + mix bins" : "mix bins",
+                        b->level - (int32_t)setting(b->iface, SET_VOLUME));
+            if (detail && guest_readable(settings, 0xBCu)) {
+                uint32_t k, n = HLE_MEM32(settings + 0x24u);
+                if (is3d)
+                    said3d++;
+                fprintf(stderr, "[DSOUND]   flags %08X, %u mix bins:", HLE_MEM32(settings + 8u), n);
+                for (k = 0; k < n && k < 8u; k++) {
+                    uint32_t bin = ((const volatile uint8_t *)HLE_PTR(settings + 0x28u))[k];
+                    fprintf(stderr, " %u@%d", bin, bin < 32u ?
+                            (int32_t)HLE_MEM32(settings + 0x30u + 4u * bin) : 0);
+                }
+                if (is3d) {
+                    uint32_t params = HLE_MEM32(settings + 0xB4u), vd = HLE_MEM32(settings + 0xB8u);
+                    if (guest_readable(params, 0xA4u) && guest_readable(vd, 0x38u)) {
+                        float dist, mn, mx;
+                        memcpy(&dist, HLE_PTR(params + 0x68u), 4);
+                        memcpy(&mn, HLE_PTR(params + 0x38u), 4);
+                        memcpy(&mx, HLE_PTR(params + 0x3Cu), 4);
+                        fprintf(stderr, "; 3D mode %u, distance %.2f (min %.2f max %.2f), "
+                                "data %d %d %d %d %d %d %d %d",
+                                HLE_MEM32(params + 0x40u), (double)dist, (double)mn, (double)mx,
+                                (int32_t)HLE_MEM32(vd + 4u), (int32_t)HLE_MEM32(vd + 8u),
+                                (int32_t)HLE_MEM32(vd + 0xCu), (int32_t)HLE_MEM32(vd + 0x10u),
+                                (int32_t)HLE_MEM32(vd + 0x14u), (int32_t)HLE_MEM32(vd + 0x18u),
+                                (int32_t)HLE_MEM32(vd + 0x1Cu), (int32_t)HLE_MEM32(vd + 0x20u));
+                    }
+                }
+                fprintf(stderr, "\n");
+            }
+            fflush(stderr);
+        }
+        said++;
+    }
 }
 
 static Buffer *find(uint32_t iface)
@@ -300,7 +624,7 @@ static Buffer *model_for_known(Buffer *known, uint32_t iface, uint64_t now)
         if (b->model.loop_start_bytes != decoded_loop) {
             pump(b, now);
             recomp_dsound_buffer_cursor(&b->model, now);
-            recomp_audio_output_reset_voice(slot_of(b));
+            reset_output(b);
             b->model.loop_start_bytes = decoded_loop;
             b->output_model = b->model;
         }
@@ -338,18 +662,20 @@ static Buffer *model_for(uint32_t iface, uint64_t now)
     return model_for_known(NULL, iface, now);
 }
 
-static uint64_t now_ms(void) { return GetTickCount64(); }
-
 /* After a control change, restart the output from the model unless this is a
- * Play that simply continues a sound already playing. */
-static void resync_output(Buffer *b, int continuing)
+ * Play that simply continues a sound already playing -- and feed the host at
+ * once, so a sound starts within the host's own latency rather than at the
+ * next pump. */
+static void resync_output(Buffer *b, int continuing, uint64_t now)
 {
     if (!continuing)
-        recomp_audio_output_reset_voice(slot_of(b));
+        reset_output(b);
     if (continuing)
         b->output_model.play_flags = b->model.play_flags;
     else
         b->output_model = b->model;
+    if (b->model.playing && lead_ms())
+        pump(b, now);
 }
 
 /* HRESULT IDirectSoundBuffer_Play(this, reserved1, reserved2, flags) */
@@ -505,7 +831,11 @@ HLE_EXPORT(IDirectSoundBuffer_Play)
     result = recomp_dsound_buffer_play(&b->model, flags, now);
     if (result == RECOMP_DSOUND_OK) {
         b->paused = 0;
-        resync_output(b, continuing);
+        if (!continuing && b->output) {
+            g_stat.plays++;
+            b->play_us = qpc_us();   /* the first submission reports the delay */
+        }
+        resync_output(b, continuing, now);
     }
     unlock();
     HLE_RETURN(result);
@@ -522,7 +852,7 @@ static void stop(uint32_t iface)
         pump(b, now);
         recomp_dsound_buffer_stop(&b->model, now);
         b->paused = 0;
-        resync_output(b, 0);
+        resync_output(b, 0, now);
     }
     unlock();
 }
@@ -577,13 +907,13 @@ static uint32_t pause_buffer(uint32_t iface, uint32_t how)
                 b->paused = 0;
                 if (recomp_dsound_buffer_play(&b->model, b->paused_flags, now)
                         == RECOMP_DSOUND_OK)
-                    resync_output(b, 0);
+                    resync_output(b, 0, now);
             }
         } else if (b->model.playing) {
             b->paused = 1;
             b->paused_flags = b->model.play_flags & RECOMP_DSOUND_PLAY_LOOPING;
             recomp_dsound_buffer_stop(&b->model, now);
-            resync_output(b, 0);
+            resync_output(b, 0, now);
         }
     }
     unlock();
@@ -681,7 +1011,7 @@ HLE_EXPORT(IDirectSoundBuffer_SetCurrentPosition)
         if (result == RECOMP_DSOUND_OK)
             result = recomp_dsound_buffer_set_position(&b->model, position, now);
         if (result == RECOMP_DSOUND_OK)
-            resync_output(b, 0);
+            resync_output(b, 0, now);
     }
     unlock();
     HLE_RETURN(result);
@@ -698,10 +1028,28 @@ HLE_EXPORT(IDirectSoundBuffer_SetFrequency)
     lock();
     b = model_for(iface, now);
     if (b) {
-        pump(b, now);
-        result = recomp_dsound_buffer_set_frequency(&b->model, frequency, now);
-        if (result == RECOMP_DSOUND_OK)
-            resync_output(b, 0);
+        /* The rate it already plays at changes nothing. Future Perfect sets
+         * the frequency of its sounds over and over (sub_000274A0, 45,324
+         * calls in the user's 52-minute session against 5,111 Plays), and
+         * each call used to drop the host voice and start it again from the
+         * model, with an empty queue: a gap and a late restart every time. */
+        uint32_t want = frequency ? frequency : b->model.original_sample_rate;
+        int same = want == b->model.sample_rate;
+        g_stat.freq_calls++;
+        if (same)
+            g_stat.freq_same++;
+        if (!same || !lead_ms()) {     /* lead 0: the old behaviour, for comparison */
+            pump(b, now);
+            result = recomp_dsound_buffer_set_frequency(&b->model, frequency, now);
+            if (result == RECOMP_DSOUND_OK) {
+                if (!same) {
+                    g_stat.freq_changed++;
+                    if (b->model.playing)
+                        g_stat.freq_changed_playing++;
+                }
+                resync_output(b, 0, now);
+            }
+        }
     }
     unlock();
     HLE_RETURN(result);
@@ -850,6 +1198,73 @@ HLE_EXPORT(IDirectSoundBuffer_SetBufferData)
     HLE_RETURN(RECOMP_DSOUND_OK);
 }
 
+/* Every five seconds while buffers play: what the output did, so latency and
+ * levels can be read from a (muted) run's log rather than by ear. */
+static void report(uint64_t now)
+{
+    static uint64_t last;
+    RecompAudioEngineStats es;
+    uint32_t i, playing = 0, shown = 0;
+    char voices3d[512];
+    size_t used = 0;
+
+    if (now - last < 5000u)
+        return;
+    last = now;
+    if (!g_stat.plays && !g_stat.submits)
+        return;
+    voices3d[0] = '\0';
+    for (i = 0; i < SLOTS; i++) {
+        Buffer *b = &g_buffers[i];
+        int is3d = 0;
+        int32_t level;
+        uint32_t settings, params;
+        float dist = 0.0f;
+
+        if (!b->iface || !b->model.playing)
+            continue;
+        playing++;
+        level = buffer_level(b, &is3d);
+        if (!is3d || shown >= 6u || used >= sizeof voices3d - 80u)
+            continue;
+        settings = HLE_MEM32(b->iface - 0x0Cu);
+        params = guest_readable(settings + 0xB4u, 4u) ? HLE_MEM32(settings + 0xB4u) : 0u;
+        if (params && guest_readable(params + 0x68u, 4u))
+            memcpy(&dist, HLE_PTR(params + 0x68u), 4);
+        used += (size_t)snprintf(voices3d + used, sizeof voices3d - used,
+                                 " slot %u level %d (volume %d) at %.1f;", i, level,
+                                 (int32_t)setting(b->iface, SET_VOLUME), (double)dist);
+        shown++;
+    }
+    recomp_audio_output_engine_stats(&es);
+    fprintf(stderr, "[DSOUND] buffers: %llu plays, first sound sent %.1f ms after Play on "
+            "average (worst %.1f); %llu submissions, %llu underruns; SetFrequency %llu "
+            "(%llu at the same rate, %llu changes, %llu of them while playing); %llu voice "
+            "resets; 3D commits %llu (XDK's own %llu); %u playing\n",
+            (unsigned long long)g_stat.plays,
+            g_stat.first_sent ? (double)g_stat.first_us_sum / 1000.0 / (double)g_stat.first_sent : 0.0,
+            (double)g_stat.first_us_max / 1000.0,
+            (unsigned long long)g_stat.submits, (unsigned long long)g_stat.underruns,
+            (unsigned long long)g_stat.freq_calls, (unsigned long long)g_stat.freq_same,
+            (unsigned long long)g_stat.freq_changed,
+            (unsigned long long)g_stat.freq_changed_playing,
+            (unsigned long long)g_stat.resets, (unsigned long long)g_stat.commits_3d,
+            (unsigned long long)g_stat.commits_original, playing);
+    fprintf(stderr, "[DSOUND] host: latency %.1f ms, %u glitches, %u of %u voices active; "
+            "voices created %llu (%.2f ms each, worst %.2f), destroyed %llu (%.2f ms each, "
+            "worst %.2f)\n",
+            es.sample_rate ? (double)es.latency_samples * 1000.0 / es.sample_rate : 0.0,
+            es.glitches, es.active_voices, es.total_voices,
+            (unsigned long long)es.voices_created,
+            es.voices_created ? es.create_ms_total / (double)es.voices_created : 0.0,
+            es.create_ms_max, (unsigned long long)es.voices_destroyed,
+            es.voices_destroyed ? es.destroy_ms_total / (double)es.voices_destroyed : 0.0,
+            es.destroy_ms_max);
+    if (shown)
+        fprintf(stderr, "[DSOUND] 3D buffers playing:%s\n", voices3d);
+    fflush(stderr);
+}
+
 /* void DirectSoundDoWork(void) -- the title's regular audio tick. The game's
  * own version services the emulated chip's deferred commands, which the
  * replaced buffers no longer need; here it feeds the host output. */
@@ -893,8 +1308,11 @@ HLE_EXPORT(DirectSoundDoWork)
                 pump(b, now);
         }
     }
+    report(now);
     unlock();
-    hle_dsound_stream_tick(now);      /* streams: feed the host, complete packets */
+    /* Streams: feed the host, complete packets -- on their own clock (the
+     * tick count every other stream entry point reads), not this file's. */
+    hle_dsound_stream_tick(GetTickCount64());
     HLE_RETURN(0);
 }
 
@@ -920,7 +1338,118 @@ HLE_EXPORT(DirectSoundDoWork)
  * file applies it, and the XAudio2 backend recreates a source voice when its
  * rate changes, which a per-frame engine pitch would do every frame. Hearing
  * it needs a frequency-ratio path in the backend first. It was not heard
- * before this change either. */
+ * before this change either.
+ *
+ * Volume, headroom and mix-bin volumes are heard: the setters keep them in
+ * the settings object, which the level (buffer_level, voice_adjust) reads
+ * at every submission. A 3D voice's attenuation is not a setter's: the XDK
+ * computes it into the voice's 3D data block in Commit3dSettings, below. */
 HLE_EXPORT(CMcpxVoiceClient_SetVolume)  { HLE_RETURN(0); }
 HLE_EXPORT(CMcpxVoiceClient_SetMixBins) { HLE_RETURN(0); }
 HLE_EXPORT(CMcpxVoiceClient_SetPitch)   { HLE_RETURN(0); }
+
+/* kernel_bridge.c: the dispatch table, to call the XDK's own 3D code. */
+typedef void (*recomp_func_t)(void);
+recomp_func_t recomp_lookup(uint32_t xbox_va);
+
+/* Call a lifted stdcall function with `n` arguments; it pops them. */
+static int call_stdcall(uint32_t va, uint32_t n, const uint32_t *args)
+{
+    recomp_func_t fn = va ? recomp_lookup(va) : NULL;
+    uint32_t i;
+
+    if (!fn)
+        return 0;
+    for (i = n; i > 0; i--) {
+        g_esp -= 4u;
+        HLE_MEM32(g_esp) = args[i - 1u];
+    }
+    g_esp -= 4u;
+    HLE_MEM32(g_esp) = 0u;               /* return address, popped by its ret */
+    fn();
+    return 1;
+}
+
+/* void CMcpxVoiceClient::Commit3dSettings(void), thiscall.
+ *
+ * The XDK's own body computes a 3D voice's data block only while the voice
+ * runs on the chip ((client+0x12 & 3) == 3: a chip voice allocated and
+ * started) -- never here -- and then programs the chip from it. For a 3D
+ * voice off the chip this does the computing half with the XDK's own
+ * calculator, exactly as that body calls it, and clears the change flags as
+ * the body and its chip half do; the chip half itself (volume and pitch
+ * reach the stubs above; the HRTF filter registers have no use here) is
+ * skipped. Called through CDirectSoundVoice_CommitDeferredSettings for each
+ * 3D voice -- the DirectSound object lists them from creation -- by the
+ * listener's CommitDeferredSettings (Future Perfect: once a frame) and by an
+ * immediate 3D setter, while the listener's change flags are still set. A
+ * voice on the chip, and any title whose code is not the checked layout,
+ * gets the XDK's own body. */
+/* The first commits, in full: what the calculator made of the voice. */
+static void commit_note(uint32_t client, uint32_t settings, uint32_t params,
+                        uint32_t vdata)
+{
+    static unsigned said;
+    float dist, mn, mx;
+
+    if (said >= 12u)
+        return;
+    said++;
+    memcpy(&dist, HLE_PTR(params + 0x68u), 4);
+    memcpy(&mn, HLE_PTR(params + 0x38u), 4);
+    memcpy(&mx, HLE_PTR(params + 0x3Cu), 4);
+    fprintf(stderr, "[DSOUND] 3D commit #%u: client %08X flags %04X, mode %u, distance "
+            "%.2f (min %.2f, max %.2f) -> distance %d cone %d front %d back %d "
+            "I3DL2 %d/%d, mix-bin adjust %d\n", said, client,
+            ((const volatile uint16_t *)HLE_PTR(client + 0x12u))[0],
+            HLE_MEM32(params + 0x40u), (double)dist, (double)mn, (double)mx,
+            (int32_t)HLE_MEM32(vdata + 4u), (int32_t)HLE_MEM32(vdata + 8u),
+            (int32_t)HLE_MEM32(vdata + 0xCu), (int32_t)HLE_MEM32(vdata + 0x10u),
+            (int32_t)HLE_MEM32(vdata + 0x1Cu), (int32_t)HLE_MEM32(vdata + 0x20u),
+            voice_adjust(settings, NULL));
+    fflush(stderr);
+}
+
+HLE_ORIGINAL(CMcpxVoiceClient_Commit3dSettings_0);
+HLE_EXPORT(CMcpxVoiceClient_Commit3dSettings_0)
+{
+    uint32_t client = g_ecx, settings, params, vdata, owner, ds;
+
+    if (!voice_layout() || !guest_readable(client, 0x74u) ||
+        (((const volatile uint8_t *)HLE_PTR(client))[0x12] & 3u) == 3u) {
+        g_stat.commits_original++;
+        if (hle_original_CMcpxVoiceClient_Commit3dSettings_0)
+            HLE_CALL_ORIGINAL(CMcpxVoiceClient_Commit3dSettings_0);
+        return;
+    }
+    settings = HLE_MEM32(client + 0x70u);
+    owner = HLE_MEM32(client + 8u);
+    if (!guest_readable(settings, 0xBCu) || !guest_readable(owner + 0xCu, 4u))
+        return;
+    /* A 3D voice by its settings (DSBCAPS_CTRL3D in the flags at +8), as the
+     * XDK's own play path asks before its first commit (sub_0040DC46 in FP).
+     * Not the client's status bits: bit 0 is "has a chip voice" and bit 1
+     * "started on the chip" (both set by that play path), so neither is ever
+     * set here and the first version of this, testing bit 1, never computed
+     * a thing (run 29: "3D commits 0"). */
+    if (!(((const volatile uint8_t *)HLE_PTR(settings))[8] & 0x10u))
+        return;                          /* not a 3D voice: nothing to commit */
+    params = HLE_MEM32(settings + 0xB4u);
+    vdata = HLE_MEM32(settings + 0xB8u);
+    ds = HLE_MEM32(owner + 0xCu);
+    if (!guest_readable(params, 0xA4u) || !guest_readable(vdata, 0x38u) ||
+        !guest_readable(ds, 0xA4u))
+        return;
+    {
+        uint32_t calc[2] = { ds + 0x30u, params };
+        uint32_t data[5] = { ds + 0x30u, params, ds + 0x80u, params + 0x7Cu, vdata };
+        if (!call_stdcall(hle_var_CDirectSound3DCalculator_Calculate3D, 2u, calc) ||
+            !call_stdcall(hle_var_CDirectSound3DCalculator_GetVoiceData, 5u, data))
+            return;
+    }
+    HLE_MEM32(params) = 0u;
+    HLE_MEM32(params + 0x7Cu) = 0u;
+    HLE_MEM32(vdata) = 0u;
+    commit_note(client, settings, params, vdata);
+    g_stat.commits_3d++;
+}

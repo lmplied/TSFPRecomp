@@ -118,6 +118,14 @@ typedef struct Stream {
      * the voice and moves this. */
     uint64_t play_origin;
     int      play_anchored;          /* the host clock has been read at least once */
+    /* This stream's own drift (see g_drift_ms) and how often its host voice
+     * ran dry while it still had sound to play: each dry spell is a gap the
+     * wall clock ran on through, and the correction that follows adds the
+     * gap to the drift total. */
+    long     drift_ms, drift_total_ms, drift_worst_ms;
+    unsigned long starved;
+    int      dry;
+    int32_t  level;                  /* the volume last given the host voice */
 } Stream;
 
 /* What the title asks of its streams, reported every five seconds while any
@@ -249,8 +257,17 @@ static void sync_to_host(Stream *s, uint64_t now)
 
     if (!s->output || s->paused || !s->resumed_ms)
         return;
-    if (!recomp_audio_output_position(slot_of(s), &played, &queued) || queued == 0)
+    if (!recomp_audio_output_position(slot_of(s), &played, &queued))
         return;
+    if (queued == 0) {
+        /* Dry while the clock says there is sound to play: the host was not
+         * fed in time (a stall longer than the lead). Counted once a spell. */
+        if (!s->dry && s->sent > s->play_origin && consumed(s, now) < s->queued)
+            s->starved++;
+        s->dry = 1;
+        return;
+    }
+    s->dry = 0;
 
     pos = s->play_origin + played;
     if (pos > s->queued)
@@ -263,6 +280,10 @@ static void sync_to_host(Stream *s, uint64_t now)
         if (drift > g_drift_ms_worst) g_drift_ms_worst = drift;
         if (-drift > g_drift_ms_worst) g_drift_ms_worst = -drift;
         g_drift_total_ms += drift;
+        s->drift_ms = drift;
+        if (drift > s->drift_worst_ms) s->drift_worst_ms = drift;
+        if (-drift > s->drift_worst_ms) s->drift_worst_ms = -drift;
+        s->drift_total_ms += drift;
     }
     s->play_anchored = 1;
     /* Measured either way, corrected unless the wall clock was asked for,
@@ -368,6 +389,17 @@ static void complete_passed(Stream *s, uint64_t now)
     }
 }
 
+/* The level the stream is heard at: the volume its SetVolume set, plus what
+ * its mix bins and 3D state add (hle_dsound.c; 0 outside the XDK layout that
+ * file checks). A 3D stream's attenuation follows the listener and the
+ * source from one commit to the next. */
+int32_t hle_dsound_stream_adjust(uint32_t stream_object, int *is3d);   /* hle_dsound.c */
+
+static int32_t stream_level(const Stream *s)
+{
+    return s->volume + (s->object ? hle_dsound_stream_adjust(s->object, NULL) : 0);
+}
+
 /* Feed the host from `sent` up to the clock plus the lead, in chunks. */
 static void pump(Stream *s, uint64_t now)
 {
@@ -443,8 +475,9 @@ static void pump(Stream *s, uint64_t now)
           * normal -- the lead is deliberately more than one chunk -- and
           * stepping over the refusal would delete that sound from the stream
           * and leave everything after it late by its length. */
+        s->level = stream_level(s);
         if (!recomp_audio_output_submit(slot_of(s), pcm, bytes, play_rate(s), s->channels,
-                                        out_bits(s), s->volume))
+                                        out_bits(s), s->level))
             break;
         s->sent += bytes;
     }
@@ -465,6 +498,13 @@ static void tick(Stream *s, uint64_t now)
     sync_to_host(s, now);
     complete_passed(s, now);
     pump(s, now);
+    /* A level change reaches what the host already holds (up to the lead,
+     * 400 ms), not only the next chunk. */
+    if (s->output) {
+        int32_t level = stream_level(s);
+        if (level != s->level && recomp_audio_output_set_volume(slot_of(s), level))
+            s->level = level;
+    }
 }
 
 void hle_dsound_stream_tick(uint64_t now)
@@ -488,11 +528,17 @@ void hle_dsound_stream_tick(uint64_t now)
                     (unsigned long long)s->queued, s->paused ? "paused" : "running",
                     g_calls_process, g_calls_status, g_calls_pause, g_calls_flush,
                     g_packets_done);
+            /* This stream's own numbers. The line used to print one total
+             * shared by every stream (each stream's corrections added to
+             * it, and every stream printed it), so eleven streams' gaps
+             * read as one stream's drift: "+14019 ms in total" at the end
+             * of the user's 52-minute session was all of them together. */
             if (s->play_anchored)
                 fprintf(stderr, "[DSOUND] stream %08X: %+ld ms from the host's play "
                         "position since the last tick, %+ld ms in total, worst single "
-                        "%ld ms%s\n", s->iface, g_drift_ms, g_drift_total_ms,
-                        g_drift_ms_worst, wallclock_only() ? " (not corrected)" : "");
+                        "%ld ms; host voice ran dry %lu times; level %d%s\n", s->iface,
+                        s->drift_ms, s->drift_total_ms, s->drift_worst_ms, s->starved,
+                        s->level, wallclock_only() ? " (not corrected)" : "");
         }
         fflush(stderr);
     }

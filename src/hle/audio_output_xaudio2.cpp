@@ -62,11 +62,31 @@ bool reported_nonzero[kVoiceCount];
 bool attempted, com_initialized, callback_registered, summary_printed;
 unsigned long long submitted_buffers, submitted_bytes, nonzero_buffers;
 unsigned long long dropped_buffers;
+/* What creating and destroying source voices costs the calling thread. */
+unsigned long long voices_created, voices_destroyed;
+double create_ms_total, create_ms_max, destroy_ms_total, destroy_ms_max;
+
+double nowMs()
+{
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER t;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t);
+    return static_cast<double>(t.QuadPart) * 1000.0 /
+           static_cast<double>(freq.QuadPart);
+}
 
 void destroyVoice(OutputVoice &voice)
 {
     /* DestroyVoice waits until XAudio2 no longer reads these buffers. */
-    if (voice.source) voice.source->DestroyVoice();
+    if (voice.source) {
+        const double t0 = nowMs();
+        voice.source->DestroyVoice();
+        const double ms = nowMs() - t0;
+        ++voices_destroyed;
+        destroy_ms_total += ms;
+        if (ms > destroy_ms_max) destroy_ms_max = ms;
+    }
     for (auto &buffer : voice.buffers) std::free(buffer.data);
     voice = {};
 }
@@ -211,6 +231,46 @@ extern "C" int recomp_audio_output_position(uint32_t slot, uint64_t *played_byte
     return 1;
 }
 
+static float gainOf(int32_t volume_hundredth_db)
+{
+    if (volume_hundredth_db < -10000) volume_hundredth_db = -10000;
+    if (volume_hundredth_db > 0) volume_hundredth_db = 0;
+    return volume_hundredth_db == -10000 ? 0.0f :
+        std::pow(10.0f, volume_hundredth_db / 2000.0f);
+}
+
+extern "C" int recomp_audio_output_set_volume(uint32_t slot, int32_t volume_hundredth_db)
+{
+    if (!engine || slot >= kVoiceCount) return 0;
+    OutputVoice &voice = voices[slot];
+    if (!voice.source) return 0;
+    if (FAILED(voice.source->SetVolume(gainOf(volume_hundredth_db)))) return 0;
+    return 1;
+}
+
+extern "C" int recomp_audio_output_engine_stats(RecompAudioEngineStats *stats)
+{
+    if (!stats) return 0;
+    *stats = {};
+    stats->voices_created = voices_created;
+    stats->voices_destroyed = voices_destroyed;
+    stats->create_ms_total = create_ms_total;
+    stats->create_ms_max = create_ms_max;
+    stats->destroy_ms_total = destroy_ms_total;
+    stats->destroy_ms_max = destroy_ms_max;
+    if (!engine || !master) return 0;
+    XAUDIO2_PERFORMANCE_DATA perf{};
+    engine->GetPerformanceData(&perf);
+    XAUDIO2_VOICE_DETAILS details{};
+    master->GetVoiceDetails(&details);
+    stats->latency_samples = perf.CurrentLatencyInSamples;
+    stats->sample_rate = details.InputSampleRate;
+    stats->glitches = perf.GlitchesSinceEngineStarted;
+    stats->active_voices = perf.ActiveSourceVoiceCount;
+    stats->total_voices = perf.TotalSourceVoiceCount;
+    return 1;
+}
+
 extern "C" int recomp_audio_output_submit(
     uint32_t slot, const uint8_t *pcm, uint32_t bytes,
     uint32_t sample_rate, uint32_t channels, uint32_t bits_per_sample,
@@ -245,8 +305,15 @@ extern "C" int recomp_audio_output_submit(
         format.nAvgBytesPerSec = sample_rate * block_align;
         format.nBlockAlign = static_cast<WORD>(block_align);
         format.wBitsPerSample = static_cast<WORD>(bits_per_sample);
+        const double t0 = nowMs();
         HRESULT error = engine->CreateSourceVoice(
             &voice.source, &format, XAUDIO2_VOICE_NOPITCH, 1.0f);
+        {
+            const double ms = nowMs() - t0;
+            ++voices_created;
+            create_ms_total += ms;
+            if (ms > create_ms_max) create_ms_max = ms;
+        }
         if (FAILED(error)) {
             dropBuffer(slot, "create-voice");
             disableOutput("CreateSourceVoice", error);
@@ -263,10 +330,7 @@ extern "C" int recomp_audio_output_submit(
         }
     }
 
-    if (volume_hundredth_db < -10000) volume_hundredth_db = -10000;
-    if (volume_hundredth_db > 0) volume_hundredth_db = 0;
-    const float gain = volume_hundredth_db == -10000 ? 0.0f :
-        std::pow(10.0f, volume_hundredth_db / 2000.0f);
+    const float gain = gainOf(volume_hundredth_db);
     HRESULT error = voice.source->SetVolume(gain);
     if (FAILED(error)) {
         dropBuffer(slot, "volume");

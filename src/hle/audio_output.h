@@ -53,6 +53,23 @@ int recomp_audio_output_submit(
 int recomp_audio_output_position(uint32_t slot, uint64_t *played_bytes,
                                  uint32_t *queued_buffers);
 
+/* The slot's volume, now, for everything it has queued: a voice whose level
+   changes while it plays (a 3D sound moving) follows without waiting for its
+   next submission. 0 when there is no voice. */
+int recomp_audio_output_set_volume(uint32_t slot, int32_t volume_hundredth_db);
+
+/* What the engine says about itself, for the DirectSound diagnostics:
+   latency is XAudio2's CurrentLatencyInSamples (from a source buffer to the
+   speakers) at the mastering rate; the create/destroy times are what
+   CreateSourceVoice and DestroyVoice cost the calling (game) thread. */
+typedef struct RecompAudioEngineStats {
+    uint32_t latency_samples, sample_rate, glitches;
+    uint32_t active_voices, total_voices;
+    uint64_t voices_created, voices_destroyed;
+    double   create_ms_total, create_ms_max, destroy_ms_total, destroy_ms_max;
+} RecompAudioEngineStats;
+int recomp_audio_output_engine_stats(RecompAudioEngineStats *stats);
+
 #ifdef __cplusplus
 }
 #endif

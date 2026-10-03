@@ -166,3 +166,53 @@ uint32_t recomp_dsound_buffer_set_frequency(
     model->sample_rate = sample_rate;
     return RECOMP_DSOUND_OK;
 }
+
+static int32_t clamp_level(int64_t level)
+{
+    if (level < -10000) return -10000;
+    if (level > 0) return 0;
+    return (int32_t)level;
+}
+
+int32_t recomp_dsound_mix_adjust(const uint8_t *bins, uint32_t bin_count,
+                                 const int32_t bin_volumes[32],
+                                 const int32_t *voice3d)
+{
+    int32_t d = 0, front = 0, back = 0, center = 0, i3dl2 = 0;
+    int32_t best_dry = -10000, best_send = -10000;
+    int any_dry = 0, any_send = 0;
+    uint32_t i;
+
+    if (bins == NULL || bin_volumes == NULL || bin_count == 0u || bin_count > 8u)
+        return 0;
+    if (voice3d != NULL) {
+        d      = clamp_level((int64_t)voice3d[1] + voice3d[2]);
+        front  = clamp_level((int64_t)voice3d[7] + voice3d[5] + voice3d[3] + d);
+        back   = clamp_level((int64_t)voice3d[7] + voice3d[4] + d);
+        center = clamp_level((int64_t)voice3d[7] + voice3d[6] + voice3d[3] + d);
+        i3dl2  = clamp_level((int64_t)voice3d[8] + d);
+    }
+    for (i = 0; i < bin_count; i++) {
+        uint32_t bin = bins[i];
+        int32_t level;
+
+        if (bin > 31u)
+            continue;
+        if (bin <= 9u) {
+            int32_t at = bin == 2u ? center : bin <= 5u ? d : bin <= 7u ? front : back;
+            level = clamp_level((int64_t)bin_volumes[bin] + at);
+            if (level > best_dry) best_dry = level;
+            any_dry = 1;
+        } else {
+            level = clamp_level((int64_t)bin_volumes[bin] + (bin == 10u ? i3dl2 : d));
+            if (level > best_send) best_send = level;
+            any_send = 1;
+        }
+    }
+    /* No audible dry bin but an audible send (I3DL2 or an FX send): the
+     * console hears that voice through its DSP effect, which is not run
+     * here, so it is passed through at the send's level rather than lost. */
+    if (any_send && (!any_dry || best_dry <= -10000) && best_send > -10000)
+        return best_send;
+    return any_dry ? best_dry : 0;
+}
