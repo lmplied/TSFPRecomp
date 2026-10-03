@@ -34,5 +34,57 @@
  {
   "start": "0x0020D810",
   "note": "Object callback (slot 3) pushed for sub_000A5CE0 at 0x002100E4, found statically; decodes as a function body."
+ },
+ {
+  "start": "0x00138F70",
+  "note": "Draw callback (+4) of entry 11 of the screen-element table at 0x004E6900 (0x1C-byte entries, called by sub_00139010 through [esi+4]): draws the four semi-transparent screen-border rectangles at an in-game cutscene; the only unresolved indirect call of play-test 2 (1924 Scotland, igcs_01), right after sub_00138590's ret; decodes as a function body."
+ },
+ {
+  "start": "0x0003D330",
+  "note": "Handler in the command table at 0x004C0994 ({fn, 0x16, 'movewhenpaused'}): mov eax,1; mov [0x6B7A9C],eax; ret; found statically (scripts/find_entries.py); decodes as a function body."
+ },
+ {
+  "start": "0x0019E300",
+  "note": "Per-level script callback in the 32-byte table at 0x004E9214 (neighbours 0x0019E050, 0x0019E810 are known functions); found statically; decodes as a function body."
+ },
+ {
+  "start": "0x001ADB60",
+  "note": "Per-level script callback in the 32-byte table at 0x004E9E24 (neighbours 0x001ADA70, 0x001ADCA0 are known functions); found statically; decodes as a function body."
+ },
+ {
+  "start": "0x0020A8A0",
+  "note": "Callback pushed as an immediate at 0x0020C5F2, right after sub_0020A570's ret; found statically; decodes as a function body."
+ },
+ {
+  "start": "0x00213F50",
+  "note": "Entry of the function table at 0x00507850 (beside 0x00210580, 0x00214220); found statically; decodes as a function body."
+ },
+ {
+  "start": "0x002C3500",
+  "note": "Callback pushed as an immediate at 0x002C3F80 and 0x002C3FF4, right after sub_002C3410's ret; found statically; decodes as a function body."
+ },
+ {
+  "start": "0x002C9040",
+  "note": "Per-level script callback in the 32-byte table at 0x00523840 (neighbours 0x002C8E00, 0x002C9480 are known functions); found statically; decodes as a function body."
+ },
+ {
+  "start": "0x002D09A0",
+  "note": "Per-level script callback in the 32-byte table at 0x00524578 (neighbours 0x002D08C0, 0x002D0BE0 are known functions); found statically; decodes as a function body."
+ },
+ {
+  "start": "0x002D21F0",
+  "note": "Per-level script callback in the 32-byte table at 0x005246AC (neighbours 0x002D2170, 0x002D2350 are known functions); found statically; decodes as a function body."
+ },
+ {
+  "start": "0x002E9E50",
+  "note": "Callback pushed as an immediate at 0x002EA86A, right after sub_002E9DF0's tail jump; found statically; decodes as a function body."
+ },
+ {
+  "start": "0x003A9E30",
+  "note": "Scalar deleting destructor in slot 0 of the vtable at 0x004B3170, right after sub_003A9DE0's ret; found statically; decodes as a function body."
+ },
+ {
+  "start": "0x00193310",
+  "note": "Callback pushed as an immediate at 0x001934B1 (with 0x00191470); after int3 padding, sub esp,0x30 prologue; the sweep had folded it into sub_00193120's extent; found statically; decodes as a function body."
  }
 ]
