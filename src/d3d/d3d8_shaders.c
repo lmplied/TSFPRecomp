@@ -409,7 +409,10 @@ static const char g_ps_tail[] =
     "\n"
     "    // Fog blending\n"
     "    if (PSFlags & 2u)\n"  /* vertex fog: input.fog is the fog factor */
-    "        current.rgb = lerp(FogColor.rgb, current.rgb, input.fog);\n"
+    /* ...or the marker of a vertex program that never wrote oFog, which
+     * means no fog here, as its old default of 1 did (d3d8_vsh.h). */
+    "        current.rgb = lerp(FogColor.rgb, current.rgb, "
+    D3D8_VSH_FOG_IS_UNWRITTEN("input.fog") " ? 1.0 : input.fog);\n"
     "\n"
     "    if (PSFlags & 8u) {\n"  /* table fog: compute fog per-pixel from view-space depth */
     "        float dist = (PSFlags & 16u) ? length(input.viewpos.xyz) : -input.viewpos.z;\n"

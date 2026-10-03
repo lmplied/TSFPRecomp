@@ -934,8 +934,19 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
      * Perfect needs the real value: it turns fog off and blends by its own
      * factor, computed in its vertex programs (A = fog alpha, B = fog
      * colour, C = r0), so with 1 forced here its guns, hands and cave came
-     * out the flat fog colour. */
-    EMIT("    float4 r_fog  = float4(fog_color.rgb, saturate(input.fog));\n");
+     * out the flat fog colour.
+     *
+     * A program that never writes oFog has no value to hand on, and what it
+     * stands for depends on fog: 1 with fog on, 0 with it off. Future
+     * Perfect's particle program writes none and draws its muzzle flash,
+     * dust and sparks with fog off through that same final combiner; read
+     * as 1, every flash quad added a square of fog colour (play-tests 2 and
+     * 3), where 0 leaves the textured flare. Its sky is a program without
+     * oFog drawn with fog on, and stays the fog colour it was. A written
+     * value is used as before, fog on or off. */
+    EMIT("    float4 r_fog  = float4(fog_color.rgb, "
+         D3D8_VSH_FOG_IS_UNWRITTEN("input.fog") " ? (fog_enable ? 1.0 : 0.0)"
+         " : saturate(input.fog));\n");
 
     /* Vertex colors: Xbox D3DCOLOR is BGRA in memory, the vertex shader
      * should have already swizzled to RGBA. */

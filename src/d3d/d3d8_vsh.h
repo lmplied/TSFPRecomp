@@ -53,6 +53,15 @@ extern "C" {
 /** Shader cache size (hashed microcode -> compiled shader). */
 #define NV2A_VS_CACHE_SIZE          64
 
+/** The fog value a vertex program that never writes oFog hands the pixel
+ * stage, and the test that recognises it there: far below any fog value a
+ * program computes, so the pixel shaders can tell "never written" from a
+ * written 0 or 1. The combiners resolve it by D3DRS_FOGENABLE (1 with fog
+ * on, 0 with it off, d3d8_combiners.c); the fixed-function pixel shader
+ * reads it as 1, the default it always had (d3d8_shaders.c). */
+#define D3D8_VSH_FOG_UNWRITTEN       "(-1.0e30)"
+#define D3D8_VSH_FOG_IS_UNWRITTEN(x) "(" x " < -1.0e29)"
+
 /* ================================================================
  * Shader Slot (stored microcode)
  * ================================================================ */

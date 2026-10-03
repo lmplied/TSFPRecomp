@@ -702,6 +702,7 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
 {
     StrBuf sb;
     int i;
+    int writes_fog = 0;     /* does any instruction write oFog? */
     uint16_t inputs = program->inputs_read;
 
     sb_init(&sb, buf, bufsize);
@@ -847,6 +848,16 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         if (ilu_runs)
             emit_dest_assign(&sb, &inst->ilu_dst, "_ilu");
 
+        /* Whether oFog is ever written: the same test emit_dest_assign
+         * applies before it emits an output write. */
+        if (mac_runs && inst->mac_op != NV2A_VSH_MAC_ARL &&
+            inst->mac_dst.output_reg == NV2A_VSH_OUT_FOG &&
+            nv2a_vsh_output_write_mask(&inst->mac_dst) != 0)
+            writes_fog = 1;
+        if (ilu_runs && inst->ilu_dst.output_reg == NV2A_VSH_OUT_FOG &&
+            nv2a_vsh_output_write_mask(&inst->ilu_dst) != 0)
+            writes_fog = 1;
+
         sb_append(&sb, "    }\n");
     }
 
@@ -876,8 +887,18 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "    o.oT0  = oT0;\n"
         "    o.oT1  = oT1;\n"
         "    o.oT2  = oT2;\n"
-        "    o.oT3  = oT3;\n"
-        "    o.oFog = oFog.x;\n"
+        "    o.oT3  = oT3;\n");
+    /* A program that never writes oFog hands on a marker, not the default 1:
+     * what fog alpha the combiners then see depends on whether fog is on
+     * (D3D8_VSH_FOG_UNWRITTEN). TimeSplitters: Future Perfect's particle
+     * program writes none, draws its muzzle flash with fog off, and blends
+     * by a final combiner that mixes toward the fog colour by fog alpha: a
+     * default of 1 drew every flash quad as a square of fog colour. */
+    if (writes_fog)
+        sb_append(&sb, "    o.oFog = oFog.x;\n");
+    else
+        sb_append(&sb, "    o.oFog = " D3D8_VSH_FOG_UNWRITTEN ";\n");
+    sb_append(&sb,
         /* Table fog reads -viewpos.z (or its length, for range fog) as the
          * distance; on the Xbox that distance is the program's oFog. */
         "    o.oViewPos = float4(0, 0, -oFog.x, 1);\n"
