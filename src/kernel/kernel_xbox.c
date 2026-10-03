@@ -191,11 +191,115 @@ uint32_t xbox_kernel_console_av_standard(void)
     return console_av_region();
 }
 
+/* ---- the whole-section indices ----
+ *
+ * Besides one value at a time, the kernel answers whole sections of the
+ * EEPROM image: XC_MAX_OS (0xFF) the user settings, XC_MAX_FACTORY (0x1FF)
+ * the factory settings, XC_ENCRYPTED_SECTION (0xFFFE) the first 0x30 bytes
+ * and XC_MAX_ALL (0xFFFF) all 256 bytes, each as REG_BINARY. XAPI's
+ * GetTimeZoneInformation reads XC_MAX_OS and takes the time-zone fields and
+ * the no-daylight-saving flag from it (Future Perfect calls it on every pass
+ * of its main loop, ~12 times a second while it loads); XNET reads XC_MAX_ALL
+ * for the Ethernet address. These used to fall into the default arm below:
+ * zeros, REG_DWORD, and the caller's own buffer size as the result length.
+ *
+ * The image is built from the same answers as the single-value indices, so
+ * the two never disagree, with the section checksums a real EEPROM carries.
+ * Its time zone is zero -- UTC, no daylight saving -- which is what every
+ * title reading XC_MAX_OS was getting before (XC_TIMEZONE_BIAS answers -300
+ * on its own; nothing seen reads it that way, and a different bias here
+ * would move every title's local clock). Layout as Cxbx-Reloaded's
+ * XBOX_EEPROM: encrypted 0x00-0x2F, factory 0x30-0x5F, user 0x60-0xBF. */
+#ifndef XC_MAX_FACTORY
+#define XC_MAX_FACTORY          0x1FF
+#endif
+#ifndef XC_ENCRYPTED_SECTION
+#define XC_ENCRYPTED_SECTION    0xFFFE
+#endif
+#ifndef XC_MAX_ALL
+#define XC_MAX_ALL              0xFFFF
+#endif
+#ifndef STATUS_BUFFER_TOO_SMALL
+#define STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xC0000023L)
+#endif
+
+static void eeprom_put32(uint8_t *img, unsigned off, uint32_t v)
+{
+    img[off] = (uint8_t)v;
+    img[off + 1] = (uint8_t)(v >> 8);
+    img[off + 2] = (uint8_t)(v >> 16);
+    img[off + 3] = (uint8_t)(v >> 24);
+}
+
+/* A section's checksum: the dword sum with end-around carry, inverted. */
+static uint32_t eeprom_checksum(const uint8_t *p, unsigned bytes)
+{
+    uint32_t high = 0, low = 0;
+    unsigned i;
+
+    for (i = 0; i + 4 <= bytes; i += 4) {
+        uint32_t v = (uint32_t)p[i] | (uint32_t)p[i + 1] << 8 |
+                     (uint32_t)p[i + 2] << 16 | (uint32_t)p[i + 3] << 24;
+        uint64_t sum = ((uint64_t)high << 32 | low) + v;
+        high = (uint32_t)(sum >> 32);
+        low += v;
+    }
+    return ~(high + low);
+}
+
+static void eeprom_image(uint8_t img[256])
+{
+    static const unsigned char mac[6] = { 0x00, 0x50, 0xF2, 0x00, 0x00, 0x01 };
+    ULONG video = 0;
+
+    memset(img, 0, 256);
+    /* encrypted section: on a console RC4-encrypted; only the region the
+     * kernel decrypts from it is meaningful to a title */
+    eeprom_put32(img, 0x2C, console_game_region());
+    /* factory section */
+    memcpy(img + 0x34, "100000000000", 12);           /* serial number */
+    memcpy(img + 0x40, mac, sizeof mac);               /* Ethernet address */
+    eeprom_put32(img, 0x58, console_av_region());     /* AV region */
+    eeprom_put32(img, 0x30, eeprom_checksum(img + 0x34, 0x2C));
+    /* user section: time zone 0x64-0x8F left zero (see above) */
+    eeprom_put32(img, 0x90, 1);                        /* language: English */
+    if (recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0))
+        video |= XC_VIDEO_FLAGS_WIDESCREEN;
+    eeprom_put32(img, 0x94, XC_VIDEO_RAW(video));      /* video flags */
+    eeprom_put32(img, 0x98, XC_AUDIO_FLAGS_STEREO);    /* audio flags */
+    eeprom_put32(img, 0xBC, 1);                        /* DVD region 1 */
+    eeprom_put32(img, 0x60, eeprom_checksum(img + 0x64, 0x5C));
+}
+
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
 {
     if (!Value)
         return STATUS_INVALID_PARAMETER;
+
+    if (ValueIndex == XC_MAX_OS || ValueIndex == XC_MAX_FACTORY ||
+        ValueIndex == XC_ENCRYPTED_SECTION || ValueIndex == XC_MAX_ALL) {
+        uint8_t img[256];
+        unsigned off = 0, len = 256;
+
+        if (ValueIndex == XC_MAX_OS)                 { off = 0x60; len = 0x60; }
+        else if (ValueIndex == XC_MAX_FACTORY)       { off = 0x30; len = 0x30; }
+        else if (ValueIndex == XC_ENCRYPTED_SECTION) { off = 0x00; len = 0x30; }
+        if (Type) *Type = 3;                           /* REG_BINARY */
+        if (ResultLength) *ResultLength = len;
+        if (ValueLength < len) {
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_XBOX,
+                "ExQueryNonVolatileSetting: index 0x%02X needs %u bytes, given %u",
+                ValueIndex, len, ValueLength);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        eeprom_image(img);
+        memcpy(Value, img + off, len);
+        xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_XBOX,
+            "ExQueryNonVolatileSetting: index=0x%02X -> %u bytes of the EEPROM image",
+            ValueIndex, len);
+        return STATUS_SUCCESS;
+    }
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_XBOX,
         "ExQueryNonVolatileSetting: index=0x%02X len=%u", ValueIndex, ValueLength);
