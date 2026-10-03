@@ -625,23 +625,34 @@ def _make_condition(jcc, flag_setter, flag_ops):
     slhs = "_fas" if lhs == "_fa" else f"(int32_t){lhs}"
 
     # ── FPU compare-to-EFLAGS and sahf: no standard operands ──
+    #
+    # An unordered compare (a NaN on either side) sets ZF, PF and CF all at
+    # once, so it reads as "below", "below or equal", "equal" and "parity"
+    # -- and not as "above", "above or equal" or "not equal". g_fp_cmp is
+    # RECOMP_FCMP's -1/0/1 for less/equal/greater and 2 for unordered, and
+    # comparing it with 0 treated 2 as "greater": `jbe` fell through and
+    # `jne` was taken on a NaN where the hardware does the opposite.
     if flag_setter in ("fcompi", "fcomip", "fucomi", "fucompi",
                         "fucomip", "fcomi", "sahf"):
         fpu_cmp_map = {
-            "ja": ">", "jnbe": ">",
-            "jae": ">=", "jnb": ">=", "jnc": ">=",
-            "jb": "<", "jnae": "<", "jc": "<",
-            "jbe": "<=", "jna": "<=",
-            "je": "==", "jz": "==",
-            "jne": "!=", "jnz": "!=",
+            "ja": "g_fp_cmp == 1", "jnbe": "g_fp_cmp == 1",
+            "jae": "g_fp_cmp == 0 || g_fp_cmp == 1",
+            "jnb": "g_fp_cmp == 0 || g_fp_cmp == 1",
+            "jnc": "g_fp_cmp == 0 || g_fp_cmp == 1",
+            "jb": "g_fp_cmp == -1 || g_fp_cmp == 2",
+            "jnae": "g_fp_cmp == -1 || g_fp_cmp == 2",
+            "jc": "g_fp_cmp == -1 || g_fp_cmp == 2",
+            "jbe": "g_fp_cmp != 1", "jna": "g_fp_cmp != 1",
+            "je": "g_fp_cmp == 0 || g_fp_cmp == 2",
+            "jz": "g_fp_cmp == 0 || g_fp_cmp == 2",
+            "jne": "g_fp_cmp == -1 || g_fp_cmp == 1",
+            "jnz": "g_fp_cmp == -1 || g_fp_cmp == 1",
+            "jp": "g_fp_cmp == 2", "jpe": "g_fp_cmp == 2",
+            "jnp": "g_fp_cmp != 2", "jpo": "g_fp_cmp != 2",
         }
-        op = fpu_cmp_map.get(jcc)
-        if op:
-            return f"(g_fp_cmp {op} 0) /* {flag_setter} */", desc
-        if jcc == "jp":
-            return "0 /* fpu: unordered/NaN */", desc
-        if jcc == "jnp":
-            return "1 /* fpu: ordered */", desc
+        cond = fpu_cmp_map.get(jcc)
+        if cond:
+            return f"({cond}) /* {flag_setter} */", desc
         return None
 
     # If no operands available for other flag-setters, can't generate condition
@@ -669,23 +680,31 @@ def _make_condition(jcc, flag_setter, flag_ops):
         )
         desc = f"{desc} ({void_a} vs {void_b})" if desc else desc
         a, b = "_fca", "_fcb"
-        # comiss uses unsigned condition codes (CF, ZF)
+        # comiss uses unsigned condition codes (CF, ZF), and PF for
+        # unordered. A NaN on either side sets ZF, PF and CF together (see
+        # _make_lahf_value), so the conditions that include CF or ZF are
+        # true for it and the others false. C's own comparisons are all
+        # false for a NaN except !=, so below, below-or-equal and equal are
+        # spelled as the negation of their ordered opposites, and not-equal
+        # as "less or greater". These were the plain operators, which
+        # agreed with the hardware only while no NaN came by: Future
+        # Perfect's hang in play-test 3 had a NaN ray in its collision code.
         if jcc in ("ja", "jnbe"):
             return f"({a} > {b})", desc
         if jcc in ("jae", "jnb", "jnc"):
             return f"({a} >= {b})", desc
         if jcc in ("jb", "jnae", "jc"):
-            return f"({a} < {b})", desc
+            return f"(!({a} >= {b}))", desc
         if jcc in ("jbe", "jna"):
-            return f"({a} <= {b})", desc
+            return f"(!({a} > {b}))", desc
         if jcc in ("je", "jz"):
-            return f"({a} == {b})", desc
+            return f"(!({a} < {b} || {a} > {b}))", desc
         if jcc in ("jne", "jnz"):
-            return f"({a} != {b})", desc
-        if jcc == "jp":
-            return f"0 /* {jcc}: unordered/NaN */", desc
-        if jcc == "jnp":
-            return f"1 /* {jcc}: ordered */", desc
+            return f"({a} < {b} || {a} > {b})", desc
+        if jcc in ("jp", "jpe"):
+            return f"({a} != {a} || {b} != {b}) /* {jcc}: unordered/NaN */", desc
+        if jcc in ("jnp", "jpo"):
+            return f"({a} == {a} && {b} == {b}) /* {jcc}: ordered */", desc
         return None
 
     # SF is the sign bit of the result at the OPERAND's width, not at 32 bits.
