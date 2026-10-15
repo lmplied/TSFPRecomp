@@ -15,11 +15,16 @@
  *
  * Pads are read through recomp_pad.h: SDL3 by default, XInput on Windows
  * when the file's "pad_api" or RECOMP_PAD_API says so. The keyboard is
- * read with GetAsyncKeyState on Windows and not yet anywhere else.
+ * read with GetAsyncKeyState on Windows and not yet anywhere else. The
+ * mouse is raw input on the game window (input_mouse.c), and both it and the
+ * keyboard read as untouched while the game window does not have the focus.
  */
 #include "input_bindings.h"
+#include "input_mouse.h"
+#include "recomp_config.h"   /* where the bindings file is, per title */
 #include "recomp_pad.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -120,7 +125,30 @@ static const struct { const char *control, *pad, *key; } DEFAULTS[] = {
 
 /* ---- the sources a control can be bound to ----------------------------- */
 
-enum { SRC_NONE, SRC_KEY, SRC_PAD_BUTTON, SRC_PAD_TRIGGER, SRC_PAD_AXIS };
+enum { SRC_NONE, SRC_KEY, SRC_PAD_BUTTON, SRC_PAD_TRIGGER, SRC_PAD_AXIS,
+       SRC_MOUSE_BUTTON, SRC_MOUSE_WHEEL, SRC_MOUSE_AXIS };
+
+/* What a "mouse:" source may name. The buttons first, in RECOMP_MOUSE_* bit
+ * order; then the wheel, each notch a short press; then motion, as the four
+ * halves of two axes the way a stick is bound: x+ is right, y+ is away from
+ * the player, which is "up" on a stick. Bind mouse:x+ to rstick_right and the
+ * mouse turns the camera through the title's own stick handling.
+ *
+ * tools/input_ui/test_runtime_vocabulary.py reads this table out of this file
+ * and fails if the UI's copy has drifted from it. */
+enum { MS_LEFT, MS_RIGHT, MS_MIDDLE, MS_X1, MS_X2, MS_WHEEL_UP, MS_WHEEL_DOWN,
+       MS_XPOS, MS_XNEG, MS_YPOS, MS_YNEG, MS_COUNT };
+
+static const char *const MOUSE_SOURCES[MS_COUNT] = {
+    "left", "right", "middle", "x1", "x2", "wheel_up", "wheel_down",
+    "x+", "x-", "y+", "y-"
+};
+
+/* Mouse speed, in raw counts a millisecond, that reads as a full stick at
+ * sensitivity 1: about 4.5 inches a second at 800 dpi. A player's
+ * sensitivity scales it, and most will want to. */
+#define MOUSE_FULL_SPEED 6.0
+#define MOUSE_WINDOW_DEFAULT 16             /* ms: one frame at 60 */
 
 /* Pad buttons, in the order PAD_BUTTONS names them. */
 enum {
@@ -147,16 +175,42 @@ typedef struct {
 
 enum { DEV_NONE, DEV_KEYBOARD, DEV_PAD };
 
+/* How mouse motion becomes a stick. The file's "mouse_*" keys, per port. */
+typedef struct {
+    double sensitivity;     /* mouse_sensitivity: 1 = MOUSE_FULL_SPEED is full */
+    int deadzone;           /* mouse_deadzone: the title's own stick deadzone, in
+                             * stick units; any motion starts just past it */
+    double exponent;        /* mouse_exponent: response curve, 1 = linear */
+    double y_scale;         /* mouse_y_scale: up and down against left and right.
+                             * Console games look up and down slower than they
+                             * turn (Future Perfect: 0.47 times as fast at the
+                             * same stick), which a mouse feels as two
+                             * sensitivities; this evens them out. */
+    int invert_y;           /* mouse_invert_y */
+    int zoom_match;         /* mouse_zoom_match: for a title that aims by the
+                             * mouse itself, slower when zoomed in, by the zoom */
+    int window_ms;          /* mouse_window_ms: the speed is averaged over this */
+} MouseFeel;
+
 typedef struct {
     int device;
     int pad;                /* recomp_pad slot when device == DEV_PAD */
     int deadzone;
     int has_key;            /* any key: source, so the port works with no pad */
+    int has_mouse;          /* any mouse: source */
+    unsigned hold_mask;     /* "hold": controls whose keys and mouse buttons
+                             * hold a toggle on rather than flip it */
+    MouseFeel mouse;
     Binding bind[CONTROL_COUNT];
-    char label[40];
+    char label[48];
 } Controller;
 
 static Controller g_ctl[PORTS];
+/* Where a load builds the ports before they replace g_ctl in one copy:
+ * a title polling its pads during a reload (the in-game menu rebinding a
+ * key) must never see a port half-parsed, or for a moment with no device,
+ * which it would take for a pad pulled out. */
+static Controller g_next[PORTS];
 static char g_path[520];
 static int g_have_path;
 static int g_ready;
@@ -257,6 +311,26 @@ static int parse_source(const char *text, Source *out)
             return 1;
         }
     }
+    if (strncmp(text, "mouse:", 6) == 0) {
+        int i;
+        for (i = 0; i < MS_COUNT; i++)
+            if (strcmp(MOUSE_SOURCES[i], text + 6) == 0)
+                break;
+        if (i <= MS_X2) {
+            out->kind = SRC_MOUSE_BUTTON;
+            out->arg = (short)(1 << (i - MS_LEFT));
+        } else if (i <= MS_WHEEL_DOWN) {
+            out->kind = SRC_MOUSE_WHEEL;
+            out->arg = (short)(i - MS_WHEEL_UP);
+        } else if (i < MS_COUNT) {
+            out->kind = SRC_MOUSE_AXIS;
+            out->arg = (short)(i >= MS_YPOS);                /* 0 x, 1 y */
+            out->sign = (signed char)((i == MS_XPOS || i == MS_YPOS) ? 1 : -1);
+        } else {
+            return 0;
+        }
+        return 1;
+    }
     return 0;
 }
 
@@ -285,6 +359,11 @@ static void defaults_for(Controller *c, int port)
     c->device = DEV_PAD;
     c->pad = port;
     c->deadzone = DEADZONE_DEFAULT;
+    c->mouse.sensitivity = 1.0;
+    c->mouse.exponent = 1.0;
+    c->mouse.y_scale = 1.0;
+    c->mouse.window_ms = MOUSE_WINDOW_DEFAULT;
+    c->mouse.zoom_match = 1;
     for (i = 0; i < (int)(sizeof DEFAULTS / sizeof DEFAULTS[0]); i++) {
         int k = control_index(DEFAULTS[i].control);
         if (k < 0)
@@ -431,6 +510,33 @@ static const char *parse_bindings(const char *p, Controller *c, int *bad)
     }
 }
 
+/* "hold": ["rthumb", "lthumb"] -- see hold_pulse. */
+static const char *parse_hold(const char *p, Controller *c)
+{
+    char value[48];
+
+    p = ws(p);
+    if (*p != '[')
+        return jskip(p);
+    p = ws(p + 1);
+    while (*p && *p != ']') {
+        int k;
+
+        p = jstring(p, value, sizeof value);
+        if (!p)
+            return NULL;
+        k = control_index(value);
+        if (k >= 0)
+            c->hold_mask |= 1u << k;
+        p = ws(p);
+        if (*p == ',')
+            p = ws(p + 1);
+    }
+    if (*p != ']')
+        return NULL;
+    return p + 1;
+}
+
 static void set_device(Controller *c, const char *name)
 {
     if (strcmp(name, "keyboard") == 0) {
@@ -482,8 +588,43 @@ static const char *parse_controller(const char *p, int index, int *bad)
         } else if (strcmp(key, "deadzone") == 0) {
             tmp.deadzone = (int)strtol(p, NULL, 10);
             p = jskip(p);
+        } else if (strcmp(key, "mouse_sensitivity") == 0) {
+            double v = strtod(p, NULL);
+            if (v > 0.0 && v <= 100.0)
+                tmp.mouse.sensitivity = v;
+            p = jskip(p);
+        } else if (strcmp(key, "mouse_deadzone") == 0) {
+            long v = strtol(p, NULL, 10);
+            if (v >= 0 && v < 32767)
+                tmp.mouse.deadzone = (int)v;
+            p = jskip(p);
+        } else if (strcmp(key, "mouse_exponent") == 0) {
+            double v = strtod(p, NULL);
+            if (v >= 0.1 && v <= 10.0)
+                tmp.mouse.exponent = v;
+            p = jskip(p);
+        } else if (strcmp(key, "mouse_y_scale") == 0) {
+            double v = strtod(p, NULL);
+            if (v >= 0.1 && v <= 10.0)
+                tmp.mouse.y_scale = v;
+            p = jskip(p);
+        } else if (strcmp(key, "mouse_invert_y") == 0) {
+            tmp.mouse.invert_y = strncmp(p, "true", 4) == 0 || *p == '1';
+            p = jskip(p);
+        } else if (strcmp(key, "mouse_zoom_match") == 0) {
+            tmp.mouse.zoom_match = strncmp(p, "true", 4) == 0 || *p == '1';
+            p = jskip(p);
+        } else if (strcmp(key, "mouse_window_ms") == 0) {
+            long v = strtol(p, NULL, 10);
+            if (v >= 1 && v <= 250)
+                tmp.mouse.window_ms = (int)v;
+            p = jskip(p);
         } else if (strcmp(key, "bindings") == 0) {
             p = parse_bindings(p, &tmp, bad);
+            if (!p)
+                return NULL;
+        } else if (strcmp(key, "hold") == 0) {
+            p = parse_hold(p, &tmp);
             if (!p)
                 return NULL;
         } else {
@@ -505,13 +646,18 @@ static const char *parse_controller(const char *p, int index, int *bad)
     if (seen_port && tmp.device == DEV_PAD && tmp.pad == index && index != port)
         tmp.pad = port;
     tmp.has_key = 0;
+    tmp.has_mouse = 0;
     for (i = 0; i < CONTROL_COUNT; i++) {
         int s;
-        for (s = 0; s < tmp.bind[i].count; s++)
-            if (tmp.bind[i].src[s].kind == SRC_KEY)
+        for (s = 0; s < tmp.bind[i].count; s++) {
+            int kind = tmp.bind[i].src[s].kind;
+            if (kind == SRC_KEY)
                 tmp.has_key = 1;
+            if (kind == SRC_MOUSE_BUTTON || kind == SRC_MOUSE_WHEEL || kind == SRC_MOUSE_AXIS)
+                tmp.has_mouse = 1;
+        }
     }
-    g_ctl[port] = tmp;
+    g_next[port] = tmp;
     return p + 1;
 }
 
@@ -579,42 +725,22 @@ static int readable(const char *path)
     return 1;
 }
 
-/* RECOMP_INPUT_CONFIG, then the per-user file the UI writes, then one beside
- * the executable (the working directory a title's run.bat starts in), so a
- * title can ship a config of its own. */
+/* RECOMP_INPUT_CONFIG; this title's own file, which the launcher writes; the
+ * per-user file every title shares; a preset beside the executable. The
+ * order is recomp_bindings_read_path's (src/config), so the launcher edits
+ * the file this reads. */
 static int find_config(char *out, size_t n)
 {
     const char *env = getenv("RECOMP_INPUT_CONFIG");
-#if defined(_WIN32)
-    const char *home = getenv("APPDATA");
-    const char *tail = "\\xboxrecomp\\input_bindings.json";
-#else
-    const char *home = getenv("XDG_CONFIG_HOME");
-    const char *tail = "/xboxrecomp/input_bindings.json";
-    if (!home || !*home) {
-        static char buf[400];
-        const char *h = getenv("HOME");
-        if (h) {
-            snprintf(buf, sizeof buf, "%s/.config", h);
-            home = buf;
-        }
-    }
-#endif
-    if (env && *env) {
-        snprintf(out, n, "%s", env);
-        if (readable(out))
-            return 1;
+
+    if (!recomp_bindings_read_path(recomp_config_title_id(), out, n))
+        return 0;
+    if (env && *env && !readable(out)) {
         fprintf(stderr, "[INPUT] RECOMP_INPUT_CONFIG=%s cannot be read; "
                         "using the built-in bindings\n", env);
         return 0;
     }
-    if (home && *home) {
-        snprintf(out, n, "%s%s", home, tail);
-        if (readable(out))
-            return 1;
-    }
-    snprintf(out, n, "input_bindings.json");
-    return readable(out);
+    return 1;
 }
 
 static char *read_file(const char *path)
@@ -643,26 +769,24 @@ static char *read_file(const char *path)
 
 static void describe(Controller *c, char *out, size_t n)
 {
+    const char *extra = c->has_mouse ? (c->has_key ? " + keyboard and mouse" : " + mouse")
+                                     : (c->has_key ? " + keyboard" : "");
     if (c->device == DEV_KEYBOARD)
-        snprintf(out, n, "keyboard");
-    else if (c->device == DEV_PAD && c->has_key)
-        snprintf(out, n, "%s pad %d + keyboard", recomp_pad_api_name(), c->pad + 1);
+        snprintf(out, n, "keyboard%s", c->has_mouse ? " and mouse" : "");
     else if (c->device == DEV_PAD)
-        snprintf(out, n, "%s pad %d", recomp_pad_api_name(), c->pad + 1);
+        snprintf(out, n, "%s pad %d%s", recomp_pad_api_name(), c->pad + 1, extra);
     else
         snprintf(out, n, "nothing");
 }
 
-void recomp_bindings_init(void)
+static void load_bindings(void)
 {
     char *text;
     int i;
 
-    if (g_ready)
-        return;
-    g_ready = 1;
+    g_have_path = 0;
     for (i = 0; i < PORTS; i++)
-        defaults_for(&g_ctl[i], i);
+        defaults_for(&g_next[i], i);
     if (find_config(g_path, sizeof g_path) && (text = read_file(g_path)) != NULL) {
         if (parse_config(text)) {
             g_have_path = 1;
@@ -670,17 +794,49 @@ void recomp_bindings_init(void)
             fprintf(stderr, "[INPUT] %s is not a binding config this build "
                             "can read; using the built-in bindings\n", g_path);
             for (i = 0; i < PORTS; i++)
-                defaults_for(&g_ctl[i], i);
+                defaults_for(&g_next[i], i);
         }
         free(text);
     }
     for (i = 0; i < PORTS; i++)
-        describe(&g_ctl[i], g_ctl[i].label, sizeof g_ctl[i].label);
+        describe(&g_next[i], g_next[i].label, sizeof g_next[i].label);
+    memcpy(g_ctl, g_next, sizeof g_ctl);
     fprintf(stderr, "[INPUT] bindings from %s\n",
             g_have_path ? g_path : "the built-in defaults (no config file)");
     for (i = 0; i < PORTS; i++)
         fprintf(stderr, "[INPUT]   controller %d: %s\n", i + 1, g_ctl[i].label);
+    {
+        int wanted = 0;
+        for (i = 0; i < PORTS; i++) {
+            const MouseFeel *m = &g_ctl[i].mouse;
+            if (!g_ctl[i].has_mouse || g_ctl[i].device == DEV_NONE)
+                continue;
+            wanted = 1;
+            fprintf(stderr, "[INPUT]   controller %d mouse: sensitivity %.2f (up and down "
+                            "x%.2f), deadzone %d, exponent %.2f, %s, averaged over %d ms\n",
+                    i + 1, m->sensitivity, m->y_scale, m->deadzone, m->exponent,
+                    m->invert_y ? "inverted" : "not inverted", m->window_ms);
+        }
+        recomp_mouse_set_wanted(wanted);
+    }
     fflush(stderr);
+}
+
+void recomp_bindings_init(void)
+{
+    if (g_ready)
+        return;
+    g_ready = 1;
+    load_bindings();
+}
+
+void recomp_bindings_reload(void)
+{
+    if (!g_ready) {
+        recomp_bindings_init();
+        return;
+    }
+    load_bindings();
 }
 
 const char *recomp_bindings_source_path(void)
@@ -741,10 +897,18 @@ typedef struct { unsigned char state[256]; } KeyCache;
 static unsigned char g_key_state[256];
 static unsigned long long g_key_state_at;
 
+/* GetAsyncKeyState answers for the whole desktop, not for a window: with no
+ * check here, typing into a chat window while the game sat behind it walked
+ * the player forward and fired. The keyboard is the game's only while its
+ * window has the focus (input_mouse.c tracks it; with no window attached it
+ * reads as before). Refreshed with the key cache, so it costs nothing a
+ * poll. */
+static int g_keys_live = 1;
+
 static int key_down(KeyCache *kc, int vk)
 {
     (void)kc;
-    if (vk <= 0 || vk > 255)
+    if (vk <= 0 || vk > 255 || !g_keys_live)
         return 0;
 #if defined(_WIN32)
     if (!g_key_state[vk])
@@ -762,7 +926,43 @@ static void key_cache_tick(void)
     if (now - g_key_state_at >= KEY_CACHE_TTL_MS) {
         memset(g_key_state, 0, sizeof g_key_state);
         g_key_state_at = now;
+        g_keys_live = recomp_input_focused();
     }
+}
+
+/* What the mouse is doing, read once per sample of a port that binds it. */
+typedef struct {
+    double vx, vy;          /* counts a millisecond; y as the device reports it */
+    unsigned buttons;
+} MouseSample;
+
+/* One half of one mouse axis as a 0..255 magnitude, the way a key or a stick
+ * half reads. Any motion at all lands just past the title's own deadzone,
+ * because a title discards a small stick deflection and a slow mouse would
+ * otherwise do nothing; from there it rises with speed, through the
+ * response curve, to a full stick. */
+static int mouse_axis_magnitude(const Source *s, const MouseSample *ms, const MouseFeel *f)
+{
+    double v, frac;
+    int floor_mag;
+
+    /* The title turns its camera by the mouse itself (recomp_mouse_set_direct). */
+    if (recomp_mouse_direct())
+        return 0;
+    if (s->arg == 0)
+        v = ms->vx;
+    else                                        /* the device's y grows downward */
+        v = (f->invert_y ? ms->vy : -ms->vy) * f->y_scale;
+    v *= s->sign;
+    if (v <= 0.0)
+        return 0;
+    frac = v * f->sensitivity / MOUSE_FULL_SPEED;
+    if (frac > 1.0)
+        frac = 1.0;
+    if (f->exponent != 1.0)
+        frac = pow(frac, f->exponent);
+    floor_mag = f->deadzone * 255 / 32767;
+    return floor_mag + 1 + (int)(frac * (254 - floor_mag));
 }
 
 static int axis_value(const RecompPadState *g, int axis)
@@ -778,11 +978,18 @@ static int axis_value(const RecompPadState *g, int axis)
 /* Every source reads as a 0..255 magnitude, whatever it is: that is what
  * makes a trigger bindable to a key and a button bindable to a stick. */
 static int source_magnitude(const Source *s, KeyCache *kc,
-                            const RecompPadState *pad, int have_pad, int deadzone)
+                            const RecompPadState *pad, int have_pad, int deadzone,
+                            const MouseSample *ms, const MouseFeel *feel)
 {
     switch (s->kind) {
     case SRC_KEY:
         return key_down(kc, s->arg) ? 255 : 0;
+    case SRC_MOUSE_BUTTON:
+        return (ms->buttons & (unsigned)s->arg) ? 255 : 0;
+    case SRC_MOUSE_WHEEL:
+        return recomp_mouse_wheel(s->arg) ? 255 : 0;
+    case SRC_MOUSE_AXIS:
+        return mouse_axis_magnitude(s, ms, feel);
     case SRC_PAD_BUTTON:
         if (!have_pad)
             return 0;
@@ -836,11 +1043,113 @@ static void say_first_press(unsigned port, const char *control)
     }
 }
 
+/* ---- hold, for a control the title toggles ------------------------------
+ *
+ * A console title toggles some things on a press -- Future Perfect's aim
+ * mode is a click of the right stick -- where a PC player expects to hold
+ * a button for as long as they want it. For a control in the file's "hold"
+ * list, and only while the title says how the toggle stands
+ * (recomp_bindings_toggle_reader), a key or mouse button bound to it is
+ * read as "on while held": whenever held and the title's state disagree,
+ * one short press is sent, then a wait for the state to follow. A press the
+ * title ignores (it cannot aim just now) is tried again a few times, then
+ * left until the button changes. Pad buttons keep the console's toggle. */
+#define HOLD_PRESS_MS 50
+#define HOLD_WAIT_MS  150
+#define HOLD_TRIES    3
+
+static int (*g_toggle_reader[CONTROL_COUNT])(unsigned port);
+
+typedef struct {
+    int phase;              /* 0 idle, 1 pressing, 2 waiting for the title */
+    unsigned long long until;
+    int tries, last_held;
+} HoldState;
+
+static HoldState g_hold[PORTS][CONTROL_COUNT];
+
+void recomp_bindings_toggle_reader(const char *control, int (*is_on)(unsigned port))
+{
+    int k = control ? control_index(control) : -1;
+
+    if (k >= 0)
+        g_toggle_reader[k] = is_on;
+}
+
+int recomp_bindings_hold_available(const char *control)
+{
+    int k = control ? control_index(control) : -1;
+
+    return k >= 0 && g_toggle_reader[k] != NULL;
+}
+
+int recomp_bindings_get_hold(unsigned port, const char *control)
+{
+    int k = control ? control_index(control) : -1;
+
+    recomp_bindings_init();
+    return port < PORTS && k >= 0 && ((g_ctl[port].hold_mask >> k) & 1u);
+}
+
+void recomp_bindings_set_hold(unsigned port, const char *control, int on)
+{
+    int k = control ? control_index(control) : -1;
+
+    recomp_bindings_init();
+    if (port >= PORTS || k < 0)
+        return;
+    if (on)
+        g_ctl[port].hold_mask |= 1u << k;
+    else
+        g_ctl[port].hold_mask &= ~(1u << k);
+}
+
+/* The pulse to send this sample, 0 or 255. */
+static int hold_pulse(unsigned port, int k, int held)
+{
+    HoldState *h = &g_hold[port][k];
+    unsigned long long now = now_ms();
+    int on;
+
+    if (held != h->last_held) {
+        h->last_held = held;
+        h->tries = 0;
+    }
+    if (h->phase == 1) {
+        if (now < h->until)
+            return 255;
+        h->phase = 2;
+        h->until = now + HOLD_WAIT_MS;
+        return 0;
+    }
+    on = g_toggle_reader[k](port);
+    if (on < 0) {                   /* the title has nothing to toggle now */
+        h->phase = 0;
+        h->tries = 0;
+        return 0;
+    }
+    if ((on != 0) == held) {
+        h->phase = 0;
+        h->tries = 0;
+        return 0;
+    }
+    if (h->phase == 2 && now < h->until)
+        return 0;
+    h->phase = 0;
+    if (h->tries >= HOLD_TRIES)
+        return 0;
+    h->tries++;
+    h->phase = 1;
+    h->until = now + HOLD_PRESS_MS;
+    return 255;
+}
+
 int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
 {
     Controller *c;
     KeyCache kc;
     RecompPadState pad;
+    MouseSample ms;
     int have_pad = 0, i;
     int axis[4] = { 0, 0, 0, 0 };
 
@@ -853,20 +1162,41 @@ int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
     c = &g_ctl[port];
     if (c->device == DEV_NONE)
         return 0;
+    /* The in-game menu has the input: the pad is there, and untouched. */
+    if (recomp_input_suspended())
+        return 1;
     memset(&kc, 0, sizeof kc);
     key_cache_tick();
     memset(&pad, 0, sizeof pad);
     if (c->device == DEV_PAD)
         have_pad = recomp_pad_read(c->pad, &pad);
+    memset(&ms, 0, sizeof ms);
+    if (c->has_mouse) {
+        recomp_mouse_velocity((unsigned)c->mouse.window_ms, &ms.vx, &ms.vy);
+        ms.buttons = recomp_mouse_buttons();
+    }
 
     for (i = 0; i < CONTROL_COUNT; i++) {
         int mag = 0, s;
+        int hold = ((c->hold_mask >> i) & 1u) && g_toggle_reader[i], held = 0;
 
         for (s = 0; s < c->bind[i].count; s++) {
-            int m = source_magnitude(&c->bind[i].src[s], &kc, &pad, have_pad,
-                                     c->deadzone);
+            const Source *src = &c->bind[i].src[s];
+            int m = source_magnitude(src, &kc, &pad, have_pad,
+                                     c->deadzone, &ms, &c->mouse);
+            if (hold && (src->kind == SRC_KEY || src->kind == SRC_MOUSE_BUTTON ||
+                         src->kind == SRC_MOUSE_WHEEL || src->kind == SRC_MOUSE_AXIS)) {
+                if (m >= 64)
+                    held = 1;
+                continue;
+            }
             if (m > mag)
                 mag = m;
+        }
+        if (hold) {
+            int pulse = hold_pulse(port, i, held);
+            if (pulse > mag)
+                mag = pulse;
         }
         if (!mag)
             continue;
@@ -915,7 +1245,8 @@ unsigned recomp_bindings_present_mask(void)
     mask = 0;
     for (i = 0; i < PORTS; i++) {
         Controller *c = &g_ctl[i];
-        if (c->device == DEV_KEYBOARD || (c->device == DEV_PAD && c->has_key)) {
+        if (c->device == DEV_KEYBOARD ||
+            (c->device == DEV_PAD && (c->has_key || c->has_mouse))) {
             mask |= 1u << i;
         } else if (c->device == DEV_PAD) {
             RecompPadState st;
@@ -924,6 +1255,45 @@ unsigned recomp_bindings_present_mask(void)
         }
     }
     return mask;
+}
+
+int recomp_bindings_mouse_port(void)
+{
+    int i;
+
+    recomp_bindings_init();
+    for (i = 0; i < PORTS; i++)
+        if (g_ctl[i].has_mouse && g_ctl[i].device != DEV_NONE)
+            return i;
+    return -1;
+}
+
+int recomp_bindings_get_mouse(unsigned port, RecompMouseSettings *out)
+{
+    recomp_bindings_init();
+    if (port >= PORTS || !out)
+        return 0;
+    out->sensitivity = g_ctl[port].mouse.sensitivity;
+    out->y_scale = g_ctl[port].mouse.y_scale;
+    out->invert_y = g_ctl[port].mouse.invert_y;
+    out->zoom_match = g_ctl[port].mouse.zoom_match;
+    return 1;
+}
+
+/* Plain stores of a double and an int, read by the sampler on guest threads:
+ * a poll that lands mid-change reads one value old and one new, for one
+ * sample, which nobody can feel. */
+void recomp_bindings_set_mouse(unsigned port, const RecompMouseSettings *in)
+{
+    recomp_bindings_init();
+    if (port >= PORTS || !in)
+        return;
+    if (in->sensitivity > 0.0 && in->sensitivity <= 100.0)
+        g_ctl[port].mouse.sensitivity = in->sensitivity;
+    if (in->y_scale >= 0.1 && in->y_scale <= 10.0)
+        g_ctl[port].mouse.y_scale = in->y_scale;
+    g_ctl[port].mouse.invert_y = in->invert_y ? 1 : 0;
+    g_ctl[port].mouse.zoom_match = in->zoom_match ? 1 : 0;
 }
 
 void recomp_bindings_rumble(unsigned port, unsigned short low, unsigned short high)

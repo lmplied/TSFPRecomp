@@ -179,6 +179,92 @@ int main(int argc, char **argv)
         }
     }
 
+    /* A preset with more sources than the launcher shows, mouse sources and
+     * mouse settings: all of it survives a save from here. Before, a save
+     * kept one pad and one key source per control and nothing else. */
+    {
+        FILE *f = fopen(tmp, "wb");
+
+        if (f) {
+            char *text;
+
+            fputs("{ \"version\": 1, \"controllers\": [\n"
+                  "  { \"port\": 1, \"device\": \"gamepad:0\",\n"
+                  "    \"mouse_sensitivity\": 2.5, \"mouse_deadzone\": 8000,\n"
+                  "    \"mouse_invert_y\": true,\n"
+                  "    \"hold\": [\"rthumb\", \"lthumb\"],\n"
+                  "    \"bindings\": {\n"
+                  "      \"a\": [\"pad:a\", \"key:E\", \"key:SPACE\", \"key:RETURN\"],\n"
+                  "      \"rtrigger\": [\"pad:rt\", \"mouse:left\"],\n"
+                  "      \"rstick_right\": [\"pad:rx+\", \"mouse:x+\"] } } ] }\n", f);
+            fclose(f);
+            check(bind_load(tmp, &b) != 0, "the preset reads");
+            check_str(b.port[0].key_src[0], "key:E", "first key shown");
+            check(bind_hidden_count(&b.port[0], 0) == 2, "two more kept out of sight");
+            check_str(b.port[0].key_src[9], "mouse:left", "a click is the keyboard column");
+            check_str(b.port[0].key_src[22], "mouse:x+", "mouse motion is the keyboard column");
+            check(b.port[0].mouse.present && b.port[0].mouse.sensitivity == 2.5 &&
+                  b.port[0].mouse.deadzone == 8000 && b.port[0].mouse.invert_y,
+                  "mouse settings read");
+
+            check(bind_save(tmp, &b) != 0, "the preset saves");
+            check(bind_load(tmp, &a) != 0, "and reads back");
+            check_str(a.port[0].extra_src[0][0], "key:SPACE", "round trip: hidden source 1");
+            check_str(a.port[0].extra_src[0][1], "key:RETURN", "round trip: hidden source 2");
+            check_str(a.port[0].key_src[9], "mouse:left", "round trip: a click");
+            check(a.port[0].mouse.present && a.port[0].mouse.sensitivity == 2.5 &&
+                  a.port[0].mouse.invert_y, "round trip: mouse settings");
+            check(!a.port[1].mouse.present, "a port without mouse settings gains none");
+            {
+                int k, rthumb = -1, lthumb = -1;
+
+                for (k = 0; k < BIND_CONTROLS; k++) {
+                    if (strcmp(bind_control_names[k], "rthumb") == 0) rthumb = k;
+                    if (strcmp(bind_control_names[k], "lthumb") == 0) lthumb = k;
+                }
+                check(rthumb >= 0 && lthumb >= 0 &&
+                      a.port[0].hold == ((1u << rthumb) | (1u << lthumb)),
+                      "round trip: the hold list");
+                check(a.port[1].hold == 0, "a port without a hold list gains none");
+            }
+
+            /* Rebinding the column shows what it does: the hidden keys go. */
+            bind_drop_hidden_keys(&a.port[0], 0);
+            check(bind_hidden_count(&a.port[0], 0) == 0, "rebinding drops hidden keys");
+
+            /* A file that never had the mouse does not grow mouse keys. */
+            bind_defaults(&a);
+            check(bind_save(tmp, &a) != 0, "defaults save");
+            text = slurp(tmp);
+            check(text && !strstr(text, "mouse_"), "no mouse settings written unasked");
+            free(text);
+        }
+    }
+
+    /* A title's action names: read, written back, and taken from the preset
+     * by a file that predates them. */
+    {
+        const char *preset = "test_bindings_preset.json";
+        FILE *f = fopen(preset, "wb");
+
+        if (f) {
+            fputs("{ \"version\": 1, \"labels\": { \"rtrigger\": \"Fire\", \"x\": \"Reload\" },\n"
+                  "  \"controllers\": [ { \"port\": 1, \"bindings\": {} } ] }\n", f);
+            fclose(f);
+            check(bind_load(preset, &a) != 0, "a preset with labels reads");
+            check_str(bind_control_title(&a, 9), "Fire", "a label names its control");
+            check_str(bind_control_title(&a, 0), "A", "an unlabelled control keeps its Xbox name");
+            check(bind_save(tmp, &a) != 0 && bind_load(tmp, &b) != 0, "labels round trip");
+            check_str(b.action[2], "Reload", "round trip: a label");
+
+            bind_defaults(&a);
+            check(bind_save(tmp, &a) != 0, "a file with no labels saves");
+            bind_load_with_labels(tmp, preset, &b);
+            check_str(bind_control_title(&b, 9), "Fire", "labels come from the preset");
+            remove(preset);
+        }
+    }
+
     remove(tmp);
     if (failures)
         printf("test_bindings: %d FAILURE(S)\n", failures);

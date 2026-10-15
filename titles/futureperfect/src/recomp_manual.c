@@ -22,6 +22,12 @@
 #include <stdint.h>
 #include <stdlib.h>   /* getenv, exit: the spin verdict below */
 #include <string.h>   /* strcmp: RECOMP_ICALL_FATAL */
+#include <time.h>     /* time: the stick probe's report interval */
+#include <math.h>     /* atan2: the look test's yaw */
+#include "input_bindings.h"   /* the mouse settings, for 1:1 aim */
+#include "input_mouse.h"      /* the mouse's counts, for 1:1 aim */
+#include "hle_xmv_play.h"     /* the intro videos to skip */
+#include "recomp_config.h"    /* the field of view */
 
 /* One diagnostic report, one piece.
  *
@@ -135,6 +141,7 @@ extern RECOMP_MANUAL_TLS uint32_t g_icall_dispatch_form;
  */
 #define FP_GUEST(va) ((uint8_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
 #define FP_MEM32(va) (*(volatile uint32_t *)FP_GUEST(va))
+#define FP_MEM8(va) (*(volatile uint8_t *)FP_GUEST(va))
 
 void sub_000245C0(void)
 {
@@ -146,6 +153,682 @@ void sub_000245C0(void)
         memmove(FP_GUEST(dst), FP_GUEST(src), n);
     g_eax = dst;
     g_esp += 4u;            /* ret: the caller pops the arguments (cdecl) */
+}
+
+/* -- Future Perfect: the stick reader at 0x00042970 --------------------- */
+
+/*
+ * float sub_00042970(int player, int axis), cdecl, the result on the x87
+ * stack: every read of a stick by the game's own logic goes through it. The
+ * controller poll (sub_0018FF70) has already turned each XInput axis into a
+ * byte centred on 0x80 (+0x1C left X, +0x20 left Y, +0x24 right X, +0x28
+ * right Y, so axis 3 is right X and 4 right Y) in the player's controller
+ * record, 0x3C bytes each from 0x006B93D0. This turns the byte back into
+ * -1..1 and takes off the record's own deadzone (the float at +0, which the
+ * game sets per player through sub_00042920): inside it 0, outside it
+ * rescaled to start from 0. While 0x006B9888 is set -- input locked -- the
+ * answer is 0.
+ *
+ * Replaced by the same arithmetic, in the same single precision with the
+ * same constants read from the XBE's own .rdata, so the game cannot tell;
+ * it is here to be a place to stand. RECOMP_FP_AXIS_PROBE=1 reports which
+ * call sites read the right stick, every five seconds, which is how the
+ * camera code that turns the view was found.
+ */
+#define FP_MEMF(va) (*(volatile float *)FP_GUEST(va))
+
+extern RECOMP_MANUAL_TLS double g_fp_stack[8];
+extern RECOMP_MANUAL_TLS int    g_fp_top;
+
+static void fp_axis_probe(uint32_t axis, uint32_t caller, float v)
+{
+    static int on = -1;
+    static uint32_t sites[16];
+    static unsigned long counts[16], moved[16];
+    static int n;
+    static time_t last;
+    int i;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_FP_AXIS_PROBE");
+        on = e && *e && strcmp(e, "0") != 0;
+    }
+    if (!on || (axis != 3 && axis != 4))
+        return;
+    for (i = 0; i < n && sites[i] != caller; i++)
+        ;
+    if (i == n && n < 16) {
+        sites[n] = caller;
+        n++;
+    }
+    if (i < 16) {
+        counts[i]++;
+        if (v != 0.0f)
+            moved[i]++;
+    }
+    {
+        time_t now = time(NULL);
+        if (now - last >= 5) {
+            last = now;
+            RECOMP_DIAG_LOCK();
+            fprintf(stderr, "[FP-AXIS] right-stick reads in the last 5 s:");
+            for (i = 0; i < n; i++)
+                fprintf(stderr, " 0x%08X x%lu (%lu non-zero)", sites[i], counts[i], moved[i]);
+            fprintf(stderr, "\n");
+            RECOMP_DIAG_UNLOCK();
+            fflush(stderr);
+            memset(counts, 0, sizeof counts);
+            memset(moved, 0, sizeof moved);
+        }
+    }
+}
+
+void sub_00042970(void)
+{
+    uint32_t caller = FP_MEM32(g_esp);
+    uint32_t player = FP_MEM32(g_esp + 4u);
+    uint32_t axis   = FP_MEM32(g_esp + 8u);
+    float v = 0.0f;
+
+    if (FP_MEM32(0x006B9888u) == 0) {
+        uint32_t ctl = FP_MEM32(0x0076B0FCu)
+                     ? 0x006B94C8u + player * 0x3Cu
+                     : 0x006B93D0u + FP_MEM32(0x006B93C0u + player * 4u) * 0x3Cu;
+        float dz = FP_MEMF(ctl);
+        int32_t b = (int32_t)FP_MEM32(ctl + 0x18u + axis * 4u);
+
+        v = (float)(b - 0x80) * (b < 0x80 ? FP_MEMF(0x004783A8u) : FP_MEMF(0x00476038u));
+        if (dz > 0.0f) {
+            float span = FP_MEMF(0x00475C78u) - dz;   /* 1.0 - dz, in single precision */
+            if (0.0f - dz > v)
+                v = (v + dz) / span;
+            else if (v > dz)
+                v = (v - dz) / span;
+            else
+                v = 0.0f;
+        }
+    }
+    fp_axis_probe(axis, caller, v);
+
+    g_fp_top = (g_fp_top + 7) & 7;              /* fld: the result on st0 */
+    g_fp_stack[g_fp_top] = (double)v;
+    g_esp += 4u;                                /* ret; the caller pops (cdecl) */
+}
+
+/* -- Future Perfect: the look vector, sub_0025CE80 ---------------------- */
+
+/*
+ * void sub_0025CE80(float *look, float *move), from the player update
+ * sub_000D5EB0 once a frame: the look vector the camera turns by, from the
+ * right stick through the control layout (sub_000CF200, actions 0x11 and
+ * 0x10), with a 0.25 deadzone of its own set each frame (sub_00042920) and a
+ * squared response (direction from a sine table, length capped at 1 and
+ * squared), then Inverse Look; and the move vector, from the left stick.
+ *
+ * Wrapped (the generated body is sub_0025CE80_gen) so the mouse can replace
+ * the look vector after the game has made it -- past the deadzone and the
+ * curve, and only where the game asked for one, so menus, cutscenes and
+ * every special mode keep their own handling.
+ *
+ * RECOMP_FP_LOOK_TEST=<ms>:<x>:<ms long>[,...] sets look x to a constant
+ * for a while on the input script's clock, and logs the view's yaw every
+ * frame (from the view matrix the D3D library keeps at 0x003E32A0, m00 and
+ * m20), which is how the turn this vector produces was measured.
+ */
+extern void sub_0025CE80_gen(void);
+extern unsigned long long recomp_input_script_ms(void);
+
+static void fp_look_test(uint32_t look_va)
+{
+    static int parsed;
+    static int count;
+    static struct { unsigned long at, len; float x, y; } steps[16];
+    static float last_yaw;
+    static int have_last;
+    unsigned long long t;
+    float x = 999.0f, y = 999.0f, yaw;
+    int i, nearby = 0;
+
+    if (!parsed) {
+        const char *s = getenv("RECOMP_FP_LOOK_TEST");
+        char *end;
+        parsed = 1;
+        while (s && *s && count < 16) {
+            steps[count].at = strtoul(s, &end, 10);
+            if (*end != ':') break;
+            steps[count].x = (float)strtod(end + 1, &end);
+            if (*end != ':') break;
+            steps[count].y = (float)strtod(end + 1, &end);
+            if (*end != ':') break;
+            steps[count].len = strtoul(end + 1, &end, 10);
+            count++;
+            s = *end == ',' ? end + 1 : end;
+        }
+    }
+    if (!count)
+        return;
+    t = recomp_input_script_ms();
+    for (i = 0; i < count; i++) {
+        if (t >= steps[i].at && t < steps[i].at + steps[i].len) {
+            x = steps[i].x;
+            y = steps[i].y;
+        }
+        if (t + 300 >= steps[i].at && t < steps[i].at + steps[i].len + 600)
+            nearby = 1;
+    }
+    /* 999: leave that axis as the game made it, and only log. */
+    if (x != 999.0f)
+        FP_MEMF(look_va) = x;
+    if (y != 999.0f)
+        FP_MEMF(look_va + 4u) = y;
+    yaw = (float)(atan2((double)FP_MEMF(0x003E32C0u), (double)FP_MEMF(0x003E32A0u))
+                  * 57.29577951308232);
+    if (nearby) {
+        float d = have_last ? yaw - last_yaw : 0.0f;
+        if (d > 180.0f) d -= 360.0f;
+        if (d < -180.0f) d += 360.0f;
+        fprintf(stderr, "[FP-LOOK] t=%llu look=%.3f,%.3f yaw=%.3f dyaw=%.4f "
+                "m01=%.4f m11=%.4f m21=%.4f m12=%.4f m10=%.4f\n",
+                t, FP_MEMF(look_va), FP_MEMF(look_va + 4u), yaw, d,
+                FP_MEMF(0x003E32A4u), FP_MEMF(0x003E32B4u), FP_MEMF(0x003E32C4u),
+                FP_MEMF(0x003E32B8u), FP_MEMF(0x003E32B0u));
+    }
+    last_yaw = yaw;
+    have_last = 1;
+}
+
+/* -- Future Perfect: true 1:1 mouse aim ---------------------------------- */
+
+/*
+ * The player's view angles, in degrees: yaw at [player+0x100] (growing as
+ * the view turns left) and pitch at [player+0x104] (growing looking up).
+ * Found by recording the player each frame through stick turns
+ * (RECOMP_FP_SCAN) against the view matrix: both follow it 1:1. The look
+ * consumer sub_0025D520 is what moves them -- yaw by look x times a turn
+ * acceleration ([player+0xF80]) and the world step, then wrapped into
+ * 0..360; pitch by look y (or eased toward level, with the game's
+ * auto-centre option), then held within +-[0x007B0C80].
+ *
+ * So the mouse turns the angles themselves, here, just before the consumer
+ * runs: counts times the sensitivity, added to yaw and pitch, and the
+ * consumer then adds the stick's turn, wraps and clamps as it always does.
+ * Nothing is measured or learned, so nothing can run away: 1:1 with no
+ * deadzone, curve, acceleration or speed cap, the turn lands in the frame
+ * it was made in, and the in-game Inverse Look stays out of it (the mouse
+ * has its own).
+ *
+ * (The first version steered the look vector toward a target and learned
+ * its gain from the view matrix each frame. In real play that loop
+ * oscillated -- the gun whipping about -- and its guard against a view
+ * turning the wrong way read the oscillation as a reversed axis and turned
+ * the axis round at random. Scripted runs, feeding steady counts, never
+ * showed it.)
+ *
+ * Only where the consumer turns the view by the look vector (fp_look_reader);
+ * elsewhere -- the states the consumer handles otherwise, and anywhere the
+ * look builder is not called, menus and cutscenes -- the mouse goes back to
+ * the right stick (recomp_mouse_set_direct lapses).
+ *
+ * RECOMP_FP_MOUSE_AIM=0 goes back to the mouse driving the right stick.
+ * RECOMP_FP_MOUSE_TEST=<ms>:<dx>:<dy>:<ms long>[,...] feeds counts each
+ * frame on the input script's clock, as if the mouse were captured, and logs
+ * every frame of it ([FP-AIM]).
+ */
+#define FP_DEG_PER_COUNT  0.04     /* at sensitivity 1: 360 degrees in about 29 cm at 800 dpi */
+
+/* How sub_0025D520 is about to treat the player at [0x007B0C7C]. */
+typedef struct {
+    uint32_t pl;            /* the player */
+    uint32_t state;         /* [player+0x114]: 2 on foot */
+    int aim;                /* [player+0xF5C]: aim mode */
+} FpLook;
+
+/* 0 when, in the player's state, the look vector turns nothing. The tests
+ * are sub_0025D520's own, down to 0x0025D5EE; constants from the XBE. */
+static int fp_look_reader(FpLook *s)
+{
+    uint32_t pl = FP_MEM32(0x007B0C7Cu), o;
+
+    if (!pl || !FP_MEM32(pl + 0x1500u))
+        return 0;
+    s->pl = pl;
+    s->state = FP_MEM32(pl + 0x114u);
+    if (s->state == 0x80)
+        return 0;                   /* its own handling, from 0x0025D55F */
+    if (!(FP_MEM8(pl + 0xCu) & 0x80) || s->state == 0x100) {
+        o = FP_MEM32(0x007B0CC0u);
+        if (!o || !(o = FP_MEM32(o + 0x26Cu)) || FP_MEM32(o) != 0x18 ||
+            s->state == 0x400 || s->state == 0x200)
+            return 0;
+    }
+    s->aim = FP_MEM32(pl + 0xF5Cu) != 0;
+    return 1;
+}
+
+/* Zoomed in, the mouse turns the view by less, in proportion: the same
+ * movement crosses the same part of the screen at any zoom (the "monitor
+ * distance 0" convention PC shooters use). The zoom is the camera's own
+ * vertical angle now ([player+8] +0x384, which eases from 55 degrees on foot
+ * to the zoomed angle in aim mode), against what it was when last not
+ * aiming, so a field-of-view setting moves both. Not zoomed in, or switched
+ * off (mouse_zoom_match), 1. */
+static double fp_zoom_scale(uint32_t pl, int aiming, int match)
+{
+    static double unzoomed = 0.0;
+    uint32_t cam = FP_MEM32(pl + 8u);
+    double fov, t;
+
+    if (!cam)
+        return 1.0;
+    fov = FP_MEMF(cam + 0x384u);
+    if (!(fov > 1.0 && fov < 170.0))
+        return 1.0;
+    t = tan(fov * 3.14159265358979 / 360.0);
+    if (!aiming) {
+        unzoomed = t;
+        return 1.0;
+    }
+    if (!match || unzoomed <= 0.0 || t >= unzoomed)
+        return 1.0;
+    return t / unzoomed < 0.05 ? 0.05 : t / unzoomed;
+}
+
+/* Yaw grows turning left; pitch grows looking up (m21 grows as the view
+ * tips down). From the view matrix the D3D library keeps; for the tests. */
+static void fp_view_angles(float *yaw, float *pitch)
+{
+    double m21 = FP_MEMF(0x003E32C4u);
+
+    if (m21 > 1.0) m21 = 1.0;
+    if (m21 < -1.0) m21 = -1.0;
+    *yaw = (float)(atan2((double)FP_MEMF(0x003E32C0u), (double)FP_MEMF(0x003E32C8u))
+                   * 57.29577951308232);
+    *pitch = (float)(-asin(m21) * 57.29577951308232);
+}
+
+/* RECOMP_FP_MOUSE_TEST: counts to feed this frame, and whether a step is on. */
+static int fp_mouse_test(long *dx, long *dy, int *logging)
+{
+    static int parsed, count;
+    static struct { unsigned long at, len; long dx, dy; } steps[16];
+    unsigned long long t;
+    int i;
+
+    if (!parsed) {
+        const char *s = getenv("RECOMP_FP_MOUSE_TEST");
+        char *end;
+        parsed = 1;
+        while (s && *s && count < 16) {
+            steps[count].at = strtoul(s, &end, 10);
+            if (*end != ':') break;
+            steps[count].dx = strtol(end + 1, &end, 10);
+            if (*end != ':') break;
+            steps[count].dy = strtol(end + 1, &end, 10);
+            if (*end != ':') break;
+            steps[count].len = strtoul(end + 1, &end, 10);
+            count++;
+            s = *end == ',' ? end + 1 : end;
+        }
+    }
+    *logging = 0;
+    if (!count)
+        return 0;
+    t = recomp_input_script_ms();
+    for (i = 0; i < count; i++) {
+        if (t >= steps[i].at && t < steps[i].at + steps[i].len) {
+            *dx += steps[i].dx;
+            *dy += steps[i].dy;
+        }
+        if (t + 200 >= steps[i].at && t < steps[i].at + steps[i].len + 400)
+            *logging = 1;
+    }
+    return 1;                       /* a test is configured: treat as captured */
+}
+
+static void fp_mouse_aim(uint32_t look_va)
+{
+    static int enabled = -1;
+    RecompMouseSettings ms;
+    FpLook rd;
+    long dx = 0, dy = 0;
+    int port, testing, logging = 0;
+    double k;
+    float yaw, pitch;
+
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_FP_MOUSE_AIM");
+        enabled = !(e && *e && strcmp(e, "0") == 0);
+        fprintf(stderr, "[FP-AIM] mouse aim %s\n", enabled
+                ? "1:1 into the view angles (RECOMP_FP_MOUSE_AIM=0 for the stick)"
+                : "through the right stick (RECOMP_FP_MOUSE_AIM=0)");
+        fflush(stderr);
+    }
+    if (!enabled)
+        return;
+    port = recomp_bindings_mouse_port();
+    testing = fp_mouse_test(&dx, &dy, &logging);
+    if (recomp_mouse_captured()) {
+        long rx, ry;
+        recomp_mouse_take_counts(&rx, &ry);     /* taken even when unused: no backlog */
+        dx += rx;
+        dy += ry;
+    }
+    if (port < 0 || (!recomp_mouse_captured() && !testing) ||
+        !recomp_bindings_get_mouse((unsigned)port, &ms))
+        return;
+    if (!fp_look_reader(&rd)) {
+        recomp_mouse_set_direct(0);             /* the stick turns this state */
+        return;
+    }
+    recomp_mouse_set_direct(1);
+
+    /* Right (dx > 0) turns right, which is yaw going down. Away from the
+     * player (dy < 0) looks up, which is pitch going up. The consumer wraps
+     * yaw and holds pitch to its limit after adding the stick's turn. */
+    k = FP_DEG_PER_COUNT * ms.sensitivity * fp_zoom_scale(rd.pl, rd.aim, ms.zoom_match);
+    yaw = FP_MEMF(rd.pl + 0x100u) - (float)(dx * k);
+    pitch = FP_MEMF(rd.pl + 0x104u) + (float)((ms.invert_y ? dy : -dy) * k * ms.y_scale);
+    if (yaw >= 360.0f || yaw < 0.0f)
+        yaw -= 360.0f * floorf(yaw / 360.0f);
+    if (pitch > 89.0f) pitch = 89.0f;
+    if (pitch < -89.0f) pitch = -89.0f;
+    if (dx)
+        FP_MEMF(rd.pl + 0x100u) = yaw;
+    if (dy)
+        FP_MEMF(rd.pl + 0x104u) = pitch;
+
+    if (logging) {
+        float vy, vp;
+        fp_view_angles(&vy, &vp);
+        fprintf(stderr, "[FP-AIM] t=%llu in %ld,%ld  angles %.3f,%.3f  view %.3f,%.3f  "
+                "look %.3f,%.3f  state %x%s  zoom %.3f\n",
+                recomp_input_script_ms(), dx, dy, FP_MEMF(rd.pl + 0x100u),
+                FP_MEMF(rd.pl + 0x104u), vy, vp, FP_MEMF(look_va), FP_MEMF(look_va + 4u),
+                rd.state, rd.aim ? " aim" : "",
+                fp_zoom_scale(rd.pl, rd.aim, ms.zoom_match));
+    }
+}
+
+/* RECOMP_FP_POKE=<ms>:<ms long>:<va hex>:<float>[,...]: write a float every
+ * frame of a window on the input script's clock -- how a variable is found
+ * by what changing it does. */
+static void fp_poke(void)
+{
+    static int parsed, count;
+    static struct { unsigned long at, len; uint32_t va; float v; } p[16];
+    unsigned long long t;
+    int i;
+
+    if (!parsed) {
+        const char *s = getenv("RECOMP_FP_POKE");
+        char *end;
+
+        parsed = 1;
+        while (s && *s && count < 16) {
+            p[count].at = strtoul(s, &end, 10);
+            if (*end != ':') break;
+            p[count].len = strtoul(end + 1, &end, 10);
+            if (*end != ':') break;
+            p[count].va = (uint32_t)strtoul(end + 1, &end, 16);
+            if (*end != ':') break;
+            p[count].v = (float)strtod(end + 1, &end);
+            count++;
+            s = *end == ',' ? end + 1 : end;
+        }
+    }
+    if (!count)
+        return;
+    t = recomp_input_script_ms();
+    for (i = 0; i < count; i++)
+        if (t >= p[i].at && t < p[i].at + p[i].len)
+            FP_MEMF(p[i].va) = p[i].v;
+}
+
+/* The field of view (recomp_fov). The camera ([player+0x8], the block its
+ * matrices start at) keeps its angles as floats, vertical, in degrees:
+ *   +0x37C tan(vertical/2)    +0x380 tan(horizontal/2), from the aspect
+ *   +0x384 the angle now      +0x388 the angle it eases toward
+ *   +0x38C the zoomed angle
+ * Found by RAM snapshot (55, 55, 30.25 on foot) and by holding each at 75
+ * (RECOMP_FP_POKE): +0x384 moves the view at once and is eased back; +0x388
+ * moves it and stays. The game writes +0x388 only when the view changes
+ * mode -- the zoomed angle going into aim mode, its own 55 coming out -- so
+ * the setting is +0x388 whenever the player is not aiming, put back the frame
+ * after the game sets its own. The game derives everything else from the
+ * angle now, its culling included, so the edges of a wider view are drawn.
+ * Only while the look builder runs: never in a cutscene. */
+static void fp_apply_fov(void)
+{
+    static float game_fov, written;
+    uint32_t pl = FP_MEM32(0x007B0C7Cu), cam;
+    double user = recomp_fov();
+    FpLook rd;
+    float target, want;
+
+    if (!pl || !(cam = FP_MEM32(pl + 8u)) || !fp_look_reader(&rd) || rd.aim)
+        return;
+    target = FP_MEMF(cam + 0x388u);
+    if (!(target > 10.0f && target < 120.0f))
+        return;                             /* not the camera this was measured on */
+    if (target != written)
+        game_fov = target;                  /* the game chose it: its own angle */
+    want = user > 0.0 ? (float)user : game_fov;
+    if (want != target)
+        FP_MEMF(cam + 0x388u) = want;
+    written = want;
+}
+
+/* When the look builder last ran (sub_0025CE80, below): the player is in
+ * play, not in a menu, a pause or a cutscene. */
+static volatile long g_fp_look_tick;
+
+/* -- Future Perfect: any screen shape (ultrawide) ------------------------- */
+
+/*
+ * Booted widescreen, Future Perfect keeps its screen's shape as two whole
+ * numbers -- 16 at 0x004C0458, 9 at 0x004C045C -- and the squeeze its 2D layer
+ * is drawn with, (4/3)/(16/9) = 0.75 at 0x004C0460, all three set once by its
+ * device set-up (0x00023A9A). The camera builds its horizontal angle from the
+ * two numbers each frame (tan(h/2) = tan(v/2) * 16/9, camera +0x380), the HUD
+ * and menus place themselves by the squeeze, and 27 places ask sub_0003C420
+ * whether the screen is 16:9 -- exactly 16 and 9, which anything else fails.
+ *
+ * With the picture filling a window of another shape (xbox_D3D8FillShape,
+ * the wide_fill setting), the three take the window's shape and the question
+ * becomes "wider than 4:3". The game then draws 21:9 itself: its own camera,
+ * its own culling, its own 2D layout. Kept up to date from the three
+ * accessors below, which the game calls every frame, so a window being
+ * resized is followed as it goes; 16:9 again whenever filling is off.
+ */
+extern int xbox_D3D8FillShape(unsigned int *width, unsigned int *height);
+extern void xbox_D3D8SetTitleAnyAspect(int on);
+extern void xbox_D3D8SetInterpRegisters(int projection, int affine_first, int affine_count);
+extern void xbox_Nv2aFlipGateSetTitlePaced(int on);
+
+static void fp_aspect_follow(void)
+{
+    static int wide;                        /* the game booted 16:9 */
+    unsigned w = 16, h = 9, a, b, t;
+
+    if (!wide) {
+        if (FP_MEM32(0x004C0458u) != 16 || FP_MEM32(0x004C045Cu) != 9)
+            return;
+        wide = 1;
+    }
+    if (xbox_D3D8FillShape(&w, &h) && h) {
+        if (w * 3u < h * 4u) {
+            w = 4;                          /* narrower than 4:3 stays 4:3 */
+            h = 3;
+        }
+        for (a = w, b = h; b; t = a % b, a = b, b = t)
+            ;
+        w /= a;
+        h /= a;
+    } else {
+        w = 16;
+        h = 9;
+    }
+    if (FP_MEM32(0x004C0458u) != w || FP_MEM32(0x004C045Cu) != h) {
+        FP_MEM32(0x004C0458u) = w;
+        FP_MEM32(0x004C045Cu) = h;
+        FP_MEMF(0x004C0460u) = (float)(4.0 * h / (3.0 * w));
+        fprintf(stderr, "[FP] screen shape %u:%u, 2D squeeze %.4f\n", w, h,
+                (double)FP_MEMF(0x004C0460u));
+        fflush(stderr);
+    }
+}
+
+/* The screen's width and height in the game's terms, and whether it is
+ * wider than 4:3 (the original: exactly 16:9). */
+void sub_0003C400(void)
+{
+    fp_aspect_follow();
+    g_eax = FP_MEM32(0x004C0458u);
+    g_esp += 4u;
+}
+
+void sub_0003C410(void)
+{
+    fp_aspect_follow();
+    g_eax = FP_MEM32(0x004C045Cu);
+    g_esp += 4u;
+}
+
+void sub_0003C420(void)
+{
+    fp_aspect_follow();
+    g_eax = FP_MEM32(0x004C0458u) * 3u > FP_MEM32(0x004C045Cu) * 4u ? 1u : 0u;
+    g_esp += 4u;
+}
+
+/* RECOMP_FP_SCAN=<file>:<from ms>:<ms long>: each look-builder call in the
+ * window, on the input script's clock, appends a record -- the clock, the
+ * view's yaw and pitch, the look vector, then the player ([0x007B0C7C],
+ * 0x1600 bytes), its camera ([player+8], 0x400) and [player+0x14] (0x400) --
+ * so the fields that follow the view can be found offline. */
+static void fp_scan(uint32_t look_va, int after)
+{
+    static int parsed;
+    static FILE *f;
+    static unsigned long from, len;
+    unsigned long long t;
+    uint32_t pl = FP_MEM32(0x007B0C7Cu), base[3], size[3] = { 0x1600u, 0x400u, 0x400u };
+    float hdr[6];
+    int i;
+
+    if (!parsed) {
+        const char *s = getenv("RECOMP_FP_SCAN");
+        char path[512], *c;
+        parsed = 1;
+        if (!s || !*s)
+            return;
+        snprintf(path, sizeof path, "%s", s);
+        c = strrchr(path, ':');
+        if (!c) return;
+        len = strtoul(c + 1, NULL, 10);
+        *c = 0;
+        c = strrchr(path, ':');
+        if (!c) return;
+        from = strtoul(c + 1, NULL, 10);
+        *c = 0;
+        f = fopen(path, "wb");
+    }
+    if (!f || !pl)
+        return;
+    t = recomp_input_script_ms();
+    if (t < from || t >= from + len)
+        return;
+    base[0] = pl;
+    base[1] = FP_MEM32(pl + 8u);
+    base[2] = FP_MEM32(pl + 0x14u);
+    fp_view_angles(&hdr[0], &hdr[1]);
+    hdr[2] = FP_MEMF(look_va);
+    hdr[3] = FP_MEMF(look_va + 4u);
+    hdr[4] = (float)after;
+    hdr[5] = (float)FP_MEM32(pl + 0xF5Cu);
+    fwrite(&t, 8, 1, f);
+    fwrite(hdr, sizeof hdr, 1, f);
+    for (i = 0; i < 3; i++) {
+        static uint8_t zero[0x1600];
+        fwrite(&base[i], 4, 1, f);
+        if (base[i] >= 0x10000u)
+            fwrite((const void *)FP_GUEST(base[i]), 1, size[i], f);
+        else
+            fwrite(zero, 1, size[i], f);
+    }
+    fflush(f);
+}
+
+/* The look builder, once per game tick while the player is in play: the
+ * field of view, then the game's own look, then the mouse over it. */
+void sub_0025CE80(void)
+{
+    uint32_t look_va = FP_MEM32(g_esp + 4u);
+
+    fp_poke();
+    fp_apply_fov();
+    sub_0025CE80_gen();
+    g_fp_look_tick = (long)(clock() * 1000 / CLOCKS_PER_SEC);
+    fp_mouse_aim(look_va);
+    fp_look_test(look_va);
+    fp_scan(look_va, 0);
+}
+
+/* -- Future Perfect: what the runtime is told before the game starts ----- */
+
+/* Aim mode, for holding the aim button rather than clicking it
+ * (recomp_bindings_toggle_reader): [player+0xF5C], the flag sub_0025D520
+ * steers by. -1 outside play, so a held button presses nothing in a menu. */
+static int fp_aim_on(unsigned port)
+{
+    FpLook rd;
+    long now = (long)(clock() * 1000 / CLOCKS_PER_SEC);
+
+    (void)port;
+    if (now - g_fp_look_tick > 100 || !fp_look_reader(&rd))
+        return -1;
+    return rd.aim;
+}
+
+/* Crouching, for holding the crouch key: bit 0x10 of [player+0xC], beside
+ * aim mode's 0x20. Found by RAM snapshots standing, crouched, standing,
+ * crouched (RECOMP_RAM_SNAPSHOT over 0x82000000): the one flag that follows,
+ * with the eye height at +0x94 halving alongside it. */
+static int fp_crouch_on(unsigned port)
+{
+    uint32_t pl = FP_MEM32(0x007B0C7Cu);
+    long now = (long)(clock() * 1000 / CLOCKS_PER_SEC);
+
+    (void)port;
+    if (now - g_fp_look_tick > 100 || !pl)
+        return -1;
+    return (FP_MEM32(pl + 0xCu) & 0x10u) != 0;
+}
+
+/* Called from main.c before the game's entry point. */
+void fp_title_setup(void)
+{
+    /* The EA Games logo (one per language) and Free Radical's, before the
+     * title screen; the attract-mode movie is not one of them. */
+    xmv_set_intro_videos("eag_*.xmv;frd.xmv");
+    recomp_bindings_toggle_reader("rthumb", fp_aim_on);
+    recomp_bindings_toggle_reader("lthumb", fp_crouch_on);
+    recomp_fov_support(55.0);               /* the camera's own, every level seen */
+    xbox_D3D8SetTitleAnyAspect(1);          /* fp_aspect_follow: 21:9 and the rest */
+    /* Frame interpolation: the projection at c60-c63, then the model-view
+     * (c64), the projection times it (c68, which most programs draw with)
+     * and a second model-view (c72). Bones are indexed from c96 and are not
+     * blended. */
+    xbox_D3D8SetInterpRegisters(60, 64, 12);
+    /* The frame clock (sub_001538C0) spins on the vblank count, so Swap
+     * comes just after a vblank: the gate holds it to the next one while
+     * frames are interpolated, or there is no time to draw them in. */
+    xbox_Nv2aFlipGateSetTitlePaced(1);
+    {
+        const char *e = getenv("RECOMP_FP_MOUSE_AIM");
+        if (!(e && *e && strcmp(e, "0") == 0))
+            recomp_mouse_declare_direct();      /* the menu shows zoomed aim */
+    }
 }
 
 /* ── Manual function overrides ─────────────────────────────── */

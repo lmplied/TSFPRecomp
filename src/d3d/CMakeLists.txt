@@ -11,6 +11,7 @@ if(WIN32)
         d3d8_combiners.c
         d3d8_vsh.c
         d3d8_overlay.c
+        d3d8_menu.c
         d3d8_movie.c
         d3d8_screencopy.c
         d3d8_display.c

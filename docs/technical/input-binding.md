@@ -84,6 +84,9 @@ or `[]` unbinds.
 | `pad:dpad_up` .. `pad:dpad_right` | the host D-pad |
 | `pad:lt` `pad:rt` | analog triggers, 0-255 |
 | `pad:lx+` `pad:lx-` `pad:ly+` .. `pad:ry-` | one half of one stick axis |
+| `mouse:left` `mouse:right` `mouse:middle` `mouse:x1` `mouse:x2` | mouse buttons (x1 back, x2 forward) |
+| `mouse:wheel_up` `mouse:wheel_down` | a wheel notch, as one short press |
+| `mouse:x+` `mouse:x-` `mouse:y+` `mouse:y-` | mouse motion, one half of one axis: x+ right, y+ away from the player (stick up) |
 
 **Controls** are the 24 inputs an Xbox pad has: `a b x y black white start
 back ltrigger rtrigger`, `dpad_up/down/left/right`, `lthumb`, `rthumb`, and
@@ -98,21 +101,156 @@ gives a full pull; binding a stick half to a key gives a full deflection.
 
 ### Where it lives
 
-Both sides look in the same places, in this order:
+Every side looks in the same places, in this order
+(`recomp_bindings_read_path` in `src/config`, which the runtime and the
+launcher both call):
 
 1. `RECOMP_INPUT_CONFIG`, if set -- an explicit path, and a run says so if it
    cannot be read rather than silently falling back;
-2. `%APPDATA%\xboxrecomp\input_bindings.json` (on POSIX,
-   `$XDG_CONFIG_HOME/xboxrecomp/input_bindings.json`) -- the per-user file the
-   UI writes by default;
-3. `input_bindings.json` in the working directory, which for a title started
-   by its `run.bat` is the directory the executable sits in, so a title can
-   ship a config of its own.
+2. `%APPDATA%\xboxrecomp\titles\<TITLE ID>.bindings.json` -- this title's own,
+   which the launcher writes (`py -3 -m tools.input_ui --title 45410066`
+   edits it too);
+3. `%APPDATA%\xboxrecomp\input_bindings.json` (on POSIX,
+   `$XDG_CONFIG_HOME/xboxrecomp/...`) -- the per-user file every title shares,
+   which `tools.input_ui` writes without `--title`;
+4. `input_bindings.json` beside the executable, then in the working directory
+   -- the preset a title project ships with its build.
 
-Bindings are per-user rather than per-title on purpose: they belong to the
-person and their hardware, and a toolkit that builds several titles should not
-make them rebind for each one. A title that genuinely needs its own gets one
-through (3), and a test run gets one through (1).
+**Per title since October 2026.** Which pad sits on which port belongs to the
+person, but a keyboard layout belongs to the game: the key that throws a
+grenade in Future Perfect means nothing in a racer, and a shared file made a
+keyboard player choose one game's layout for all of them. The shared file is
+still read, after the title's own, so nothing set up before this changes. The
+launcher always saves to the title's own file, and its "Reset this controller"
+goes back to the preset in (4) when there is one.
+
+### The mouse (October 2026)
+
+`src/input/input_mouse.c` reads the mouse as raw input on the game window, so
+motion is the counts the mouse reports, not the pointer -- no Windows pointer
+acceleration, no stop at the screen edge. The game owns the mouse only while it
+is **captured**: a click in the window captures it (that click is not passed
+on), Alt+Tab or anything else that takes the focus releases it, and a
+fullscreen window captures it as soon as it is active. The pointer is hidden and
+held in the window meanwhile. Outside a capture every mouse source reads as
+still and unpressed. Nothing captures unless a binding names a `mouse:` source.
+
+Motion drives a stick. The speed over the last `mouse_window_ms` milliseconds
+(a ring of 1 ms buckets) becomes a deflection, so every poll in a frame sees the
+same stick however often the title reads its pad. Per controller:
+
+| key | default | |
+|---|---|---|
+| `mouse_sensitivity` | 1.0 | 1.0 reaches a full stick at 6 counts a millisecond (4.5 in/s at 800 dpi) |
+| `mouse_deadzone` | 0 | the title's own stick deadzone, in stick units: any motion at all lands just past it |
+| `mouse_exponent` | 1.0 | applied to the deflection; below 1 straightens a title that curves its stick upward |
+| `mouse_y_scale` | 1.0 | up and down against left and right: console games look up and down slower than they turn |
+| `mouse_invert_y` | false | |
+| `mouse_window_ms` | 16 | |
+| `mouse_zoom_match` | true | for a title that aims by the mouse itself: zoomed in, the view turns less, by the zoom |
+
+A click whose release arrives at once is held for 40 ms, so a title sampling
+once a frame still sees it; a wheel notch is a 50 ms press and a 30 ms gap.
+
+**Hold or toggle.** A per-controller `"hold": ["rthumb"]` makes the keys
+and mouse buttons bound to those controls hold a toggle on for as long as
+they are held, where the console toggles on each press (Future Perfect's aim
+mode, a click of the right stick). It needs the title to say how the toggle
+stands (`recomp_bindings_toggle_reader`); then, whenever the button and the
+game disagree, one 50 ms press is sent and the state is given 150 ms to
+follow; a press the game ignores (it cannot aim just now) is tried three
+times, then left until the button changes. Pad buttons keep the toggle. The
+in-game menu has a Hold / Press-to-toggle row for each such control.
+
+**The keyboard and mouse are read only while the game window has the focus.**
+`GetAsyncKeyState` answers for the whole desktop, so before this, typing in a
+chat window with the game behind it walked and fired in the game. A run with
+no game window (the shadow renderer off) reads the keyboard as before.
+
+### Future Perfect's preset
+
+`titles/futureperfect/input_bindings.json`, copied beside the executable and
+the launcher at build time. Controller 1 keeps its pad and adds:
+
+| | Xbox control | keyboard and mouse |
+|---|---|---|
+| Move, side step | left stick | W A S D |
+| Look, turn | right stick | mouse |
+| Fire | right trigger | left click |
+| Aim | right stick click | right click, held |
+| Throw grenade | left trigger | G, middle click |
+| Activate / menu select | A | E, Space, Enter |
+| Melee / menu back | B | F, Backspace |
+| Reload | X | R |
+| (menus) | Y | V |
+| Crouch | left stick click | C, left Ctrl (toggles; can be set to hold) |
+| Change weapon | D-pad left / right | wheel, Q / arrows |
+| Zoom in / out | D-pad up / down | mouse forward / back buttons, arrows |
+| Pause | Start | Escape |
+| Back | Back | Tab |
+
+#### True 1:1 aim
+
+The mouse does not go through the right stick in Future Perfect: it turns
+the player's view angles itself (`titles/futureperfect/src/recomp_manual.c`,
+wrapped around the look builder `sub_0025CE80`; the comment there has the
+detail). A stick only sets how fast the view turns, through the game's
+deadzone, curve, speed cap and turn acceleration, so no stick setting makes a
+mouse feel right. The player keeps yaw at [player+0x100] and pitch at
+[player+0x104], in degrees; the look consumer `sub_0025D520` adds the stick's
+turn to them, wraps yaw and holds pitch within its limit. The hook, which
+runs just before it, adds the counts that arrived times the sensitivity. The
+angle turned is the counts times the sensitivity, the same up and down as
+left and right, in the frame the mouse moved, and the stick still works
+alongside.
+
+The two angles were found by recording the player and its camera every frame
+through scripted stick turns (`RECOMP_FP_SCAN=<file>:<from ms>:<ms long>`)
+and correlating every field with the view matrix's yaw and pitch: both follow
+it at 1.00.
+
+**The first version steered, and it failed in play.** It read where the view
+was from the view matrix, moved a target by the counts, and wrote the look
+vector that would turn the view onto it, learning how far a unit of look
+turned as it went. Scripted counts never showed a problem. A real mouse made
+the loop oscillate (the gun whipping about), and its guard against an axis
+that seemed to turn the wrong way read the oscillation as one and reversed
+the axis at random (`[FP-AIM] the view turns against the mouse`). Writing the
+angles needs nothing measured or learned, so there is nothing to run away.
+
+- `mouse_sensitivity` 1 is 0.04 degrees a count (a full turn in about 29 cm
+  at 800 dpi); the preset's 1.5 is 0.06, about what PC shooters ship with.
+  `mouse_y_scale` is 1.0, and `mouse_invert_y` is the only invert the mouse
+  has: the game's Inverse Look applies to the pad alone.
+  `mouse_deadzone`, `mouse_exponent` and `mouse_window_ms` are not used
+  while the mouse aims directly.
+- Aim mode (right click) zooms: the camera's vertical angle ([player+8]
+  +0x384) eases to the zoomed one, and with `mouse_zoom_match` the mouse
+  turns the view less by the ratio of the two angles' tangents, so a movement
+  crosses the same part of the screen zoomed or not (0.52 at the stock
+  zoom).
+- Holding right click aims (`"hold": ["rthumb"]`): the reader is the aim
+  flag at [player+0xF5C]. Crouch can be held too (left Ctrl, C): bit 0x10 of
+  [player+0xC], found by RAM snapshots standing and crouched; the preset
+  leaves it a toggle.
+- Measured with `RECOMP_FP_MOUSE_TEST` (synthetic counts, logged each frame):
+  yaw moves exactly counts x 0.04 x sensitivity a frame and the view with it,
+  pitch stops at the game's own 60 degrees, and aiming scales both by the
+  zoom.
+- Where the look consumer does not turn the view by the look vector (a state
+  it handles otherwise, a menu, a cutscene) the mouse falls back
+  to the right stick within a quarter of a second, with the stick settings
+  below. `RECOMP_FP_MOUSE_AIM=0` keeps it on the stick everywhere.
+
+The stick settings were measured, not guessed. Holding the right stick at a
+fixed strength in 2401 (`RECOMP_INPUT_SEQ` with `rstick_right@<percent>`, frames
+compared for horizontal shift) turned the view not at all up to 35%, slowly at
+40%, and about 5x and 13x faster at 50% and 60%: Future Perfect ignores the
+right stick below about 37% and curves it upward above that. So the preset's
+`mouse_deadzone` is 12450 (38%) and its `mouse_exponent` 0.7. Up and down
+looks at about half the speed it turns, which the stick fallback keeps. In
+the game's own Controls page Auto Lookahead, which re-centres the view while
+walking, is better off.
 
 ### Defaults, when there is no file
 
@@ -234,10 +372,10 @@ Burnout 2, built from this branch:
   wants thinking about.
 - **DirectInput and raw HID**, so a PlayStation or generic pad appears without
   a third-party translation layer.
-- **Rumble** goes to the model and no further: nothing drives the host pad's
-  motors yet, on any port.
-- **Per-title overrides** beyond dropping a file next to the executable -- no
-  profiles, no per-title directory in the per-user config.
+- **Mouse aim straight into the camera.** Motion goes through the title's
+  stick handling, deadzone, curve and turn-speed cap included, which is as
+  close as a toolkit can get without knowing the game. A title project can do
+  better by adding the mouse to the camera's own angles.
 - **A POSIX backend.** The parser is portable and builds anywhere; the
   sampling is XInput and `GetAsyncKeyState`, so on POSIX every port reads
   neutral until an SDL2 backend exists (the same gap `src/hle`'s audio and

@@ -159,6 +159,9 @@ HRESULT d3d8_vsh_delete_shader(DWORD handle);
 void d3d8_vsh_set_constant(int start_reg, const float *data, int count);
 /* Which constant register the experimental Hor+ scale applies to. */
 int  d3d8_vsh_hor_plus_reg(void);
+/* Nonzero: the title draws its own 16:9 frame, so Hor+ is not applied
+ * (d3d8_display.c, from xbox_D3D8SetTitleWidescreen). */
+void d3d8_vsh_title_widescreen(int native);
 /* The registers frame interpolation blends (xbox_D3D8SetInterpRegisters):
  * the projection's first register or -1, and a run of 4-register affine
  * matrices (count a multiple of 4; first -1 and count 0 for none). */

@@ -109,6 +109,10 @@ diagnostics go to whatever redirected them, else to the terminal it was started 
 title's own `main.c` (from `templates/new-game/src/main.c`), so change the template and
 regenerate with `scripts/regen_title_main.py`.
 
+**F1 opens the in-game settings menu** (or Back+Start on a pad): display, mouse and key
+bindings, live where the runtime can change them, saved to the launcher's files
+(`docs/technical/in-game-menu.md`). Game input is suspended while it is open.
+
 **F11 captures the frame on screen** -- a BMP and a replayable capture, beside the executable --
 which is how a player reports a rendering bug that only happens somewhere specific.
 `RECOMP_INPUT_SEQ` can now hold stick directions (`lstick_up`, `rstick_left`, ...) as well as
@@ -122,6 +126,43 @@ are whole, the queue is deeper, and a stream's packets complete when the host ha
 played them (`RECOMP_DSOUND_WALLCLOCK=1` for the old wall clock). If a title's sound ever
 drifts again, read `[audio-output] dropped=` and the `[DSOUND] ... from the host's play
 position` line before suspecting anything else.
+
+**Broken, looping dialogue was a flush nobody heard (15 Oct 2026).** Future Perfect stops a
+stream with `Pause` then `CDirectSoundStream_FlushEx` (ASYNC) before every new line or track;
+only `Flush` was replaced, so the old sound's packets stayed queued here, played ahead of the
+new one, were re-read in its format, and every completion after that matched the title's packet
+one later than it meant -- it refilled memory not yet played. `FlushEx` is replaced now. To
+look at sound without listening: `RECOMP_AUDIO_DUMP=<folder>` writes every host voice's audio
+as WAVs plus a submissions CSV, and `RECOMP_DSOUND_TRACE=1` logs every stream packet (with a
+checksum), completion, flush, pause, format and status change, and every buffer Play/Stop, on
+the input script's clock. A title whose sound breaks up: trace it and check that no packet's
+memory is submitted again while it is still queued.
+
+**Frame interpolation needed three things a title can hide (15 Oct 2026).** First, the redraw
+did not keep vertex declarations: Future Perfect draws one program with several vertex layouts
+in a frame, and in-between frames read every draw with its program's last layout, so the world
+vanished and the sky flickered alone. Declarations are now in the snapshot and kept on every
+change -- any host call that changes state must be kept, or the redraw is wrong. Second, FP draws
+most of its world with the projection already multiplied into the model-view (`c68`-`c71`), and
+never reads the projection register: those draws looked 2D to the interpolator and were not
+blended, so the world did not turn in the in-between frames. A group whose last row is not
+`(0,0,0,1)` is now unprojected with the projection register, blended, and multiplied back. Third,
+FP waits for the vblank in its own loop, so under the adaptive gate Swap never waited and no
+in-between frame was drawn: a title that paces itself calls `xbox_Nv2aFlipGateSetTitlePaced(1)`,
+and while interpolation is on its Swap is held to the next vblank. To check another title:
+`[INTERP]` reports "0 in-between shown" (the pacing) or in-between frames whose world matches the
+newer frame exactly (`RECOMP_INTERP_DUMP` beside `RECOMP_HLE_D3D8_DUMP_EVERY`: the registers);
+an in-between frame missing what the real one has: `RECOMP_INTERP_DRAWS=<n>` against
+`d3d8_replay --draws <n>` on a capture of the same frame finds the draw.
+`docs/technical/frame-interpolation.md` has the details.
+
+**A mouse aim that steers by feedback fails with a real mouse (15 Oct 2026).** FP's first 1:1
+aim wrote the look vector that would turn the view onto a target, learning the gain from the
+view matrix; scripted counts were fine, a real mouse made it oscillate and its wrong-way guard
+reverse axes at random. It now adds the counts to the player's own yaw/pitch ([player+0x100],
+[player+0x104], degrees), found by correlating a per-frame record of the player struct with the
+view (`RECOMP_FP_SCAN`). For another title: find the angles and write them; do not close a loop
+over the game's turning.
 
 **Widescreen and internal resolution** are investigated in
 `docs/technical/widescreen-and-resolution.md`, with every work item classified toolkit or

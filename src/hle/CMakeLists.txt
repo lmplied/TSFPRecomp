@@ -40,6 +40,11 @@ if(WIN32)
     target_sources(xbox_hle PRIVATE
         audio_output_xaudio2.cpp
         input_host.c
+        # The in-game settings menu (F1): what it shows and does. The panel
+        # itself is drawn by src/d3d/d3d8_menu.c.
+        hle_menu.c
+        # F12: the picture on screen, as a PNG in Pictures.
+        hle_screenshot.c
     )
 endif()
 target_include_directories(xbox_hle PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -49,7 +54,7 @@ target_link_libraries(xbox_hle PUBLIC xbox_kernel)
 # shared with the USB gamepad so one config file covers both input paths.
 target_link_libraries(xbox_hle PUBLIC xbox_input)
 if(WIN32)
-    target_link_libraries(xbox_hle PRIVATE xaudio2 ole32 xinput9_1_0)
+    target_link_libraries(xbox_hle PRIVATE xaudio2 ole32 xinput9_1_0 shell32 uuid)
     # The D3D8 replacements drive the host renderer in src/d3d, and open a
     # window of their own for it.
     target_link_libraries(xbox_hle PRIVATE xbox_d3d8 xbox_video user32)

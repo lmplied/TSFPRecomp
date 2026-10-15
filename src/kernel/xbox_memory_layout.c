@@ -1054,10 +1054,29 @@ static int flip_gate_mode_index(void)
     return -1;
 }
 
+static int flip_gate_held_for_hook(int d);
+
 const char *xbox_Nv2aFlipGateModeName(void)
 {
     int i = flip_gate_mode_index();
+    if (flip_gate_held_for_hook(flip_gate_divisor()))
+        return "60 (for interpolation)";
     return i < 0 ? "custom" : g_gate_modes[i].name;
+}
+
+int xbox_Nv2aFlipGateModeIndex(void)
+{
+    return flip_gate_mode_index();
+}
+
+void xbox_Nv2aFlipGateSetMode(int i)
+{
+    if (i < 0 || i >= (int)(sizeof g_gate_modes / sizeof g_gate_modes[0]))
+        return;
+    g_flip_gate_divisor = g_gate_modes[i].divisor;
+    g_flip_gate_strict = g_gate_modes[i].strict;
+    fprintf(stderr, "  [NV2A] flip gate: %s\n", g_gate_modes[i].name);
+    fflush(stderr);
 }
 
 void xbox_Nv2aFlipGateCycle(void)
@@ -1133,21 +1152,42 @@ static BOOL flip_gate_lend(void)
     }
 }
 
+/* A title that waits for the vblank itself before each frame (Future
+ * Perfect spins on its own counter) reaches Swap a few milliseconds after
+ * the vblank it waited for, which has already signalled the gate: adaptive
+ * never holds it, and the wait the hook would be lent is spent in the
+ * title's own loop instead. With a hook (frame interpolation), such a title
+ * is held to the next vblank under adaptive and off too -- "off" has no
+ * meaning for a title that paces itself. A cap of 30 is left as it is. */
+static int g_flip_gate_title_paced;
+
+void xbox_Nv2aFlipGateSetTitlePaced(int on)
+{
+    g_flip_gate_title_paced = on;
+}
+
+static int flip_gate_held_for_hook(int d)
+{
+    return g_flip_gate_idle && g_flip_gate_title_paced && (d == 0 || !g_flip_gate_strict);
+}
+
 void xbox_Nv2aFlipGateArm(void)
 {
     static int said;
+    int d = flip_gate_divisor();
+    int hold = flip_gate_held_for_hook(d);
 
-    if (flip_gate_divisor() == 0)
+    if (d == 0 && !hold)
         return;
     if (!InterlockedCompareExchange(&g_flip_gate_vblanks, 0, 0))
         return;                                         /* no vblank has ever come */
     if (!g_flip_gate_event)
         return;
-    if (g_flip_gate_strict)
+    if (g_flip_gate_strict || hold)
         ResetEvent(g_flip_gate_event);                  /* the next vblank, not a past one */
     /* Only while one Swap a vblank is the cadence: the release is then
      * always the next vblank, which is what the hook is told. */
-    if (g_flip_gate_idle && flip_gate_divisor() == 1 && flip_gate_lend())
+    if (g_flip_gate_idle && (d == 1 || hold) && flip_gate_lend())
         return;
     if (WaitForSingleObject(g_flip_gate_event, 250) == WAIT_TIMEOUT && !said++) {
         fprintf(stderr, "  [NV2A] flip gate timed out: no vblank for 250 ms, "

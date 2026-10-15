@@ -30,4 +30,14 @@ uint32_t xmv_play_time(int handle);
 
 void xmv_play_close(int handle);
 
+/* The title's logo videos, the ones it plays before its menu: file names
+ * separated by ';', case ignored, '*' matching anything ("eag_*.xmv;frd.xmv").
+ * With skip_intro on (RECOMP_SKIP_INTRO) each is reported over the moment it
+ * is created, as a movie that cannot be played always was. Set by the title
+ * project before the game starts. */
+void xmv_set_intro_videos(const char *names);
+
+/* 1 when `path` is one of those and skip_intro is on. */
+int  xmv_is_skipped_intro(const char *path);
+
 #endif

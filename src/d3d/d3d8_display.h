@@ -42,6 +42,11 @@ typedef struct D3D8DisplayPolicy {
      * which suits a title whose backdrops are separate from its HUD and
      * leaves seams in one that composes its menus from both. */
     int  centre_2d;
+    /* RECOMP_WIDESCREEN_2D=native: the title draws its own 16:9 frame, 2D
+     * and all, so nothing is squeezed. auto chooses this by itself for a
+     * title that says so when it creates its device (see
+     * d3d8_display_title_native_wide); this is for one that does not. */
+    int  native_2d;
     /* RECOMP_ANISO=<1..16>, the anisotropy to force on textures the title
      * already filters linearly. 1 leaves every sampler as the title asked
      * for it. */
@@ -55,6 +60,16 @@ const D3D8DisplayPolicy *d3d8_display_policy(void);
  * (xbox_D3D8SetWideFrames). Everything that treats a frame as widescreen
  * -- the 2D squeeze, the shape at present -- asks this. */
 int  d3d8_display_wide_now(void);
+/* Whether the title draws its own 16:9 frame: it created its device with
+ * D3DPRESENTFLAG_WIDESCREEN (xbox_D3D8SetTitleWidescreen), or the setting
+ * says so (widescreen_2d = native). Such a title's 2D layer is authored
+ * squeezed like its 3D, so the 2D squeeze and Hor+ -- both there to widen
+ * a title that has no 16:9 mode -- stand aside. */
+int  d3d8_display_title_native_wide(void);
+/* Whether the picture fills the window, whatever its shape: widescreen,
+ * the wide_fill setting, and a title that draws any shape itself
+ * (xbox_D3D8SetTitleAnyAspect). The output shape is then the window's. */
+int  d3d8_display_fill_now(void);
 /* A frame has been presented (it notes each change of shape in the log). */
 void d3d8_display_frame_done(void);
 
@@ -62,6 +77,9 @@ void d3d8_display_frame_done(void);
  * guest_h. Equal to the guest's own size when nothing is scaled. */
 void d3d8_display_scene_size(UINT guest_w, UINT guest_h,
                              UINT *scene_w, UINT *scene_h);
+/* The device has made its targets again at this scale while the title runs
+ * (xbox_D3D8RequestScale): what the policy reports from now on. */
+void d3d8_display_set_scale(UINT scale);
 
 /* Where the scene lands inside a back buffer of bb_w by bb_h: the largest
  * centred rectangle with the scene's own shape. Equal to the whole buffer
@@ -72,7 +90,7 @@ D3D8DisplayFit d3d8_display_fit(UINT shape_w, UINT shape_h, UINT bb_w, UINT bb_h
 
 /* The shape the scene should appear as, which is its own unless the
  * title is drawing anamorphically for a 16:9 display. Not a size: only
- * the ratio of the two is used. */
+ * the ratio of the two is used. 0 by 0 when it fills the window. */
 void d3d8_display_output_shape(UINT scene_w, UINT scene_h,
                                UINT *shape_w, UINT *shape_h);
 

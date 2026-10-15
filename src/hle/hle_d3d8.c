@@ -67,6 +67,9 @@
 #include <string.h>
 #include "hle.h"
 #include "recomp_config.h"
+#include "input_mouse.h"     /* the window's mouse and focus, for the bindings */
+#include "hle_menu.h"        /* the settings menu: F1 */
+#include "hle_screenshot.h"  /* F12 */
 
 #ifdef _WIN32
 #include "d3d8_xbox.h"
@@ -107,6 +110,7 @@ HLE_EXPORT(D3DDevice_SetSoftDisplayFilter)
 #ifdef _WIN32
 
 #define SHADOW_WM_DESTROY (WM_APP + 1)
+#define SHADOW_WM_FULLSCREEN (WM_APP + 2)   /* wParam: on; from the settings menu */
 
 static int                g_shadow_mode = -1;
 static int                g_shadow_tried;
@@ -252,7 +256,25 @@ static int  g_shadow_fullscreen;
 
 static LRESULT CALLBACK shadow_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    /* The mouse and the focus first: a click that hands the game the mouse,
+     * and the hidden pointer while it has it, are decided there. */
+    {
+        intptr_t result;
+        if (recomp_input_window_message(hwnd, msg, (uintptr_t)wp, (intptr_t)lp, &result))
+            return (LRESULT)result;
+    }
     switch (msg) {
+    case WM_KEYDOWN:
+        /* F1 opens the settings menu; while it is open every key is its. */
+        if (hle_menu_key((unsigned)wp))
+            return 0;
+        break;
+    case WM_MOUSEWHEEL:
+        hle_menu_wheel(GET_WHEEL_DELTA_WPARAM(wp));
+        break;
+    case SHADOW_WM_FULLSCREEN:
+        shadow_set_fullscreen(hwnd, (int)wp);
+        return 0;
     case WM_SYSKEYDOWN:
         /* Alt+Enter, the usual Windows key for it: fullscreen and back. */
         if (wp == VK_RETURN && (lp & (1 << 29)) && !(lp & (1 << 30))) {
@@ -338,6 +360,7 @@ static void shadow_set_fullscreen(HWND hwnd, int on)
     fflush(stderr);
     g_shadow_fullscreen = on;
     xbox_D3D8SetFullscreen(on ? TRUE : FALSE);
+    recomp_input_window_fullscreen(hwnd, on);
 }
 
 typedef struct {
@@ -366,6 +389,19 @@ static DWORD WINAPI shadow_window_thread(LPVOID param)
     r.top = 0;
     r.right = (LONG)req->width;
     r.bottom = (LONG)req->height;
+    /* RECOMP_WINDOW_SIZE=<w>x<h>: the window's inside at the start, say a
+     * 21:9 one, rather than the game's own size. It can be resized later
+     * either way. */
+    {
+        const char *ws = getenv("RECOMP_WINDOW_SIZE");
+        unsigned ww = 0, wh = 0;
+
+        if (ws && sscanf(ws, "%ux%u", &ww, &wh) == 2 && ww >= 160 && wh >= 120 &&
+            ww <= 16384 && wh <= 16384) {
+            r.right = (LONG)ww;
+            r.bottom = (LONG)wh;
+        }
+    }
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     req->hwnd = CreateWindowA(wc.lpszClassName, "xboxrecomp - D3D8 replacement (shadow)",
                               WS_OVERLAPPEDWINDOW,
@@ -379,6 +415,8 @@ static DWORD WINAPI shadow_window_thread(LPVOID param)
     if (req->hwnd) {
         const char *bg = getenv("RECOMP_WINDOW_BACKGROUND");
 
+        /* Before it is shown, so the focus it gets on showing is seen. */
+        recomp_input_attach_window(req->hwnd);
         if (bg && *bg && strcmp(bg, "0") != 0) {
             ShowWindow(req->hwnd, SW_SHOWNOACTIVATE);
             SetWindowPos(req->hwnd, HWND_BOTTOM, 0, 0, 0, 0,
@@ -1388,16 +1426,46 @@ static void shadow_frame_brightness(void)
     fflush(stderr);
 }
 
+/* R8G8B8A8 pixels to a 24-bit BMP at path. 0 on success. */
+static int write_rgba_bmp(const char *path, const uint8_t *px, size_t pitch, UINT w, UINT h)
+{
+    uint8_t hdr[54];
+    UINT y, x, pad = (4 - ((w * 3) & 3)) & 3;
+    uint32_t filesz = 54 + (w * 3 + pad) * h;
+    FILE *f = fopen(path, "wb");
+
+    if (!f)
+        return -1;
+    memset(hdr, 0, sizeof hdr);
+    hdr[0] = 'B'; hdr[1] = 'M';
+    memcpy(hdr + 2, &filesz, 4);
+    hdr[10] = 54;
+    hdr[14] = 40;
+    memcpy(hdr + 18, &w, 4);
+    memcpy(hdr + 22, &h, 4);
+    hdr[26] = 1;
+    hdr[28] = 24;
+    fwrite(hdr, 1, sizeof hdr, f);
+    for (y = h; y-- > 0; ) {             /* BMP rows run bottom-up */
+        const uint8_t *row = px + (size_t)y * pitch;
+        for (x = 0; x < w; x++) {
+            const uint8_t *p = row + x * 4;
+            uint8_t bgr[3] = { p[2], p[1], p[0] };
+            fwrite(bgr, 1, 3, f);
+        }
+        fwrite("\0\0\0", 1, pad, f);
+    }
+    fclose(f);
+    return 0;
+}
+
 /* The back buffer as it is now, to a 24-bit BMP at path. 0 on success. */
 static int dump_back_buffer(const char *path)
 {
     IDirect3DSurface8 *surf = NULL;
     D3DLOCKED_RECT lr;
-    uint8_t hdr[54];
-    UINT w, h, y, x, pad;
-    uint32_t filesz;
-    FILE *f;
-    int ok = -1;
+    UINT w, h;
+    int ok;
 
     if (!g_shadow)
         return -1;
@@ -1423,32 +1491,7 @@ static int dump_back_buffer(const char *path)
             h = g_shadow_height;
         }
     }
-    pad = (4 - ((w * 3) & 3)) & 3;
-    filesz = 54 + (w * 3 + pad) * h;
-    f = fopen(path, "wb");
-    if (f) {
-        memset(hdr, 0, sizeof hdr);
-        hdr[0] = 'B'; hdr[1] = 'M';
-        memcpy(hdr + 2, &filesz, 4);
-        hdr[10] = 54;
-        hdr[14] = 40;
-        memcpy(hdr + 18, &w, 4);
-        memcpy(hdr + 22, &h, 4);
-        hdr[26] = 1;
-        hdr[28] = 24;
-        fwrite(hdr, 1, sizeof hdr, f);
-        for (y = h; y-- > 0; ) {         /* BMP rows run bottom-up */
-            const uint8_t *row = (const uint8_t *)lr.pBits + (size_t)y * (size_t)lr.Pitch;
-            for (x = 0; x < w; x++) {
-                const uint8_t *p = row + x * 4;
-                uint8_t bgr[3] = { p[2], p[1], p[0] };
-                fwrite(bgr, 1, 3, f);
-            }
-            fwrite("\0\0\0", 1, pad, f);
-        }
-        fclose(f);
-        ok = 0;
-    }
+    ok = write_rgba_bmp(path, (const uint8_t *)lr.pBits, (size_t)lr.Pitch, w, h);
     surf->lpVtbl->UnlockRect(surf);
     surf->lpVtbl->Release(surf);
     return ok;
@@ -1464,7 +1507,7 @@ int hle_d3d8_dump_back_buffer(const char *path)
 static void shadow_dump_frame(void)
 {
     static const char *prefix;
-    static int configured, every = 300, written, keep_last;
+    static int configured, every = 300, written, keep_last, presented;
     static unsigned long min_draws, last_dump, from_swap;
     static char ring[24][512];
     static char asked_prefix[8];
@@ -1496,6 +1539,15 @@ static void shadow_dump_frame(void)
         e = getenv("RECOMP_HLE_D3D8_DUMP_KEEP_LAST");
         if (e && atoi(e) > 0)
             keep_last = atoi(e) > 24 ? 24 : atoi(e);
+        /* RECOMP_HLE_D3D8_DUMP_PRESENTED=1: what reached the window instead
+         * of the scene -- after the widescreen unsqueeze, the bars and the
+         * resolve, at the window's size. The scene is the title's own
+         * shape whatever the screen shows, so a widescreen fault does not
+         * appear in it at all. The previous frame's, as it was presented. */
+        e = getenv("RECOMP_HLE_D3D8_DUMP_PRESENTED");
+        presented = e && *e && strcmp(e, "0") != 0;
+        if (presented)
+            xbox_D3D8KeepPresented(TRUE);
     }
     /* Asked for by hand: this frame, wherever the run has got to, whatever
      * the interval and the 24-file cap say, and beside the executable when
@@ -1531,6 +1583,14 @@ static void shadow_dump_frame(void)
         written++;
     } else {
         snprintf(path, sizeof path, "%s%03d.bmp", prefix, written++);
+    }
+    if (presented) {
+        UINT pw = 0, ph = 0;
+        const uint8_t *px = xbox_D3D8Presented(&pw, &ph);
+
+        if (px && write_rgba_bmp(path, px, (size_t)pw * 4u, pw, ph) == 0)
+            fprintf(stderr, "[HLE-D3D8] presented frame %lu -> %s\n", g_shadow_swaps, path);
+        return;
     }
     if (dump_back_buffer(path) == 0)
         fprintf(stderr, "[HLE-D3D8] shadow frame %lu -> %s\n", g_shadow_swaps, path);
@@ -1861,6 +1921,9 @@ HLE_EXPORT(Direct3D_CreateDevice)
          * Flags +0x28, FullScreen_PresentationInterval +0x30. The swap effect
          * decides what a Swap means (frame_end_shadow). */
         g_swap_effect = HLE_MEM32(pp_va + 0x14);
+        /* D3DPRESENTFLAG_WIDESCREEN (0x10): the title is in a 16:9 mode of
+         * its own, so its whole frame is authored anamorphic (d3d8_display.c). */
+        xbox_D3D8SetTitleWidescreen((HLE_MEM32(pp_va + 0x28) & 0x10) ? TRUE : FALSE);
         fprintf(stderr, "[HLE-D3D8] CreateDevice: %ux%u format 0x%02X, %u back buffer(s), "
                 "swap effect %u (1 discard, 2 flip, 3 copy, 4 copy vsync), flags 0x%08X, "
                 "refresh %u Hz, presentation interval 0x%08X -> 0x%08X\n",
@@ -1951,11 +2014,12 @@ static void swap_timing_report(void)
  * what it says and when it appears is decided here, because this is where
  * the frame rate is already counted and where the flip gate is reachable.
  *
- * F9 shows or hides the counter, F10 steps the cap. Both are read only while
+ * F9 shows or hides the counter, F10 steps the cap, F12 saves a screenshot
+ * (hle_screenshot.c) and puts a line up saying where. All are read only while
  * the game's window is in front, so they do nothing while the player is in
- * another application, and neither is a key the input bindings offer, so
- * neither can collide with a control. RECOMP_FPS_OVERLAY=1 starts with the
- * counter already on.
+ * another application, and none is a key the input bindings offer, so none
+ * can collide with a control. RECOMP_FPS_OVERLAY=1 starts with the counter
+ * already on.
  *
  * The rate is measured over half-second windows at the same Swap that
  * RECOMP_FPS counts, so the number on screen and the number in the log are
@@ -1965,24 +2029,28 @@ static void swap_timing_report(void)
  * frame (hle_d3d8_interp.c) carries the same line as the frames around it. */
 static int  g_overlay_shown;
 static char g_overlay_line[96];
+/* What is on screen this frame: the counter's line, a screenshot's notice,
+ * or nothing. */
+static const char *g_overlay_text;
 
 void hle_d3d8_overlay_redraw(void)
 {
-    if (g_overlay_shown)
-        d3d8_overlay_draw(g_overlay_line);
+    if (g_overlay_text)
+        d3d8_overlay_draw(g_overlay_text);
 }
 
 static void overlay_frame(void)
 {
-    static int configured, f9_was_down, f10_was_down, f11_was_down;
+    static int configured, f9_was_down, f10_was_down, f11_was_down, f12_was_down;
     static LARGE_INTEGER qpf, window_start;
     static unsigned window_frames;
     static unsigned long window_extra;
     int enabled = g_overlay_shown;
     char *line = g_overlay_line;
     const size_t line_size = sizeof g_overlay_line;
+    const char *notice;
     LARGE_INTEGER now;
-    int front, f9, f10, f11;
+    int front, f9, f10, f11, f12, shot = 0;
 
     if (!configured) {
         const char *v = recomp_config_lookup("RECOMP_FPS_OVERLAY", "fps_overlay");
@@ -2001,6 +2069,11 @@ static void overlay_frame(void)
     f9  = front && (GetAsyncKeyState(VK_F9)  & 0x8000) != 0;
     f10 = front && (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     f11 = front && (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+    f12 = front && (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
+    /* F12: a screenshot of this frame, which then goes without the counter. */
+    if ((f12 && !f12_was_down) || hle_screenshot_scripted())
+        shot = hle_screenshot_request();
+    f12_was_down = f12;
     if (f11 && !f11_was_down) {
         /* Both, because they answer different questions: the picture shows
          * what is wrong, the capture lets it be replayed draw by draw with
@@ -2032,7 +2105,7 @@ static void overlay_frame(void)
 
         /* With frame interpolation, what reaches the screen as well. */
         if (extra)
-            snprintf(line, line_size, "%.1f fps (%.1f shown)   cap %s",
+            snprintf(line, line_size, "game %.1f fps, screen %.1f fps (interpolated)   cap %s",
                      (double)window_frames / secs,
                      (double)(window_frames + extra) / secs, xbox_Nv2aFlipGateModeName());
         else
@@ -2044,8 +2117,41 @@ static void overlay_frame(void)
     }
 
     g_overlay_shown = enabled;
-    if (enabled)
-        d3d8_overlay_draw(line);
+    notice = hle_screenshot_frame();
+    g_overlay_text = shot ? NULL : notice ? notice : enabled ? line : NULL;
+    if (g_overlay_text)
+        d3d8_overlay_draw(g_overlay_text);
+    /* The settings menu: its keys, its pad, and the panel for this present. */
+    hle_menu_frame();
+}
+
+/* What the settings menu (hle_menu.c) changes here. */
+int hle_d3d8_fps_overlay(void)
+{
+    return g_overlay_shown;
+}
+
+void hle_d3d8_set_fps_overlay(int on)
+{
+    g_overlay_shown = on ? 1 : 0;
+}
+
+int hle_d3d8_fullscreen(void)
+{
+    return g_shadow_fullscreen;
+}
+
+void hle_d3d8_request_fullscreen(int on)
+{
+    /* The window's own thread changes its style (shadow_set_fullscreen). */
+    if (g_shadow_hwnd)
+        PostMessageA(g_shadow_hwnd, SHADOW_WM_FULLSCREEN, on ? 1 : 0, 0);
+}
+
+void hle_d3d8_guest_size(unsigned *w, unsigned *h)
+{
+    if (w && g_shadow_width) *w = g_shadow_width;
+    if (h && g_shadow_height) *h = g_shadow_height;
 }
 
 /* HRESULT D3DDevice_Swap(DWORD Flags)                                       */

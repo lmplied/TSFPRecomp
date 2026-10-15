@@ -10,6 +10,9 @@ static DWORD rs[256];
 static int failures;
 
 ID3D11Device *d3d8_GetD3D11Device(void) { return device; }
+/* d3d8_display.c tells the shader layer about a title's own 16:9 mode;
+ * this test links the display without the shaders. */
+void d3d8_vsh_title_widescreen(int native) { (void)native; }
 ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return context; }
 const DWORD *d3d8_GetRenderStates(void) { return rs; }
 const DWORD *d3d8_GetTSS(DWORD stage) { (void)stage; return NULL; }

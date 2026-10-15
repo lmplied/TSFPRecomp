@@ -34,6 +34,7 @@
  *     see "Threads" in hle_d3d8_record.h.
  */
 #include "platform/xbox_winnt.h"
+#include <stddef.h>   /* offsetof: a kept declaration's size */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -930,8 +931,8 @@ static void draw_key(HleInterpDrawKey *k, DWORD type, UINT prims, UINT stride,
     k->target = g_target_lost ? NULL : g_target_texture;
     /* Read after the draw: the program's verdict is made when it is bound
      * for it. A fixed-function draw is not blended. */
-    k->uses_proj = d3d8_vsh_is_programmable(g_bound_vs) &&
-                   d3d8_vsh_bound_uses_projection();
+    k->programmable = d3d8_vsh_is_programmable(g_bound_vs);
+    k->uses_proj = k->programmable && d3d8_vsh_bound_uses_projection();
 }
 
 /* ------------------------------------------------------------ device calls */
@@ -1776,8 +1777,43 @@ void host_vsh_set_constant(int first_reg, const float *data, int count)
     d3d8_vsh_set_constant(first_reg, data, count);
 }
 
+/* A program's vertex declaration -- where in the vertex each input register
+ * reads -- is state like any other, and kept for frame interpolation:
+ * Future Perfect draws one program with up to four layouts in a frame (272
+ * changes in a gameplay frame), so a frame drawn again with each program's
+ * last layout read most of its world through the wrong bytes, and the world
+ * went missing from the in-between frames while the sky, drawn first,
+ * stayed. */
+typedef struct {
+    DWORD        handle;
+    int          count;
+    D3D8VshInput inputs[NV2A_VS_MAX_INPUTS];
+} dq_declaration;
+
+static void op_vsh_declaration(const void *arg)
+{
+    const dq_declaration *p = (const dq_declaration *)arg;
+    host_vsh_set_declaration(p->handle, p->count ? p->inputs : NULL, p->count);
+}
+
+static void keep_declaration(DWORD handle, const D3D8VshInput *inputs, int count)
+{
+    dq_declaration p;
+
+    if (count < 0 || count > NV2A_VS_MAX_INPUTS || (count && !inputs))
+        return;
+    p.handle = handle;
+    p.count = count;
+    if (count)
+        memcpy(p.inputs, inputs, (size_t)count * sizeof *inputs);
+    hle_d3d8_interp_op(op_vsh_declaration, &p,
+                       offsetof(dq_declaration, inputs) + (size_t)count * sizeof *inputs);
+}
+
 HRESULT host_vsh_set_declaration(DWORD handle, const D3D8VshInput *inputs, int count)
 {
+    if (hle_d3d8_interp_rec)
+        keep_declaration(handle, inputs, count);
     if (g_cap)
         rec_vs_declaration(handle, inputs, count);
     return d3d8_vsh_set_declaration(handle, inputs, count);
@@ -1910,6 +1946,15 @@ void hle_d3d8_interp_snapshot(void)
 
     if (!dev || !hle_d3d8_interp_rec)
         return;
+    for (i = 0; i < NV2A_VS_MAX_SLOTS; i++) {
+        const DWORD *microcode;
+        const D3D8VshInput *decl;
+        int length, decl_count;
+        DWORD handle;
+
+        if (d3d8_vsh_get_slot(i, &handle, &microcode, &length, &decl, &decl_count))
+            keep_declaration(handle, decl, decl_count);
+    }
     {
         dq_constants p;
         p.first = 0;

@@ -66,6 +66,75 @@ deep 16:9 mode: camera aspect plus alternative HUD and menu layout code.
 There is **no in-game option**. The flag is read once during start-up and cached,
 so it must be right before the title initialises and cannot be toggled at runtime.
 
+### TimeSplitters: Future Perfect has one too, and says so (October 2026)
+
+Future Perfect's XAPI `XGetVideoFlags` is `sub_0037D45F` (`push 8`, then
+`shr eax, 0x10; and eax, 0x5f`), and its device set-up `sub_00023930` calls it
+at `0x00023A91`. With bit 0 set it ORs `D3DPRESENTFLAG_WIDESCREEN` (0x10) into
+the presentation flags it passes to `CreateDevice` (0x110 instead of 0x100),
+writes 16 and 9 over the 4 and 3 at `0x004C0458`/`0x004C045C`, and stores 0.75
+at `0x004C0460`, a squeeze its camera, HUD and menus read in over three hundred
+places. Its front end's 3D room, its levels and its HUD all widen.
+
+So a title that has a 16:9 mode can announce it, and the toolkit now listens:
+the HLE reads the flag at `CreateDevice` (`xbox_D3D8SetTitleWidescreen`), and a
+title that set it is only stretched at present. The 2D squeeze and Hor+ -- both
+there to widen a title that has no 16:9 mode -- stand aside, because this
+title's 2D is authored squeezed like its 3D. Before that, Future Perfect's
+colour grading, a full-screen pass that redraws the whole frame from a copy of
+it, was squeezed into the middle three quarters like a HUD element: a narrowed
+copy of the picture over the ungraded frame, which showed at both sides as a
+ghost. `widescreen_2d = native` asks for the same treatment for a title that
+draws 16:9 without setting the flag. `RECOMP_HLE_D3D8_DUMP_PRESENTED=1` makes
+the frame dumps show what reached the window, where this kind of fault is
+visible, instead of the title's own-sized scene, where it is not.
+
+#### Any shape: 21:9 and the rest (October 2026)
+
+Those three numbers are all Future Perfect draws its shape from, so it can
+draw any shape. The camera builds its horizontal angle from the two integers
+every frame (tan(h/2) = tan(v/2) x 16/9, at camera `+0x380`), the HUD and
+menus place themselves by the squeeze, and 27 places ask `sub_0003C420`
+whether the screen is 16:9 -- comparing for exactly 16 and 9. With
+`wide_fill = 1` (the menu's Widescreen: "Fill the window"), the renderer
+presents the scene over the whole window, whatever its shape
+(`d3d8_display_fill_now`, output shape 0 by 0, so no bars), and the title
+project keeps the three numbers at the window's shape
+(`xbox_D3D8FillShape`; `fp_aspect_follow` in `recomp_manual.c`, run from
+the hand-written accessors `sub_0003C400`/`410`/`420`, the last answering
+"wider than 4:3"). A 1680x720 window gives 7:3 and a squeeze of 0.5714, and
+the game then draws 21:9 itself: its own camera and culling, so nothing is
+missing at the edges; its HUD in the corners at the right proportions; its
+menus centred over a wider room. The window can be resized while playing.
+The scene is still the guest's 640x480 grid times the resolution scale,
+stretched across: at 21:9 a scale of 4 or more keeps it sharp.
+
+#### Changing the resolution while playing
+
+Only the scene target and the device's own depth buffer are scaled; a
+title's own render targets keep the size it asked for. So a new
+`resolution_scale` (the in-game menu, `xbox_D3D8RequestScale`) is those two
+made again at the new size right after a present, before the next frame's
+first draw (`follow_scale` in `d3d8_device.c`). Everything else sizes itself
+from the scene as it goes -- viewport and scissor through `rt_scale_x`, the
+resolve and the screen copy per call, frame interpolation's second image when
+it next starts. The depth surface object the title holds keeps its identity
+and has its image and view traded for the new ones. Verified in Future
+Perfect's 2401 stepping 1x to 4x and back mid-level: six rebuilds, the
+picture and its colour grading intact, edges visibly smoother at 4x.
+
+#### Field of view
+
+The camera (`[player+0x8]`) keeps its angles in vertical degrees: now at
+`+0x384`, the one it eases toward at `+0x388`, the zoomed one at `+0x38C`.
+The game writes `+0x388` only when the view changes mode -- the zoomed angle
+going into aim mode, its own 55 coming back out -- so the `fov` setting
+(40 to 90, live from the menu) is put there whenever the player is not
+aiming, and the game derives the rest, culling included (`fp_apply_fov`).
+The weapon in hand is drawn with the same projection and changes with it.
+`recomp_fov_support` is how a title project offers the setting; the menu
+shows the row only then.
+
 ### TimeSplitters 2 has no 16:9 mode at all
 
 The `ExQueryNonVolatileSetting` import thunk in TimeSplitters 2 is

@@ -144,6 +144,38 @@ static long g_drift_total_ms;
 static int  g_wallclock = -1;        /* RECOMP_DSOUND_WALLCLOCK */
 
 static Stream g_streams[MAX_STREAMS];
+
+/* RECOMP_DSOUND_TRACE=1: every packet in and out, every flush, pause, format
+ * change and change of status, one line each on the input script's clock,
+ * with a checksum of each packet's data -- a title handing the same sound
+ * over twice looks different from this file playing it twice. Read with the
+ * host side of RECOMP_AUDIO_DUMP. */
+unsigned long long recomp_input_script_ms(void);   /* input_host.c */
+static int g_trace = -1;
+
+static int tracing(void)
+{
+    if (g_trace < 0)
+        g_trace = xbox_EnvSwitch("RECOMP_DSOUND_TRACE", 0);
+    return g_trace;
+}
+
+#define TRACE(...) do { if (tracing()) { \
+        fprintf(stderr, "[DST %llu] ", recomp_input_script_ms()); \
+        fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
+
+static uint32_t checksum(uint32_t va, uint32_t bytes)
+{
+    uint32_t h = 2166136261u, i;
+    const volatile uint8_t *p;
+
+    if (!bytes || va < 0x00010000u)
+        return 0;
+    p = (const volatile uint8_t *)HLE_PTR(va);
+    for (i = 0; i < bytes; i++)
+        h = (h ^ p[i]) * 16777619u;
+    return h;
+}
 static CRITICAL_SECTION g_lock;
 static INIT_ONCE g_lock_once = INIT_ONCE_STATIC_INIT;
 
@@ -341,6 +373,9 @@ static Stream *find_by_object(uint32_t object)
 static void complete(Stream *s, const Packet *p, uint32_t status, uint32_t size)
 {
     g_packets_done++;
+    TRACE("s%u done data %08X [%llu..%llu) status %08X, %d left", slot_of(s) - SLOT_BASE,
+          p->data, (unsigned long long)p->start, (unsigned long long)p->end, status,
+          s->count);
     if (p->status_va && guest_readable(p->status_va, 4u))
         HLE_MEM32(p->status_va) = status;
     if (p->completed_va && guest_readable(p->completed_va, 4u))
@@ -443,14 +478,21 @@ static void pump(Stream *s, uint64_t now)
         if (want > p->end - s->sent) want = p->end - s->sent;
         if (want > sizeof pcm) want = sizeof pcm;
         if (s->tag == TAG_ADPCM) {
+            /* From exactly where the stream is, which after a pause, a
+             * format change or a refeed is anywhere inside a block: copying
+             * whole blocks from the block's start played the part already
+             * heard again, and at a packet's end ran a block past it into
+             * the next packet, a tick at every one of those. */
             uint32_t block = XBOX_ADPCM_BLOCK_BYTES * s->channels;
             uint32_t dblock = XBOX_ADPCM_BLOCK_SAMPLES * s->channels * 2u;
-            uint32_t n = (uint32_t)(want / dblock), k;
-            if (n == 0u) n = 1u;
+            uint64_t pos = within, end = within + want;
             bytes = 0u;
-            for (k = 0; k < n; k++) {
-                uint32_t src = p->data + (uint32_t)((within / dblock) + k) * block;
+            while (pos < end) {
+                uint32_t off = (uint32_t)(pos % dblock), take = dblock - off;
+                uint32_t src = p->data + (uint32_t)(pos / dblock) * block;
                 int16_t decoded[XBOX_ADPCM_BLOCK_SAMPLES * 2];
+                if (take > end - pos)
+                    take = (uint32_t)(end - pos);
                 if (!guest_readable(src, block) ||
                     !xbox_adpcm_decode_block((const uint8_t *)HLE_PTR(src), block,
                                              s->channels, decoded,
@@ -459,8 +501,9 @@ static void pump(Stream *s, uint64_t now)
                     recomp_audio_output_reset_voice(slot_of(s));
                     return;
                 }
-                memcpy(pcm + bytes, decoded, dblock);
-                bytes += dblock;
+                memcpy(pcm + bytes, (const uint8_t *)decoded + off, take);
+                bytes += take;
+                pos += take;
             }
         } else {
             bytes = (uint32_t)want - (uint32_t)(want % frame_bytes(s));
@@ -741,6 +784,12 @@ HLE_EXPORT(CDirectSoundStream_Process)
     s->count++;
     if (p->status_va && guest_readable(p->status_va, 4u))
         HLE_MEM32(p->status_va) = XMP_STATUS_PENDING;
+    TRACE("s%u packet data %08X size %u sum %08X [%llu..%llu) consumed %llu sent %llu, "
+          "%d queued%s", slot_of(s) - SLOT_BASE, p->data, p->size,
+          guest_readable(p->data, p->size) ? checksum(p->data, p->size) : 0u,
+          (unsigned long long)p->start, (unsigned long long)p->end,
+          (unsigned long long)consumed(s, now), (unsigned long long)s->sent, s->count,
+          s->paused ? " paused" : "");
     if (said < 4) {
         said++;
         fprintf(stderr, "[DSOUND] stream %08X: packet %u bytes at %08X (%d queued)\n",
@@ -751,17 +800,19 @@ HLE_EXPORT(CDirectSoundStream_Process)
     HLE_RETURN(DS_OK);
 }
 
-/* HRESULT CDirectSoundStream::Flush(this). Every pending packet comes back
- * flushed, and the clock moves to the end of the data. */
-HLE_EXPORT(CDirectSoundStream_Flush)
+/* Every pending packet comes back flushed, and the clock moves to the end of
+ * the data. */
+static void flush_stream(uint32_t object, const char *what, uint32_t flags)
 {
-    g_calls_flush++;
-    note_caller("Flush");
     uint64_t now = now_ms();
     Stream *s;
 
     lock();
-    s = find_by_object(HLE_ARG(0));
+    s = find_by_object(object);
+    if (s)
+        TRACE("s%u %s (flags %X), %d queued, consumed %llu of %llu", slot_of(s) - SLOT_BASE,
+              what, flags, s->count, (unsigned long long)consumed(s, now),
+              (unsigned long long)s->queued);
     if (s) {
         Packet flushed[MAX_PACKETS];
         int n = 0, i;
@@ -776,9 +827,40 @@ HLE_EXPORT(CDirectSoundStream_Flush)
         recomp_audio_output_reset_voice(slot_of(s));
         for (i = 0; i < n; i++)
             complete(s, &flushed[i], XMP_STATUS_FLUSHED, 0u);
-        (void)now;
     }
     unlock();
+}
+
+/* HRESULT CDirectSoundStream::Flush(this) */
+HLE_EXPORT(CDirectSoundStream_Flush)
+{
+    g_calls_flush++;
+    note_caller("Flush");
+    flush_stream(HLE_ARG(0), "Flush", 0u);
+    HLE_RETURN(DS_OK);
+}
+
+/* HRESULT CDirectSoundStream::FlushEx(this, REFERENCE_TIME rtTimeStamp,
+ * DWORD dwFlags), `ret 16`: a flush at a time stamp, or (DSSTREAMFLUSHEX_ASYNC)
+ * one that completes in the background, or after the release envelope
+ * (_ENVELOPE). Taken now, as StopEx's scheduled stop is: what a title can
+ * observe is its packets coming back flushed, and it reuses their memory once
+ * they have.
+ *
+ * Future Perfect stops every stream this way (0x00029B40: Pause, then
+ * FlushEx ASYNC, then the next sound's SetFormat and packets) -- each dialogue
+ * line, each change of music. With FlushEx left to the title's own code,
+ * which reaches only the emulated chip, the old sound's packets stayed queued
+ * here: they played ahead of the new sound (a line cut into by the end of
+ * the last one), were re-read in the new sound's format if it differed
+ * (mono read as stereo is noise), and every completion after that matched
+ * the title's packet one later than it meant, so it refilled memory that
+ * had not been played yet -- dialogue that looped and broke up. */
+HLE_EXPORT(CDirectSoundStream_FlushEx)
+{
+    g_calls_flush++;
+    note_caller("FlushEx");
+    flush_stream(HLE_ARG(0), "FlushEx", HLE_ARG(3));
     HLE_RETURN(DS_OK);
 }
 
@@ -817,6 +899,10 @@ HLE_EXPORT(CDirectSoundStream_Pause)
 
     lock();
     s = find_by_object(HLE_ARG(0));
+    if (s)
+        TRACE("s%u Pause(%u)%s, %d queued, consumed %llu of %llu", slot_of(s) - SLOT_BASE,
+              mode, s->paused ? " (paused)" : "", s->count,
+              (unsigned long long)consumed(s, now), (unsigned long long)s->queued);
     if (s) {
         if (mode == DSSTREAMPAUSE_RESUME) {
             if (s->paused) {
@@ -867,6 +953,15 @@ HLE_EXPORT(CDirectSoundStream_GetStatus__r2)
             status |= DSSTREAMSTATUS_PLAYING;
         else if (s->queued)
             status |= DSSTREAMSTATUS_STARVED;
+        {
+            static uint32_t last[MAX_STREAMS];
+            uint32_t k = slot_of(s) - SLOT_BASE;
+            if (last[k] != status) {
+                TRACE("s%u status %08X -> %08X (caller %08X)", k, last[k], status,
+                      HLE_MEM32(g_esp));
+                last[k] = status;
+            }
+        }
     } else {
         status = DSSTREAMSTATUS_READY;
     }
@@ -925,6 +1020,9 @@ HLE_EXPORT(CDirectSoundStream_SetFormat)
     if (s) {
         uint32_t tag = HLE_MEM32(wfx) & 0xFFFFu, ch = HLE_MEM32(wfx) >> 16;
         uint32_t rate = HLE_MEM32(wfx + 4u), bits = HLE_MEM32(wfx + 12u) >> 16;
+        TRACE("s%u SetFormat %04X %u ch %u Hz %u bit (was %04X %u ch %u Hz), %d queued",
+              slot_of(s) - SLOT_BASE, tag, ch, rate, bits, s->tag, s->channels, s->rate,
+              s->count);
         if (tag != s->tag || ch != s->channels || rate != s->rate || bits != s->bits ||
             s->freq) {
             uint32_t ot = s->tag, oc = s->channels, orate = s->rate, of = s->freq;

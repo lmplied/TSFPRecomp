@@ -103,6 +103,7 @@ typedef struct {
     const void *tex[4];   /* bound textures, as keys only */
     const void *target;   /* render target texture, NULL for the back buffer */
     int      uses_proj;   /* drawn through the projection: 3D */
+    int      programmable; /* a vertex program, not fixed function */
 } HleInterpDrawKey;
 
 void hle_d3d8_interp_op(void (*fn)(const void *arg), const void *arg, size_t size);

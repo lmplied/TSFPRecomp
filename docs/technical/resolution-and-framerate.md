@@ -339,6 +339,29 @@ recur; that is cheap and should be part of the stage.
 
 ---
 
+### Future Perfect paces itself, so "uncapped" stays at 60 (October 2026)
+
+With the frame cap off, Future Perfect's menus run at thousands of frames a
+second but its levels stay at 60, because the game waits for the vertical
+blank itself. Its frame clock, `sub_001538C0`, called at the top of every
+frame, spins on the count its vblank callback keeps (`sub_00022020`,
+`0x00563918`) until it moves, and takes the blanks that passed, 1 to 3, as the
+frame's step: whole at `0x004E7940`, as a float at `0x004E7948`, again at
+`0x004E7944`/`0x004E794C` for the game world (0 while paused), added to the
+game-time total at `0x007497B0`. A sampling profile of a level shows 72% of
+the game thread in that spin.
+
+Letting the spin through and giving each frame a fractional step was tried
+(the code is kept in the session notes, not the tree): 240 frames a second
+with the game's clock at exactly 60 ticks a second, and the world and player
+update still ran 58-60 times a second -- FP updates once per whole tick, so the
+extra frames were the same picture again. The world tick is read hundreds of
+times, some of them dividing by it or multiplying by it, so a frame with no
+tick in it cannot run the update, and a frame forced to one runs every timer
+fast. Smoother motion for FP is frame interpolation's job
+(`frame-interpolation.md`): its registers are named, and it runs at 2x-4x
+(120-240 frames shown a second) with the game at 60.
+
 ## 3. Dependencies, risk, and order
 
 **XDK-version independence.** Both halves are version-independent. The scale

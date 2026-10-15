@@ -1453,10 +1453,22 @@ const float *d3d8_vsh_constants(void)
  * xbox_D3D8ClaimHorPlus, and the register is then left as uploaded. */
 static BOOL g_hor_plus_claimed;
 
+/* d3d8_display.c says so when the title draws its own 16:9 frame
+ * (xbox_D3D8SetTitleWidescreen): its camera is widened already, and
+ * widening it again would show the world past what it culls to. */
+static int g_hor_plus_off;
+
+void d3d8_vsh_title_widescreen(int native)
+{
+    g_hor_plus_off = native;
+}
+
 static float hor_plus_factor(void)
 {
     static float factor = -1.0f;
 
+    if (g_hor_plus_off)
+        return 1.0f;
     if (factor < 0.0f) {
         const char *v = recomp_config_lookup("RECOMP_HOR_PLUS", "hor_plus");
 

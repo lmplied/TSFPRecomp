@@ -21,6 +21,7 @@ from tools.input_ui import bindings
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
 SOURCE = os.path.join(ROOT, "src", "input", "input_bindings.c")
+CONFIG_SOURCE = os.path.join(ROOT, "src", "config", "recomp_config.c")
 
 
 def read_source():
@@ -62,6 +63,20 @@ class Vocabulary(unittest.TestCase):
         self.assertEqual({name: int(code, 16) for name, code in rows},
                          bindings.KEY_NAMES)
 
+    def test_the_mouse_source_names_are_the_same_and_in_the_same_order(self):
+        names = re.findall(r'"([a-z_0-9+\-]+)"', table(self.text, "MOUSE_SOURCES"))
+        self.assertEqual(names, bindings.MOUSE_SOURCE_NAMES)
+
+    def test_the_runtime_reads_every_mouse_setting_the_ui_writes(self):
+        for key, _default, _low, _high in bindings.MOUSE_SETTINGS:
+            self.assertIn('strcmp(key, "%s")' % key, self.text)
+
+    def test_the_mouse_window_default_is_the_same(self):
+        match = re.search(r"#define MOUSE_WINDOW_DEFAULT (\d+)", self.text)
+        self.assertTrue(match)
+        defaults = {key: default for key, default, _l, _h in bindings.MOUSE_SETTINGS}
+        self.assertEqual(int(match.group(1)), defaults["mouse_window_ms"])
+
     def test_the_deadzone_default_is_the_same(self):
         match = re.search(r"#define DEADZONE_DEFAULT (\d+)", self.text)
         self.assertTrue(match)
@@ -70,14 +85,23 @@ class Vocabulary(unittest.TestCase):
     def test_the_runtime_reads_the_same_environment_variable(self):
         self.assertIn('getenv("RECOMP_INPUT_CONFIG")', self.text)
 
-    def test_the_runtime_looks_in_the_same_per_user_place(self):
+    def test_the_runtime_looks_in_the_same_per_user_places(self):
         # bindings.config_path() builds %APPDATA%\xboxrecomp\input_bindings.json
-        # and find_config() in the C builds the same path from the same pieces.
-        self.assertIn('getenv("APPDATA")', self.text)
-        self.assertIn('"\\\\xboxrecomp\\\\input_bindings.json"', self.text)
-        self.assertTrue(bindings.config_path().endswith(
-            os.path.join("xboxrecomp", "input_bindings.json"))
-            or os.environ.get("RECOMP_INPUT_CONFIG"))
+        # and, given a title, ...\titles\<ID>.bindings.json; the runtime gets
+        # both from recomp_bindings_read_path in src/config, built from the
+        # same pieces.
+        with open(CONFIG_SOURCE, encoding="utf-8") as handle:
+            config = handle.read()
+        self.assertIn("recomp_bindings_read_path", self.text)
+        self.assertIn('getenv("APPDATA")', config)
+        self.assertIn('"\\\\xboxrecomp"', config)
+        self.assertIn('"input_bindings.json"', config)
+        self.assertIn('"titles" SEP "%08X.bindings.json"', config)
+        if not os.environ.get("RECOMP_INPUT_CONFIG"):
+            self.assertTrue(bindings.config_path().endswith(
+                os.path.join("xboxrecomp", "input_bindings.json")))
+            self.assertTrue(bindings.config_path(0x45410066).endswith(
+                os.path.join("xboxrecomp", "titles", "45410066.bindings.json")))
 
 
 if __name__ == "__main__":

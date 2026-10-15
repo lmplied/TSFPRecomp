@@ -11,6 +11,7 @@
  * the life of the process, so there is nothing to recompile for.
  */
 #include "d3d8_display.h"
+#include "d3d8_vsh.h"        /* d3d8_vsh_title_widescreen: Hor+ stands aside */
 #include "recomp_config.h"
 
 #if defined(_WIN32)
@@ -71,9 +72,12 @@ const D3D8DisplayPolicy *d3d8_display_policy(void)
 
         v = recomp_config_lookup("RECOMP_WIDESCREEN_2D", "widescreen_2d");
         g_policy.centre_2d = v && (strcmp(v, "centre") == 0 || strcmp(v, "center") == 0);
-        if (v && *v && !g_policy.centre_2d && strcmp(v, "auto") != 0)
-            fprintf(stderr, "D3D8 display: RECOMP_WIDESCREEN_2D=%s is neither auto nor "
-                    "centre; using auto\n", v);
+        g_policy.native_2d = v && strcmp(v, "native") == 0;
+        if (g_policy.native_2d)
+            d3d8_vsh_title_widescreen(1);
+        if (v && *v && !g_policy.centre_2d && !g_policy.native_2d && strcmp(v, "auto") != 0)
+            fprintf(stderr, "D3D8 display: RECOMP_WIDESCREEN_2D=%s is none of auto, "
+                    "centre and native; using auto\n", v);
 
         if (g_policy.widescreen)
             fprintf(stderr, "D3D8 display: widescreen, so the title's frame is presented "
@@ -105,9 +109,88 @@ void xbox_D3D8SetWideFrames(BOOL wide)
     g_title_narrow = wide ? 0 : 1;
 }
 
+/* The device made its targets again at a new scale (xbox_D3D8RequestScale). */
+void d3d8_display_set_scale(UINT scale)
+{
+    d3d8_display_policy();                  /* read the rest first */
+    if (scale >= 1 && scale <= D3D8_DISPLAY_MAX_SCALE)
+        g_policy.scale = scale;
+}
+
+void xbox_D3D8SetAnisotropy(UINT level)
+{
+    d3d8_display_policy();                  /* read the rest first */
+    if (level < 1) level = 1;
+    if (level > 16) level = 16;
+    g_policy.anisotropy = level;
+}
+
 int d3d8_display_wide_now(void)
 {
     return d3d8_display_policy()->widescreen && !g_title_narrow;
+}
+
+/* Set at CreateDevice from the title's own presentation flags. TimeSplitters:
+ * Future Perfect reads the console's widescreen flag (XGetVideoFlags at
+ * 0x0037D45F, from its device set-up at 0x00023A91), and when it is set it
+ * adds D3DPRESENTFLAG_WIDESCREEN, sets its aspect to 16:9 and stores a 0.75
+ * squeeze that its camera, HUD and menus all read. Treated as a 4:3-only
+ * title, its full-screen colour grading -- which redraws the whole frame
+ * from a copy of it -- was squeezed into the middle three quarters: a
+ * narrowed copy of the picture over the ungraded frame, which showed at the
+ * sides. A title that says it draws 16:9 is taken at its word. */
+static int g_title_native_wide;
+
+void xbox_D3D8SetTitleWidescreen(BOOL native)
+{
+    g_title_native_wide = native ? 1 : 0;
+    d3d8_vsh_title_widescreen(d3d8_display_title_native_wide());
+    if (native && d3d8_display_policy()->widescreen)
+        fprintf(stderr, "D3D8 display: the title draws its own 16:9 frame "
+                "(D3DPRESENTFLAG_WIDESCREEN), so it is only stretched at present: "
+                "no 2D is squeezed and Hor+ is not applied\n");
+}
+
+int d3d8_display_title_native_wide(void)
+{
+    return g_title_native_wide || d3d8_display_policy()->native_2d;
+}
+
+/* Filling the window, whatever its shape -- 21:9, 32:9, 16:10 -- rather
+ * than a 16:9 picture between bars. Only for a title whose project can make
+ * the game draw that shape itself (its camera, culling and 2D layout), so it
+ * says so (xbox_D3D8SetTitleAnyAspect) and then follows the window's shape
+ * (xbox_D3D8FillShape). The player's switch is the settings file's
+ * wide_fill (RECOMP_WIDE_FILL), live from the in-game menu. */
+static volatile LONG g_title_any_aspect;
+static volatile LONG g_wide_fill = -1;
+
+void xbox_D3D8SetTitleAnyAspect(BOOL on)
+{
+    InterlockedExchange(&g_title_any_aspect, on ? 1 : 0);
+}
+
+BOOL xbox_D3D8TitleAnyAspect(void)
+{
+    return g_title_any_aspect != 0;
+}
+
+void xbox_D3D8SetWideFill(BOOL on)
+{
+    InterlockedExchange(&g_wide_fill, on ? 1 : 0);
+}
+
+BOOL xbox_D3D8WideFill(void)
+{
+    if (g_wide_fill < 0)
+        InterlockedExchange(&g_wide_fill,
+                            recomp_config_bool("RECOMP_WIDE_FILL", "wide_fill", 0) ? 1 : 0);
+    return g_wide_fill != 0;
+}
+
+int d3d8_display_fill_now(void)
+{
+    return g_title_any_aspect && d3d8_display_wide_now() && xbox_D3D8WideFill();
 }
 
 void d3d8_display_frame_done(void)
@@ -134,7 +217,11 @@ void d3d8_display_scene_size(UINT guest_w, UINT guest_h,
 void d3d8_display_output_shape(UINT scene_w, UINT scene_h,
                                UINT *shape_w, UINT *shape_h)
 {
-    if (d3d8_display_wide_now()) {
+    if (d3d8_display_fill_now()) {
+        /* The title drew the window's own shape: no bars at all. */
+        if (shape_w) *shape_w = 0;
+        if (shape_h) *shape_h = 0;
+    } else if (d3d8_display_wide_now()) {
         /* The frame is anamorphic: the title squeezed a 16:9 view into
          * whatever buffer it renders to, and the display is meant to
          * stretch it back. Presenting it at its own shape would be the
@@ -186,10 +273,15 @@ D3D8DisplayFit d3d8_display_fit(UINT shape_w, UINT shape_h, UINT bb_w, UINT bb_h
  * number -- which is most window sizes -- still resolves smoothly, and so
  * a window larger than the scene magnifies cleanly instead of blocking
  * up. At a whole-number ratio with taps to match, this is the box filter
- * that makes the supersampling exact. */
+ * that makes the supersampling exact.
+ *
+ * gamma: the player's brightness (xbox_D3D8SetBrightness), as the exponent
+ * that applies it -- one over the setting, so a setting above 1 lifts the
+ * dark end. Exactly 1 skips the pow, so the picture is bit-for-bit the
+ * game's own until someone moves the slider. */
 typedef struct {
     float origin_x, origin_y, ratio_x, ratio_y;
-    float texel_x, texel_y, inv_taps, pad;
+    float texel_x, texel_y, inv_taps, gamma;
 } ResolveConstants;
 
 static const char kSource[] =
@@ -211,8 +303,29 @@ static const char kSource[] =
     "        [unroll] for (int x = 0; x < TAPS; x++)\n"
     "            sum += scene.SampleLevel(smp,\n"
     "                       (base + (float2(x, y) + 0.5) * step) * q.xy, 0);\n"
-    "    return sum * q.z;\n"
+    "    sum *= q.z;\n"
+    "    if (q.w != 1.0)\n"
+    "        sum.rgb = pow(saturate(sum.rgb), q.w);\n"
+    "    return sum;\n"
     "}\n";
+
+/* The player's brightness, live (the in-game menu); 0 until the settings
+ * have been read. */
+static volatile float g_brightness;
+
+void xbox_D3D8SetBrightness(float b)
+{
+    g_brightness = b < 0.5f ? 0.5f : (b > 2.0f ? 2.0f : b);
+}
+
+float xbox_D3D8Brightness(void)
+{
+    if (g_brightness <= 0.0f) {
+        const char *v = recomp_config_lookup("RECOMP_BRIGHTNESS", "brightness");
+        xbox_D3D8SetBrightness(v && *v ? (float)atof(v) : 1.0f);
+    }
+    return g_brightness;
+}
 
 static struct {
     RhiShader      *vs;
@@ -358,7 +471,7 @@ HRESULT d3d8_display_resolve(RhiView *scene, UINT scene_w, UINT scene_h,
         c.texel_x = 1.0f / (float)scene_w;
         c.texel_y = 1.0f / (float)scene_h;
         c.inv_taps = 1.0f / (float)(taps * taps);
-        c.pad = 0.0f;
+        c.gamma = 1.0f / xbox_D3D8Brightness();
         memcpy(mapped, &c, sizeof c);
         rhi_buffer_unmap(g.cb);
     }

@@ -15,11 +15,16 @@
 #include <string.h>
 
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>     /* GetModuleFileNameA: the bindings preset */
 #include <direct.h>
 #define RECOMP_MKDIR(p) _mkdir(p)
 #else
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>      /* readlink: the bindings preset */
 #define RECOMP_MKDIR(p) mkdir((p), 0755)
 #endif
 
@@ -195,6 +200,10 @@ void recomp_settings_defaults(RecompSettings *s)
     s->fullscreen        = 0;
     s->vrr               = 1;
     s->frame_interp      = 1;
+    s->brightness        = 1.0;
+    s->mute_unfocused    = 0;
+    s->skip_intro        = 0;
+    s->fov               = 0.0;
     snprintf(s->frame_cap, sizeof s->frame_cap, "adaptive");
 }
 
@@ -229,6 +238,8 @@ int recomp_settings_read(const char *path, RecompSettings *s)
             s->resolution_scale = clamp_int(atoi(v), 1, 8);
         if ((v = from_table("widescreen")) != NULL)
             s->widescreen = !off_word(v);
+        if ((v = from_table("wide_fill")) != NULL)
+            s->wide_fill = !off_word(v);
         if ((v = from_table("hor_plus")) != NULL)
             s->hor_plus = atof(v);
         if ((v = from_table("hor_plus_register")) != NULL)
@@ -247,6 +258,19 @@ int recomp_settings_read(const char *path, RecompSettings *s)
             s->vrr = !off_word(v);
         if ((v = from_table("frame_interp")) != NULL)
             s->frame_interp = clamp_int(atoi(v), 1, 4);
+        if ((v = from_table("brightness")) != NULL) {
+            double b = atof(v);
+            s->brightness = b < 0.5 ? 0.5 : (b > 2.0 ? 2.0 : b);
+        }
+        if ((v = from_table("mute_unfocused")) != NULL)
+            s->mute_unfocused = !off_word(v);
+        if ((v = from_table("skip_intro")) != NULL)
+            s->skip_intro = !off_word(v);
+        if ((v = from_table("fov")) != NULL) {
+            double d = atof(v);
+            s->fov = d <= 0.0 ? 0.0 : (d < RECOMP_FOV_MIN ? RECOMP_FOV_MIN
+                                     : (d > RECOMP_FOV_MAX ? RECOMP_FOV_MAX : d));
+        }
         if ((v = from_table("game_dir")) != NULL)
             snprintf(s->game_dir, sizeof s->game_dir, "%s", v);
     }
@@ -351,17 +375,43 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "# must have it switched on. 0 turns it off.             [RECOMP_VRR]\n"
         "vrr = %d\n"
         "\n"
-        "# Frame interpolation: draw frames between the game's own, so 2 shows\n"
-        "# 120 a second while the game itself still runs at 60. Best with\n"
-        "# variable refresh. 1 is off.                   [RECOMP_FRAME_INTERP]\n"
+        "# Frame interpolation: draw frames between the game's own, which still\n"
+        "# runs at 60. 2 for a 120 Hz monitor, 3 for 180 Hz, 4 for 240 Hz.\n"
+        "# 1 is off.                                     [RECOMP_FRAME_INTERP]\n"
         "frame_interp = %d\n"
-        "\n"
-        "# Where the game's files are, if they are not beside the executable.\n"
-        "#                                                   [RECOMP_GAME_DIR]\n",
+        "\n",
         s->resolution_scale, s->widescreen, s->hor_plus, s->hor_plus_register,
         s->widescreen_2d[0] ? s->widescreen_2d : "auto",
         s->anisotropy, s->frame_cap[0] ? s->frame_cap : "adaptive", s->fps_overlay,
         s->fullscreen, s->vrr, s->frame_interp < 1 ? 1 : s->frame_interp);
+    fprintf(f,
+        "# Brightness, as a gamma on the finished picture: above 1 lifts the\n"
+        "# shadows, below 1 deepens them. 0.5 to 2.        [RECOMP_BRIGHTNESS]\n"
+        "brightness = %.2f\n"
+        "\n"
+        "# Silence the game while another window has the focus.\n"
+        "#                                             [RECOMP_MUTE_UNFOCUSED]\n"
+        "mute_unfocused = %d\n"
+        "\n"
+        "# With widescreen on, fill the window whatever its shape -- 21:9,\n"
+        "# 32:9, 16:10 -- rather than a 16:9 picture between bars. Only for a\n"
+        "# game whose project can make it draw any shape.  [RECOMP_WIDE_FILL]\n"
+        "wide_fill = %d\n"
+        "\n"
+        "# Skip the logo videos the game plays before its title screen.\n"
+        "#                                                 [RECOMP_SKIP_INTRO]\n"
+        "skip_intro = %d\n"
+        "\n"
+        "# Field of view, in degrees from the top of the screen to the bottom,\n"
+        "# 40 to 90; 0 keeps the game's own. Only for a game whose project can\n"
+        "# set its camera.                                         [RECOMP_FOV]\n"
+        "fov = %g\n"
+        "\n"
+        "# Where the game's files are, if they are not beside the executable.\n"
+        "#                                                   [RECOMP_GAME_DIR]\n",
+        s->brightness >= 0.5 ? s->brightness : 1.0, s->mute_unfocused, s->wide_fill,
+        s->skip_intro,
+        s->fov > 0.0 ? s->fov : 0.0);
 
     if (s->game_dir[0])
         fprintf(f, "game_dir = %s\n", s->game_dir);
@@ -394,6 +444,129 @@ int recomp_settings_path(uint32_t title_id, char *out, size_t n)
     }
     return 1;
 }
+
+/* ------------------------------------------------------------------ fov */
+
+static double g_fov_game;               /* 0: the title cannot set it */
+static volatile double g_fov = -1.0;    /* -1 until read from the settings */
+
+void recomp_fov_support(double game_degrees)
+{
+    g_fov_game = game_degrees > 0.0 ? game_degrees : 0.0;
+}
+
+double recomp_fov_game(void)
+{
+    return g_fov_game;
+}
+
+void recomp_fov_set(double degrees)
+{
+    g_fov = degrees <= 0.0 ? 0.0 : (degrees < RECOMP_FOV_MIN ? RECOMP_FOV_MIN
+                                   : (degrees > RECOMP_FOV_MAX ? RECOMP_FOV_MAX : degrees));
+}
+
+double recomp_fov(void)
+{
+    if (g_fov < 0.0) {
+        const char *v = recomp_config_lookup("RECOMP_FOV", "fov");
+        recomp_fov_set(v && *v ? atof(v) : 0.0);
+    }
+    return g_fov;
+}
+
+/* ------------------------------------------------------------ bindings */
+
+#if defined(_WIN32)
+#  define SEP "\\"
+#else
+#  define SEP "/"
+#endif
+
+int recomp_bindings_preset_path(char *out, size_t n)
+{
+    char exe[1024];
+    size_t len = 0;
+
+    if (!out || !n)
+        return 0;
+#if defined(_WIN32)
+    len = GetModuleFileNameA(NULL, exe, (DWORD)sizeof exe);
+#else
+    {
+        ssize_t got = readlink("/proc/self/exe", exe, sizeof exe - 1);
+        len = got > 0 ? (size_t)got : 0;
+        exe[len] = '\0';
+    }
+#endif
+    if (len > 0 && len < sizeof exe) {
+        char *slash = strrchr(exe, SEP[0]);
+        if (slash) {
+            slash[1] = '\0';
+            snprintf(out, n, "%sinput_bindings.json", exe);
+            if (readable(out))
+                return 1;
+        }
+    }
+    /* The working directory: what this used to be, and still the answer for
+     * a run.bat that starts the title from somewhere else. */
+    snprintf(out, n, "input_bindings.json");
+    return readable(out);
+}
+
+static int title_bindings_file(uint32_t title_id, char *out, size_t n)
+{
+    char dir[1024];
+
+    if (!title_id || !user_dir(dir, sizeof dir))
+        return 0;
+    snprintf(out, n, "%s" SEP "titles" SEP "%08X.bindings.json", dir, (unsigned)title_id);
+    return 1;
+}
+
+static int shared_bindings_file(char *out, size_t n)
+{
+    char dir[1024];
+
+    if (!user_dir(dir, sizeof dir))
+        return 0;
+    snprintf(out, n, "%s" SEP "input_bindings.json", dir);
+    return 1;
+}
+
+int recomp_bindings_read_path(uint32_t title_id, char *out, size_t n)
+{
+    const char *env = getenv("RECOMP_INPUT_CONFIG");
+
+    if (!out || !n)
+        return 0;
+    if (env && *env) {
+        snprintf(out, n, "%s", env);
+        return 1;
+    }
+    if (title_bindings_file(title_id, out, n) && readable(out))
+        return 1;
+    if (shared_bindings_file(out, n) && readable(out))
+        return 1;
+    return recomp_bindings_preset_path(out, n);
+}
+
+int recomp_bindings_write_path(uint32_t title_id, char *out, size_t n)
+{
+    const char *env = getenv("RECOMP_INPUT_CONFIG");
+
+    if (!out || !n)
+        return 0;
+    if (env && *env) {
+        snprintf(out, n, "%s", env);
+        return 1;
+    }
+    if (title_bindings_file(title_id, out, n))
+        return 1;
+    return shared_bindings_file(out, n);
+}
+
+#undef SEP
 
 static void load(void)
 {

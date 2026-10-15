@@ -86,6 +86,28 @@ PAD_SOURCES = (["pad:" + b for b in PAD_BUTTONS]
                + ["pad:lt", "pad:rt"]
                + ["pad:" + a for a in PAD_AXES])
 
+# What a "mouse:" source may name: five buttons, the wheel (each notch a short
+# press), and motion as four half-axes the way a stick is bound -- x+ right,
+# y+ away from the player. Mirrors MOUSE_SOURCES in input_bindings.c.
+MOUSE_SOURCE_NAMES = [
+    "left", "right", "middle", "x1", "x2", "wheel_up", "wheel_down",
+    "x+", "x-", "y+", "y-",
+]
+MOUSE_SOURCES = ["mouse:" + m for m in MOUSE_SOURCE_NAMES]
+
+# How mouse motion turns into a stick, per controller, with the range the
+# runtime accepts: (key, default, low, high). Mirrors MouseFeel and its
+# parsing in input_bindings.c.
+MOUSE_SETTINGS = [
+    ("mouse_sensitivity", 1.0, 0.01, 100.0),
+    ("mouse_deadzone", 0, 0, 32766),
+    ("mouse_exponent", 1.0, 0.1, 10.0),
+    ("mouse_y_scale", 1.0, 0.1, 10.0),
+    ("mouse_invert_y", False, None, None),
+    ("mouse_zoom_match", True, None, None),
+    ("mouse_window_ms", 16, 1, 250),
+]
+
 # Virtual-key names a "key:" source may use, beyond the single letters and
 # digits (which are their own code on Windows). Mirrors the KEYS table in
 # src/input/input_bindings.c.
@@ -147,7 +169,7 @@ def is_valid_source(source):
     """Is this a source string the runtime will understand?"""
     if not isinstance(source, str) or not source:
         return False
-    if source in PAD_SOURCES:
+    if source in PAD_SOURCES or source in MOUSE_SOURCES:
         return True
     if source.startswith("key:"):
         name = source[4:]
@@ -196,6 +218,14 @@ def source_label(source):
         if len(pretty) == 1:
             pretty = pretty.upper()                     # the face buttons
         return "Pad " + pretty
+    if source.startswith("mouse:"):
+        return {
+            "left": "Left click", "right": "Right click",
+            "middle": "Middle click", "x1": "Mouse back", "x2": "Mouse forward",
+            "wheel_up": "Wheel up", "wheel_down": "Wheel down",
+            "x+": "Mouse right", "x-": "Mouse left",
+            "y+": "Mouse forward (up)", "y-": "Mouse back (down)",
+        }.get(source[6:], source)
     return source
 
 
@@ -269,6 +299,15 @@ def normalise(data):
         return config
     if data.get("pad_api") in PAD_APIS:
         config["pad_api"] = data["pad_api"]
+    # What each control does in the title ("Fire"), which a title's preset
+    # carries for the launcher and the in-game menu to show. Kept, so a save
+    # from here does not lose them; the runtime never reads them.
+    labels = data.get("labels")
+    if isinstance(labels, dict):
+        kept = {control: label[:31] for control, label in labels.items()
+                if control in CONTROL_NAMES and isinstance(label, str) and label}
+        if kept:
+            config["labels"] = kept
     listed = data.get("controllers")
     if not isinstance(listed, list):
         return config
@@ -287,6 +326,21 @@ def normalise(data):
         deadzone = entry.get("deadzone")
         if isinstance(deadzone, int) and 0 <= deadzone < 32767:
             target["deadzone"] = deadzone
+        # The mouse settings are written only when the file had them, so a
+        # config with no mouse in it stays exactly as it was.
+        for key, default, low, high in MOUSE_SETTINGS:
+            value = entry.get(key)
+            if isinstance(default, bool):
+                if isinstance(value, bool):
+                    target[key] = value
+            elif (isinstance(value, (int, float)) and not isinstance(value, bool)
+                  and low <= value <= high):
+                target[key] = type(default)(value)
+        # Controls whose keys hold a toggle on rather than flip it (aim in
+        # Future Perfect); the runtime's "hold". Kept only when the file had it.
+        hold = entry.get("hold")
+        if isinstance(hold, list):
+            target["hold"] = [c for c in hold if c in CONTROL_NAMES]
         bindings = entry.get("bindings")
         if isinstance(bindings, dict):
             for control, value in bindings.items():
@@ -301,12 +355,14 @@ def normalise(data):
     return config
 
 
-def config_path():
+def config_path(title_id=None):
     """Where the UI and the runtime agree the config lives.
 
     RECOMP_INPUT_CONFIG wins, as it does in the runtime. Otherwise it is a
-    per-user file: bindings belong to the person, not to a title or a
-    checkout, and every title the toolkit builds reads the same one.
+    per-user file: with a title id, that title's own
+    (<user dir>/titles/<TITLE ID>.bindings.json, which the launcher writes
+    and the runtime reads first); without one, the file every title shares.
+    The runtime's order is recomp_bindings_read_path in src/config.
     """
     env = os.environ.get("RECOMP_INPUT_CONFIG")
     if env:
@@ -316,6 +372,9 @@ def config_path():
     else:
         base = (os.environ.get("XDG_CONFIG_HOME")
                 or os.path.join(os.path.expanduser("~"), ".config"))
+    if title_id:
+        return os.path.join(base, "xboxrecomp", "titles",
+                            "%08X.bindings.json" % title_id)
     return os.path.join(base, "xboxrecomp", "input_bindings.json")
 
 

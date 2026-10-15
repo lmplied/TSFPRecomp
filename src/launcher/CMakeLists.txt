@@ -20,7 +20,8 @@ if(WIN32)
         add_executable(${TARGET} WIN32
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/launcher.c
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/launcher_theme.c
-            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/launcher_bindings.c
+            # launcher_bindings.c is built into xbox_input, linked below,
+            # which the in-game menu shares.
         )
         target_include_directories(${TARGET} PRIVATE
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}
@@ -59,9 +60,16 @@ if(WIN32)
         # the launcher writes both off. A 2D fighter is the case: its stage
         # bounds and walls are built for 4:3, so a wider view shows space the
         # fighters cannot reach.
-        cmake_parse_arguments(_launcher "NO_WIDESCREEN" "" "" ${ARGN})
+        # recomp_add_launcher(<target> <exe> NATIVE_WIDESCREEN): a title with a
+        # 16:9 mode of its own, which it uses when the console says it is
+        # widescreen. Widescreen is then all it takes, so Wide camera -- the
+        # widening for a title without one -- is hidden and written off.
+        cmake_parse_arguments(_launcher "NO_WIDESCREEN;NATIVE_WIDESCREEN" "" "" ${ARGN})
         if(_launcher_NO_WIDESCREEN)
             target_compile_definitions(${TARGET} PRIVATE LAUNCHER_NO_WIDESCREEN=1)
+        endif()
+        if(_launcher_NATIVE_WIDESCREEN)
+            target_compile_definitions(${TARGET} PRIVATE LAUNCHER_NATIVE_WIDESCREEN=1)
         endif()
         if(MSVC)
             target_compile_options(${TARGET} PRIVATE

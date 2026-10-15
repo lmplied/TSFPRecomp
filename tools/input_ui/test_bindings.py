@@ -82,6 +82,57 @@ class Sources(unittest.TestCase):
             self.assertTrue(bindings.is_valid_source(source), source)
 
 
+class Mouse(unittest.TestCase):
+    def test_every_mouse_source_is_valid_and_has_a_label(self):
+        for source in bindings.MOUSE_SOURCES:
+            self.assertTrue(bindings.is_valid_source(source), source)
+            self.assertNotEqual(bindings.source_label(source), source)
+
+    def test_a_mouse_name_the_runtime_does_not_know_is_not(self):
+        for source in ("mouse:", "mouse:button4", "mouse:x", "mouse:wheel"):
+            self.assertFalse(bindings.is_valid_source(source), source)
+
+    def test_mouse_bindings_and_settings_survive_normalising(self):
+        config = bindings.normalise({"controllers": [{
+            "port": 1,
+            "mouse_sensitivity": 2.5, "mouse_deadzone": 8000,
+            "mouse_invert_y": True, "mouse_window_ms": 24,
+            "bindings": {"rstick_right": "mouse:x+", "rtrigger": ["mouse:left"]},
+        }]})
+        port = config["controllers"][0]
+        self.assertEqual(port["bindings"]["rstick_right"], ["mouse:x+"])
+        self.assertEqual(port["bindings"]["rtrigger"], ["mouse:left"])
+        self.assertEqual(port["mouse_sensitivity"], 2.5)
+        self.assertEqual(port["mouse_deadzone"], 8000)
+        self.assertIs(port["mouse_invert_y"], True)
+        self.assertEqual(port["mouse_window_ms"], 24)
+
+    def test_out_of_range_mouse_settings_are_dropped(self):
+        config = bindings.normalise({"controllers": [{
+            "port": 1, "mouse_sensitivity": 0, "mouse_deadzone": 40000,
+            "mouse_invert_y": "yes", "mouse_window_ms": 1000,
+        }]})
+        port = config["controllers"][0]
+        for key, _default, _low, _high in bindings.MOUSE_SETTINGS:
+            self.assertNotIn(key, port)
+
+    def test_action_labels_survive_and_unknown_ones_are_dropped(self):
+        config = bindings.normalise({"labels": {"rtrigger": "Fire", "nonsense": "x",
+                                                "x": 7}})
+        self.assertEqual(config["labels"], {"rtrigger": "Fire"})
+        self.assertNotIn("labels", bindings.default_config())
+
+    def test_the_hold_list_survives_and_unknown_controls_are_dropped(self):
+        data = {"controllers": [{"port": 1, "hold": ["rthumb", "warp", "lthumb"]}]}
+        port = bindings.normalise(data)["controllers"][0]
+        self.assertEqual(port["hold"], ["rthumb", "lthumb"])
+        self.assertNotIn("hold", bindings.normalise({})["controllers"][0])
+
+    def test_a_config_without_the_mouse_gains_no_mouse_keys(self):
+        port = bindings.default_config()["controllers"][0]
+        self.assertFalse([k for k in port if k.startswith("mouse_")])
+
+
 class Normalising(unittest.TestCase):
     def test_a_file_with_one_binding_changes_one_binding(self):
         config = bindings.normalise({

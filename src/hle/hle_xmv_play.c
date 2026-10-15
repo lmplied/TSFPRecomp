@@ -18,9 +18,65 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "hle.h"
+#include "recomp_config.h"
 #include "../kernel/xbox_memory_layout.h"   /* xbox_EnvSwitch */
+
+/* ---- the title's intro videos (xmv_set_intro_videos) ---- */
+
+static char g_intro[256];
+
+void xmv_set_intro_videos(const char *names)
+{
+    snprintf(g_intro, sizeof g_intro, "%s", names ? names : "");
+}
+
+/* name against a pattern of '*' and plain characters, case ignored. */
+static int glob_match(const char *pat, size_t plen, const char *name)
+{
+    if (!plen)
+        return !*name;
+    if (*pat == '*') {
+        for (;; name++) {
+            if (glob_match(pat + 1, plen - 1, name))
+                return 1;
+            if (!*name)
+                return 0;
+        }
+    }
+    if (!*name)
+        return 0;
+    if (tolower((unsigned char)*pat) != tolower((unsigned char)*name))
+        return 0;
+    return glob_match(pat + 1, plen - 1, name + 1);
+}
+
+int xmv_is_skipped_intro(const char *path)
+{
+    static int skip = -1;
+    const char *base, *p, *end;
+
+    if (!g_intro[0] || !path)
+        return 0;
+    if (skip < 0)
+        skip = recomp_config_bool("RECOMP_SKIP_INTRO", "skip_intro", 0);
+    if (!skip)
+        return 0;
+    base = path;
+    for (p = path; *p; p++)
+        if (*p == '\\' || *p == '/' || *p == ':')
+            base = p + 1;
+    for (p = g_intro; *p; p = *end ? end + 1 : end) {
+        end = strchr(p, ';');
+        if (!end)
+            end = p + strlen(p);
+        if (glob_match(p, (size_t)(end - p), base))
+            return 1;
+    }
+    return 0;
+}
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -210,6 +266,10 @@ int xmv_play_open(uint32_t source_va, uint32_t *width, uint32_t *height)
     if (!read_path(source_va, path, sizeof path)) {
         fprintf(stderr, "[XMV] Create's source 0x%08X is not a path; the movie is skipped\n",
                 source_va);
+        return 0;
+    }
+    if (xmv_is_skipped_intro(path)) {
+        fprintf(stderr, "[XMV] %s: an intro video, skipped (skip_intro)\n", path);
         return 0;
     }
     for (i = 0; i < MAX_MOVIES; i++)

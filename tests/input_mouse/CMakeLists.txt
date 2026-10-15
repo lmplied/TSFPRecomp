@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(input_mouse_test C)
+set(CMAKE_C_STANDARD 11)
+add_subdirectory(../.. runtime)
+add_executable(input_mouse_test test_main.c)
+target_link_libraries(input_mouse_test PRIVATE xbox_input)
+enable_testing()
+add_test(NAME input_mouse_test COMMAND input_mouse_test)

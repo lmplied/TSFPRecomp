@@ -18,6 +18,10 @@
 #include <cstdlib>
 #include <cstring>
 
+extern "C" int recomp_input_window_active(void);                 /* input_mouse.c */
+extern "C" const char *recomp_config_lookup(const char *env, const char *key);
+extern "C" unsigned long long recomp_input_script_ms(void);      /* input_host.c */
+
 namespace {
 
 /* 0..255 are DirectSound buffers (hle_dsound.c), 256..271 streams
@@ -62,6 +66,11 @@ bool reported_nonzero[kVoiceCount];
 bool attempted, com_initialized, callback_registered, summary_printed;
 unsigned long long submitted_buffers, submitted_bytes, nonzero_buffers;
 unsigned long long dropped_buffers;
+/* The master gain as configured, and the background mute over it: the
+ * setting (-1 until read), and whether the master is silenced for it now. */
+float master_gain = 1.0f;
+std::atomic<int> mute_unfocused{-1};
+std::atomic<int> background_muted{0};
 /* What creating and destroying source voices costs the calling thread. */
 unsigned long long voices_created, voices_destroyed;
 double create_ms_total, create_ms_max, destroy_ms_total, destroy_ms_max;
@@ -118,6 +127,130 @@ void checkCriticalError()
 {
     const HRESULT error = critical_error.load(std::memory_order_relaxed);
     if (engine && FAILED(error)) disableOutput("device", error);
+}
+
+/* mute_unfocused: silent while another window has the focus. Followed as
+ * sound is submitted, which is all the time, on a thread that owns the
+ * engine -- never from the window's thread, which could catch it being
+ * released. */
+void followFocus()
+{
+    const int want = recomp_audio_output_mute_unfocused() && !recomp_input_window_active();
+    int had = background_muted.load(std::memory_order_relaxed);
+    if (want != had && master &&
+        background_muted.compare_exchange_strong(had, want)) {
+        master->SetVolume(want ? 0.0f : master_gain);
+        std::fprintf(stderr, "[audio-output] %s\n", want
+            ? "muted: the game window is in the background (mute_unfocused)"
+            : "sound back: the game window has the focus");
+    }
+}
+
+/* RECOMP_AUDIO_DUMP=<folder>: everything each voice is given, as it is
+ * submitted, in WAV files -- slotNNN_KKK.wav, a new KKK each time the voice
+ * is reset or changes format -- and submissions.csv, one line a submission
+ * on the input script's clock (ms, slot, file, offset, bytes, rate, channels,
+ * level). What reaches the speakers, to be read rather than listened to: a
+ * repeat, a gap, noise or two voices at once all show in the files. */
+struct DumpFile {
+    FILE *f;
+    uint32_t rate, channels, bits, bytes;
+    int index;
+};
+DumpFile dumps[kVoiceCount];
+int dump_state = -1;                        /* -1 unread, 0 off, 1 on */
+char dump_dir[512];
+FILE *dump_log;
+CRITICAL_SECTION dump_lock;
+
+bool dumpOn()
+{
+    if (dump_state < 0) {
+        const char *v = std::getenv("RECOMP_AUDIO_DUMP");
+        dump_state = 0;
+        if (v && *v) {
+            std::snprintf(dump_dir, sizeof dump_dir, "%s", v);
+            CreateDirectoryA(dump_dir, nullptr);
+            char path[600];
+            std::snprintf(path, sizeof path, "%s\\submissions.csv", dump_dir);
+            dump_log = std::fopen(path, "w");
+            InitializeCriticalSection(&dump_lock);
+            if (dump_log) {
+                std::fprintf(dump_log, "ms,slot,file,offset,bytes,rate,channels,level\n");
+                dump_state = 1;
+                std::fprintf(stderr, "[audio-output] RECOMP_AUDIO_DUMP: every voice to %s\n",
+                             dump_dir);
+            }
+        }
+    }
+    return dump_state == 1;
+}
+
+void dumpHeader(DumpFile &d)
+{
+    uint8_t h[44];
+    const uint32_t align = d.channels * d.bits / 8, rate_bytes = d.rate * align;
+    std::memcpy(h, "RIFF", 4);
+    const uint32_t riff = 36 + d.bytes, fmt_len = 16, data = d.bytes;
+    const uint16_t pcm = 1, ch = (uint16_t)d.channels, al = (uint16_t)align,
+                   bits = (uint16_t)d.bits;
+    std::memcpy(h + 4, &riff, 4);
+    std::memcpy(h + 8, "WAVEfmt ", 8);
+    std::memcpy(h + 16, &fmt_len, 4);
+    std::memcpy(h + 20, &pcm, 2);
+    std::memcpy(h + 22, &ch, 2);
+    std::memcpy(h + 24, &d.rate, 4);
+    std::memcpy(h + 28, &rate_bytes, 4);
+    std::memcpy(h + 32, &al, 2);
+    std::memcpy(h + 34, &bits, 2);
+    std::memcpy(h + 36, "data", 4);
+    std::memcpy(h + 40, &data, 4);
+    std::fseek(d.f, 0, SEEK_SET);
+    std::fwrite(h, 1, sizeof h, d.f);
+    std::fseek(d.f, 0, SEEK_END);
+}
+
+void dumpClose(uint32_t slot)
+{
+    if (dump_state != 1 || slot >= kVoiceCount) return;
+    EnterCriticalSection(&dump_lock);
+    if (dumps[slot].f) {
+        std::fclose(dumps[slot].f);
+        dumps[slot].f = nullptr;
+    }
+    LeaveCriticalSection(&dump_lock);
+}
+
+void dumpWrite(uint32_t slot, const uint8_t *pcm, uint32_t bytes, uint32_t rate,
+               uint32_t channels, uint32_t bits, int32_t level)
+{
+    if (!dumpOn() || slot >= kVoiceCount) return;
+    EnterCriticalSection(&dump_lock);
+    DumpFile &d = dumps[slot];
+    if (d.f && (d.rate != rate || d.channels != channels || d.bits != bits)) {
+        std::fclose(d.f);
+        d.f = nullptr;
+    }
+    if (!d.f) {
+        char path[600];
+        std::snprintf(path, sizeof path, "%s\\slot%03u_%03d.wav", dump_dir, slot, d.index++);
+        d.f = std::fopen(path, "w+b");
+        d.rate = rate;
+        d.channels = channels;
+        d.bits = bits;
+        d.bytes = 0;
+        if (d.f) dumpHeader(d);
+    }
+    if (d.f) {
+        std::fprintf(dump_log, "%llu,%u,%d,%u,%u,%u,%u,%d\n", recomp_input_script_ms(), slot,
+                     d.index - 1, d.bytes, bytes, rate, channels, level);
+        std::fwrite(pcm, 1, bytes, d.f);
+        d.bytes += bytes;
+        dumpHeader(d);
+        std::fflush(d.f);
+        std::fflush(dump_log);
+    }
+    LeaveCriticalSection(&dump_lock);
 }
 
 void dropBuffer(uint32_t slot, const char *reason)
@@ -187,13 +320,29 @@ extern "C" void recomp_audio_output_initialize(void)
             std::fprintf(stderr, "[audio-output] RECOMP_MUTE: playing silently\n");
         }
     }
-    error = master->SetVolume(static_cast<float>(gain));
+    master_gain = static_cast<float>(gain);
+    error = master->SetVolume(master_gain);
     if (FAILED(error)) {
         disableOutput("MasterSetVolume", error);
         return;
     }
     std::fprintf(stderr,
         "[audio-output] initialized backend=xaudio2_9 master_gain=%.6f\n", gain);
+}
+
+extern "C" void recomp_audio_output_set_mute_unfocused(int on)
+{
+    mute_unfocused.store(on ? 1 : 0, std::memory_order_relaxed);
+}
+
+extern "C" int recomp_audio_output_mute_unfocused(void)
+{
+    if (mute_unfocused.load(std::memory_order_relaxed) < 0) {
+        const char *v = recomp_config_lookup("RECOMP_MUTE_UNFOCUSED", "mute_unfocused");
+        int setting = v && *v && std::strcmp(v, "0") != 0, unread = -1;
+        mute_unfocused.compare_exchange_strong(unread, setting);
+    }
+    return mute_unfocused.load(std::memory_order_relaxed);
 }
 
 extern "C" void recomp_audio_output_shutdown(void)
@@ -213,6 +362,7 @@ extern "C" void recomp_audio_output_reset_voice(uint32_t slot)
 {
     checkCriticalError();
     if (slot < kVoiceCount) destroyVoice(voices[slot]);
+    dumpClose(slot);
 }
 
 extern "C" int recomp_audio_output_position(uint32_t slot, uint64_t *played_bytes,
@@ -278,6 +428,7 @@ extern "C" int recomp_audio_output_submit(
 {
     recomp_audio_output_initialize();
     if (!engine || bytes == 0) return 0;
+    followFocus();
     if (slot >= kVoiceCount || !pcm || bytes > kMaxBufferBytes ||
         sample_rate < XAUDIO2_MIN_SAMPLE_RATE ||
         sample_rate > XAUDIO2_MAX_SAMPLE_RATE ||
@@ -371,6 +522,7 @@ extern "C" int recomp_audio_output_submit(
     ++voice.queued;
     ++submitted_buffers;
     submitted_bytes += bytes;
+    dumpWrite(slot, pcm, bytes, sample_rate, channels, bits_per_sample, volume_hundredth_db);
     bool nonzero = false;
     const uint8_t silence = bits_per_sample == 8 ? 0x80 : 0;
     for (uint32_t i = 0; i < bytes && !nonzero; ++i)

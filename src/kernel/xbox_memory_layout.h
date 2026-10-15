@@ -261,11 +261,21 @@ void xbox_Nv2aFlipGateRelease(void);
 typedef long long (*xbox_FlipGateIdleFn)(long long now, long long release);
 void xbox_Nv2aFlipGateSetIdle(xbox_FlipGateIdleFn fn);
 
+/* The title waits for the vblank itself before each frame, so adaptive and
+ * off leave the hook above no time: while a hook is set, such a title's
+ * Swap is held to the next vblank under them too. For a title project. */
+void xbox_Nv2aFlipGateSetTitlePaced(int on);
+
 /* The setting by name ("adaptive", "60", "30", "off", or "custom" for one
  * RECOMP_FPS_CAP asked for that is not a stop on the cycle), and the next
  * one along. For a key the player presses while the title runs. */
 const char *xbox_Nv2aFlipGateModeName(void);
 void        xbox_Nv2aFlipGateCycle(void);
+/* The same list by position -- 0 adaptive, 1 60, 2 30, 3 off, the order of
+ * the settings file's frame_cap choices -- for a menu: where the setting is
+ * (-1 for a custom one), and putting it at a stop. */
+int         xbox_Nv2aFlipGateModeIndex(void);
+void        xbox_Nv2aFlipGateSetMode(int index);
 
 /* The running title's own name, from its XBE certificate, as UTF-8; NULL
  * when the headers carried none. Valid once the layout has been set up. */

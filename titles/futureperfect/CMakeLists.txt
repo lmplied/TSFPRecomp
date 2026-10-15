@@ -155,3 +155,30 @@ endif()
 #     ENABLE_ICALL_TRACE=1
 #     VERBOSE_KERNEL_LOG=1
 # )
+
+# ── Keyboard and mouse ──────────────────────────────────────────
+# Future Perfect's own layout for a keyboard and mouse, beside the
+# executable, where the runtime reads it when the player has no bindings
+# of their own for this title (recomp_bindings_read_path) and where the
+# launcher's "Reset this controller" goes back to. WASD to move, the mouse
+# to look, left click fires, right click aims; the full table is in
+# docs/technical/input-binding.md.
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/input_bindings.json
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/input_bindings.json)
+
+# ── Launcher ────────────────────────────────────────────────────
+# A settings window that writes the per-title settings and controls and
+# starts the game. Windows only; see "The launcher" in the top-level README.
+if(COMMAND recomp_add_launcher)
+    # NATIVE_WIDESCREEN: Future Perfect has a 16:9 mode of its own, chosen
+    # from the console's video flag (XGetVideoFlags, read in its device
+    # set-up at 0x00023A91), so the launcher offers Widescreen alone.
+    recomp_add_launcher(${PROJECT_NAME}_launcher ${PROJECT_NAME}.exe NATIVE_WIDESCREEN)
+    # The same preset beside the launcher, for its reset.
+    add_custom_command(TARGET ${PROJECT_NAME}_launcher POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${CMAKE_CURRENT_SOURCE_DIR}/input_bindings.json
+                $<TARGET_FILE_DIR:${PROJECT_NAME}_launcher>/input_bindings.json)
+endif()

@@ -1183,6 +1183,12 @@ void xbox_D3D8SetPresentInterval(UINT interval);
  * Presented returns the last copy and its size, or NULL. */
 void           xbox_D3D8KeepPresented(BOOL on);
 const uint8_t *xbox_D3D8Presented(UINT *width, UINT *height);
+/* A screenshot: the next frame as it reaches the window, after the display
+ * resolve and before the settings menu is drawn over it. Take returns it as
+ * RGBA8 rows of width*4 bytes, malloc'd and now the caller's to free, or
+ * NULL until it has been taken. Any thread. */
+void     xbox_D3D8RequestShot(void);
+uint8_t *xbox_D3D8TakeShot(UINT *width, UINT *height);
 /* The size the guest presents at, for its screen-space geometry; the HLE
  * sets it from the title's present parameters (d3d8_GetGuestWidth). */
 void xbox_D3D8SetGuestSize(UINT width, UINT height);
@@ -1211,12 +1217,44 @@ float xbox_D3D8ClaimHorPlus(void);
  * widescreen, nothing. */
 void xbox_D3D8SetWideFrames(BOOL wide);
 
+/* The title created its device with D3DPRESENTFLAG_WIDESCREEN: it has a 16:9
+ * mode of its own and is in it, so its whole frame -- 3D, HUD, menus and
+ * full-screen passes -- is authored anamorphic and needs only the stretch at
+ * present. The 2D squeeze and Hor+ then do nothing. Called by the HLE at
+ * CreateDevice. */
+void xbox_D3D8SetTitleWidescreen(BOOL native);
+
 /* The window now fills its screen (borderless fullscreen), or no longer
  * does. While it does, and the vrr setting allows (RECOMP_VRR, on by
  * default), frames are presented for a variable-refresh display
  * (rhi_swapchain_set_vrr). Called by whoever owns the window, from any
  * thread; the swap chain follows at the next present. */
 void xbox_D3D8SetFullscreen(BOOL on);
+
+/* Settings the in-game menu changes while the title runs: variable refresh
+ * (the vrr setting) and the forced anisotropy (RECOMP_ANISO, 1 to 16; a
+ * sampler is rebuilt when it is next bound). */
+void xbox_D3D8SetVrr(BOOL on);
+void xbox_D3D8SetAnisotropy(UINT level);
+/* Brightness, 0.5 to 2 (RECOMP_BRIGHTNESS): a gamma applied as the scene is
+ * resolved to the window, 1 leaving the picture exactly as drawn. */
+void  xbox_D3D8SetBrightness(float b);
+float xbox_D3D8Brightness(void);
+/* The resolution scale, 1 to 8, changed while the title runs: the scene and
+ * its depth buffer are made again at the new size after the next present. */
+void  xbox_D3D8RequestScale(UINT scale);
+
+/* Filling the window at any shape (ultrawide). A title project that can make
+ * its game draw any aspect -- camera, culling, 2D -- says so before the game
+ * starts; with widescreen and the wide_fill setting on (RECOMP_WIDE_FILL,
+ * live from the menu), the picture then fills the window, and FillShape
+ * gives the shape the game must draw: the window's inside, in pixels, or
+ * FALSE when it should draw its own 16:9. */
+void xbox_D3D8SetTitleAnyAspect(BOOL on);
+BOOL xbox_D3D8TitleAnyAspect(void);
+void xbox_D3D8SetWideFill(BOOL on);
+BOOL xbox_D3D8WideFill(void);
+BOOL xbox_D3D8FillShape(UINT *width, UINT *height);
 
 /* Where the title's next screen-space draws belong in widescreen, for a title
  * that knows what it is drawing. A 4:3-only title's 2D is squeezed back to

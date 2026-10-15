@@ -208,6 +208,23 @@ static uint32_t setting(uint32_t iface, uint32_t offset)
 
 static uint32_t slot_of(const Buffer *b) { return (uint32_t)(b - g_buffers); }
 
+/* RECOMP_DSOUND_TRACE=1: the buffers' side of hle_dsound_stream.c's trace --
+ * every Play, Stop, SetBufferData and SetCurrentPosition, on the input
+ * script's clock. */
+unsigned long long recomp_input_script_ms(void);   /* input_host.c */
+static int g_trace = -1;
+
+static int tracing(void)
+{
+    if (g_trace < 0)
+        g_trace = xbox_EnvSwitch("RECOMP_DSOUND_TRACE", 0);
+    return g_trace;
+}
+
+#define TRACE(...) do { if (tracing()) { \
+        fprintf(stderr, "[DBT %llu] ", recomp_input_script_ms()); \
+        fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
+
 /* Drop what the host voice holds; the next submission starts a new one. */
 static void reset_output(Buffer *b)
 {
@@ -828,6 +845,9 @@ HLE_EXPORT(IDirectSoundBuffer_Play)
     recomp_dsound_buffer_cursor(&b->model, now);
     continuing = b->model.playing && b->output_model.playing &&
                  !(flags & RECOMP_DSOUND_PLAY_FROMSTART);
+    TRACE("b%u Play %08X data %08X size %u format %08X rate %u flags %X%s%s", slot_of(b),
+          iface, b->data, b->size, b->format, setting(iface, SET_RATE), flags,
+          continuing ? " (continuing)" : "", b->output ? "" : " clock only");
     result = recomp_dsound_buffer_play(&b->model, flags, now);
     if (result == RECOMP_DSOUND_OK) {
         b->paused = 0;
@@ -848,6 +868,8 @@ static void stop(uint32_t iface)
 
     lock();
     b = find(iface);
+    if (b)
+        TRACE("b%u Stop %08X%s", slot_of(b), iface, b->model.playing ? "" : " (not playing)");
     if (b) {
         pump(b, now);
         recomp_dsound_buffer_stop(&b->model, now);
@@ -998,6 +1020,8 @@ HLE_EXPORT(IDirectSoundBuffer_SetCurrentPosition)
 
     lock();
     b = model_for(iface, now);
+    if (b)
+        TRACE("b%u SetCurrentPosition %08X %u", slot_of(b), iface, position);
     if (b) {
         pump(b, now);
         if ((b->format & 0xFFFFu) == TAG_ADPCM && b->output) {
@@ -1184,6 +1208,7 @@ HLE_EXPORT(IDirectSoundBuffer_SetBufferData)
         fprintf(stderr, "[DSOUND] SetBufferData buffer=%08X data 0x%08X, %u bytes\n",
                 iface, data, bytes);
     }
+    TRACE("SetBufferData %08X data %08X size %u", iface, data, bytes);
     stop(iface);
     lock();
     object = HLE_MEM32(iface);

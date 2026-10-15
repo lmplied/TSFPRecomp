@@ -663,6 +663,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * does nothing while appearing to be set. */
     xbox_WatchdogStart();
 
+    /* What this title tells the runtime about itself: its intro videos, the
+     * toggles a held key can follow (recomp_manual.c). */
+    {
+        extern void fp_title_setup(void);
+        fp_title_setup();
+    }
+
     /* Step 7: Call the recompiled entry point */
     printf("\nStarting game...\n");
     fflush(stdout);

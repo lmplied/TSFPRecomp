@@ -43,7 +43,12 @@
  * turned more than 45 degrees or moved by half its distance in one frame
  * is a cut, and drawn as N has it. Only draws whose program goes through
  * the projection are blended: screen-space draws are N's exactly, so the
- * HUD does not shimmer.
+ * HUD does not shimmer. A group whose last row is not (0,0,0,1) is taken
+ * as the projection times an affine matrix, which a title that multiplies
+ * them itself uploads (Future Perfect's c68-c71): the affine part is
+ * unprojected with the projection register's value, blended, and
+ * multiplied by the blended projection. A program that reads such a group
+ * is 3D even if it never reads the projection itself.
  *
  * A frame is not interpolated (it is "held": the display keeps showing
  * N-1, as at 60) when it has no 3D, when less than 60% of its 3D
@@ -96,6 +101,8 @@ typedef struct {
     int match;                                   /* draw in the frame before, or -1 */
     int tier;
     int cut;                                     /* matched, but a matrix jumped */
+    int is3d;                                    /* through the projection, or a group
+                                                    that has it multiplied in */
     int reads_proj;                              /* its program reads the projection */
     uint32_t groups;                             /* the affine matrices it reads */
 } InterpDraw;
@@ -115,6 +122,8 @@ typedef struct {
  * turned to the same hemisphere), the rest of the 3x3, the translation. */
 typedef struct {
     int    ok;
+    int    projected;                            /* the projection times this: blend the
+                                                    affine part, multiply it back in */
     double qa[4], qb[4];
     double sa[9], sb[9];
     double ta[3], tb[3];
@@ -140,6 +149,7 @@ static LONGLONG   g_last_present, g_qpf, g_redraw_est, g_presented_at;
 static const char   *g_dump_prefix;
 static unsigned long g_dump_from, g_swaps;
 static int           g_dumped;
+static long          g_max_draws = -2;          /* RECOMP_INTERP_DRAWS, in redraw */
 
 /* For the report. */
 static unsigned long g_frames, g_shown, g_late, g_held_2d, g_held_match, g_held_cut,
@@ -231,11 +241,29 @@ void hle_d3d8_interp_draw(void (*fn)(const void *arg), const void *arg, size_t s
     l->draws[l->ndraws].cut = 0;
     /* Only what the program reads is the draw's: a register it never reads
      * holds whatever was last put there, and may jump about. Asked now,
-     * while the draw's program is the one bound. */
-    l->draws[l->ndraws].reads_proj =
-        key->uses_proj && g_proj >= 0 && (d3d8_vsh_bound_reads(g_proj, 4) & 1u);
-    l->draws[l->ndraws].groups =
-        key->uses_proj && g_aff_count ? d3d8_vsh_bound_reads(g_aff_first, g_aff_count) : 0;
+     * while the draw's program is the one bound.
+     *
+     * A program that never reads the projection is still 3D when a group it
+     * reads has a last row other than (0,0,0,1): the title multiplied the
+     * projection in itself (Future Perfect's c68-c71), and blend_projected
+     * takes it back out. */
+    {
+        InterpDraw *d = &l->draws[l->ndraws];
+        uint32_t reads = key->programmable && g_aff_count
+                         ? d3d8_vsh_bound_reads(g_aff_first, g_aff_count) : 0;
+        int projected = 0, g;
+
+        for (g = 0; g < g_aff_count / 4 && g_proj >= 0; g++) {
+            const float *w = c + (g_aff_first + g * 4 + 3) * 4;
+            if (((reads >> g) & 1u) &&
+                (fabsf(w[0]) > 1e-4f || fabsf(w[1]) > 1e-4f || fabsf(w[2]) > 1e-4f ||
+                 fabsf(w[3] - 1.0f) > 1e-4f))
+                projected = 1;
+        }
+        d->is3d = key->uses_proj || projected;
+        d->reads_proj = key->uses_proj && g_proj >= 0 && (d3d8_vsh_bound_reads(g_proj, 4) & 1u);
+        d->groups = d->is3d ? reads : 0;
+    }
     r = l->regs + (size_t)l->ndraws * (size_t)g_nregs * 4;
     if (g_proj >= 0) {
         memcpy(r, c + g_proj * 4, 16 * sizeof(float));
@@ -525,16 +553,101 @@ static int split(const float *g, double *q, double *s, double *t, int *mirror)
     return 1;
 }
 
-static void prepare_group(Prepared *p, const float *a, const float *b, int *cut)
+/* m^-1 by Gauss-Jordan with partial pivoting; 0 if m is singular. */
+static int invert4(const double *m, double *out)
 {
+    double a[4][8];
+    int i, j, k;
+
+    for (i = 0; i < 4; i++)
+        for (j = 0; j < 4; j++) {
+            a[i][j] = m[i * 4 + j];
+            a[i][4 + j] = i == j ? 1.0 : 0.0;
+        }
+    for (i = 0; i < 4; i++) {
+        int p = i;
+        double v;
+        for (k = i + 1; k < 4; k++)
+            if (fabs(a[k][i]) > fabs(a[p][i]))
+                p = k;
+        if (fabs(a[p][i]) < 1e-12)
+            return 0;
+        if (p != i)
+            for (j = 0; j < 8; j++) {
+                double t = a[i][j];
+                a[i][j] = a[p][j];
+                a[p][j] = t;
+            }
+        v = a[i][i];
+        for (j = 0; j < 8; j++)
+            a[i][j] /= v;
+        for (k = 0; k < 4; k++)
+            if (k != i && a[k][i] != 0.0) {
+                double f = a[k][i];
+                for (j = 0; j < 8; j++)
+                    a[k][j] -= f * a[i][j];
+            }
+    }
+    for (i = 0; i < 4; i++)
+        for (j = 0; j < 4; j++)
+            out[i * 4 + j] = a[i][4 + j];
+    return 1;
+}
+
+/* g is proj times an affine matrix: that matrix, proj^-1 g, in out. 0 when
+ * it is not one -- proj is not what the title multiplied in (a stale
+ * register, another camera's), or g is something else. The last row is
+ * allowed what a float product of a far translation gets wrong, then made
+ * exact. */
+static int unproject(const float *proj, const float *g, float *out)
+{
+    double p[16], inv[16], m[16], scale = 1.0;
+    int i, j, k;
+
+    for (i = 0; i < 16; i++)
+        p[i] = proj[i];
+    if (!invert4(p, inv))
+        return 0;
+    for (i = 0; i < 4; i++)
+        for (j = 0; j < 4; j++) {
+            double v = 0.0;
+            for (k = 0; k < 4; k++)
+                v += inv[i * 4 + k] * g[k * 4 + j];
+            m[i * 4 + j] = v;
+        }
+    for (i = 0; i < 3; i++)
+        if (fabs(m[i * 4 + 3]) > scale)
+            scale = fabs(m[i * 4 + 3]);
+    if (fabs(m[12]) > 1e-3 || fabs(m[13]) > 1e-3 || fabs(m[14]) > 1e-3 ||
+        fabs(m[15] - 1.0) > 1e-4 * scale)
+        return 0;
+    for (i = 0; i < 12; i++)
+        out[i] = (float)m[i];
+    out[12] = out[13] = out[14] = 0.0f;
+    out[15] = 1.0f;
+    return 1;
+}
+
+/* a and b are a draw's group in the frame before and this one; pa and pb
+ * the projection each side, or NULL when no register is one. */
+static void prepare_group(Prepared *p, const float *a, const float *b, const float *pa,
+                          const float *pb, int *cut)
+{
+    float ua[16], ub[16];
     int ma, mb;
     double dot, da, db, dt;
 
     p->ok = 0;
+    p->projected = 0;
     if (memcmp(a, b, 16 * sizeof(float)) == 0)
         return;                                  /* nothing moved: drawn as it is */
-    if (!is_affine(a) || !is_affine(b))
-        return;
+    if (!is_affine(a) || !is_affine(b)) {
+        if (!pa || !pb || !unproject(pa, a, ua) || !unproject(pb, b, ub))
+            return;
+        a = ua;
+        b = ub;
+        p->projected = 1;
+    }
     if (!split(a, p->qa, p->sa, p->ta, &ma) || !split(b, p->qb, p->sb, p->tb, &mb) ||
         ma != mb) {
         *cut = 1;
@@ -627,18 +740,21 @@ static int prepare_frame(void)
     for (i = 0; i < cur->ndraws; i++) {
         InterpDraw *d = &cur->draws[i];
 
-        if (!d->key.uses_proj)
+        if (!d->is3d)
             continue;
         prims3d += d->key.prims;
         if (d->match < 0)
             continue;
         matched += d->key.prims;
         {
+            const float *pa = g_proj >= 0 ? regs_of(prev, d->match) : NULL;
+            const float *pb = g_proj >= 0 ? regs_of(cur, i) : NULL;
             const float *a = regs_of(prev, d->match) + (g_proj >= 0 ? 16 : 0);
             const float *b = regs_of(cur, i) + (g_proj >= 0 ? 16 : 0);
             for (g = 0; g < g_groups; g++) {
                 if ((d->groups >> g) & 1u)
-                    prepare_group(&g_prep[i * g_groups + g], a + g * 16, b + g * 16, &d->cut);
+                    prepare_group(&g_prep[i * g_groups + g], a + g * 16, b + g * 16, pa, pb,
+                                  &d->cut);
                 else
                     g_prep[i * g_groups + g].ok = 0;
             }
@@ -691,26 +807,45 @@ static void set_draw_registers(int i, double a)
     const InterpDraw *d = &cur->draws[i];
     const float *b = regs_of(cur, i);
     float out[INTERP_MAX_REGS * 4];
-    int blend = d->key.uses_proj && d->match >= 0 && !d->cut;
+    int blend = d->is3d && d->match >= 0 && !d->cut;
     int g, k;
 
     memcpy(out, b, (size_t)g_nregs * 4 * sizeof(float));
     if (blend) {
         const float *pa = regs_of(prev, d->match);
         float *o = out;
+        double proj[16] = {0};
 
         if (g_proj >= 0) {
             /* The same kind of projection both sides (the last row says
              * perspective or not), or it is a change of view, not motion. */
-            if (d->reads_proj && memcmp(pa + 12, b + 12, 4 * sizeof(float)) == 0)
+            int same = memcmp(pa + 12, b + 12, 4 * sizeof(float)) == 0;
+            for (k = 0; k < 16; k++)
+                proj[k] = same ? (1.0 - a) * pa[k] + a * b[k] : b[k];
+            if (d->reads_proj && same)
                 for (k = 0; k < 16; k++)
-                    o[k] = (float)((1.0 - a) * pa[k] + a * b[k]);
+                    o[k] = (float)proj[k];
             o += 16;
         }
         for (g = 0; g < g_groups; g++) {
             const Prepared *p = &g_prep[i * g_groups + g];
-            if (p->ok)
+            if (p->ok) {
                 blend_group(p, a, o + g * 16);
+                if (p->projected) {
+                    /* The projection back in: the blended one times the
+                     * blended affine matrix. */
+                    float m[16];
+                    int r, c2, n;
+                    memcpy(m, o + g * 16, sizeof m);
+                    for (r = 0; r < 4; r++)
+                        for (c2 = 0; c2 < 4; c2++) {
+                            double v = 0.0;
+                            for (n = 0; n < 4; n++)
+                                v += proj[r * 4 + n] * m[n * 4 + c2];
+                            o[g * 16 + r * 4 + c2] = (float)v;
+                        }
+                }
+            }
         }
     }
     if (g_proj >= 0) {
@@ -741,11 +876,24 @@ static void redraw(double a)
         g_on = 0;
         return;
     }
+    /* RECOMP_INTERP_DRAWS=<n>: only the first n draws of each in-between
+     * frame (state still applied), as d3d8_replay --draws does for a
+     * capture -- with RECOMP_INTERP_DUMP, the way to find the draw an
+     * in-between frame gets wrong. */
+    if (g_max_draws == -2) {
+        const char *e = getenv("RECOMP_INTERP_DRAWS");
+        g_max_draws = e && *e ? atol(e) : -1;
+    }
     hle_d3d8_interp_rec = 0;                     /* what is drawn now is not kept */
     for (off = 0; off < cur->len; ) {
         op_header *h = (op_header *)(cur->ops + off);
-        if (h->draw >= 0)
+        if (h->draw >= 0) {
+            if (g_max_draws >= 0 && h->draw >= g_max_draws) {
+                off += sizeof(op_header) + INTERP_ALIGN(h->size);
+                continue;
+            }
             set_draw_registers(h->draw, a);
+        }
         h->fn(h->size ? (const void *)(h + 1) : NULL);
         off += sizeof(op_header) + INTERP_ALIGN(h->size);
     }

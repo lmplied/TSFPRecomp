@@ -78,18 +78,21 @@ static int        g_bind_dirty;
  * the rest of the window state because the capture below reads it. */
 static int        g_sel;
 
-#define BIND_ROWS_VISIBLE 5
+#define BIND_ROWS_VISIBLE 9       /* as many as the Video tab: the window holds nine */
 
-/* The input list starts with three rows that are not controls: which
- * controller is being edited, what it reads from, and putting it back.
- * They live in the list rather than off to one side so they are reached
- * the same way as everything else -- one way to move, one way to
+/* The input list starts with rows that are not controls: which controller
+ * is being edited, what it reads from, how the mouse feels, and putting it
+ * back. They live in the list rather than off to one side so they are
+ * reached the same way as everything else -- one way to move, one way to
  * change, and no second idea to learn. */
-#define BIND_HEAD_ROWS 4
+#define BIND_HEAD_ROWS 7
 #define BIND_ROW_PORT   0
 #define BIND_ROW_DEVICE 1
 #define BIND_ROW_API    2       /* SDL3 or XInput, for every controller */
-#define BIND_ROW_RESET  3
+#define BIND_ROW_SENS   3       /* mouse sensitivity */
+#define BIND_ROW_YSCALE 4       /* mouse up and down against left and right */
+#define BIND_ROW_INVERT 5       /* mouse up and down, inverted */
+#define BIND_ROW_RESET  6
 #define BIND_TOTAL_ROWS (BIND_HEAD_ROWS + BIND_CONTROLS)
 
 static const char *frame_cap_label(int i)
@@ -111,7 +114,14 @@ static void build_rows(void)
     r->kind  = ROW_INT; r->lo = 1; r->hi = 8; r->ival = &g_settings.resolution_scale;
     r++;
 
-#ifndef LAUNCHER_NO_WIDESCREEN
+#if defined(LAUNCHER_NATIVE_WIDESCREEN)
+    /* recomp_add_launcher(... NATIVE_WIDESCREEN): the game widens itself. */
+    r->label = "Widescreen";
+    r->help  = "16:9, the game's own widescreen mode: the view, the HUD and the"
+               " menus all widen. Takes effect when the game starts.";
+    r->kind  = ROW_BOOL; r->ival = &g_settings.widescreen;
+    r++;
+#elif !defined(LAUNCHER_NO_WIDESCREEN)
     /* Hidden for a title built with recomp_add_launcher(... NO_WIDESCREEN),
      * where a wider picture cannot be right; settings_save writes both off. */
     r->label = "Widescreen";
@@ -132,8 +142,8 @@ static void build_rows(void)
     r++;
 
     r->label = "Frame rate";
-    r->help  = "Adaptive paces the game the way the console did. F10 changes it"
-               " while playing.";
+    r->help  = "Adaptive paces the game the way the console did (nothing to do with"
+               " G-SYNC or FreeSync). F10 changes it while playing.";
     r->kind  = ROW_CHOICE; r->choices = k_frame_caps; r->ival = &g_frame_cap_index;
     r++;
 
@@ -147,14 +157,16 @@ static void build_rows(void)
     r->kind  = ROW_BOOL; r->ival = &g_settings.fullscreen;
     r++;
 
-    r->label = "Variable refresh rate";
-    r->help  = "In fullscreen on a G-SYNC or FreeSync display: an even 60, no judder.";
+    r->label = "G-SYNC / FreeSync";
+    r->help  = "For a monitor with G-SYNC or FreeSync, in fullscreen: each frame is"
+               " shown the moment it is ready, so 60 is an even 60. Off for others.";
     r->kind  = ROW_BOOL; r->ival = &g_settings.vrr;
     r++;
 
     r->label = "Frame interpolation";
-    r->help  = "Draw frames between the game's own: smoother motion while the game"
-               " still runs at 60. Best with Variable refresh rate.";
+    r->help  = "Draw frames between the game's own, which still runs at 60: 2x for"
+               " a 120 Hz monitor, 3x for 180 Hz, 4x for 240 Hz. Adds a little"
+               " input delay.";
     r->kind  = ROW_INT; r->lo = 1; r->hi = 4; r->ival = &g_settings.frame_interp;
     r++;
 
@@ -350,46 +362,19 @@ static const char *capture_pad(int pad_index)
     return NULL;
 }
 
-/* The key names the runtime knows by name; everything else is a letter
- * or a digit and spells itself. Escape is not offered: it is how a
- * person gets out of the capture. */
-static const struct { int vk; const char *name; } k_named_keys[] = {
-    { VK_RETURN, "RETURN" }, { VK_BACK, "BACK" }, { VK_SPACE, "SPACE" },
-    { VK_TAB, "TAB" }, { VK_UP, "UP" }, { VK_DOWN, "DOWN" },
-    { VK_LEFT, "LEFT" }, { VK_RIGHT, "RIGHT" },
-    { VK_LSHIFT, "LSHIFT" }, { VK_RSHIFT, "RSHIFT" },
-    { VK_LCONTROL, "LCTRL" }, { VK_RCONTROL, "RCTRL" },
-    { 0, NULL }
-};
-
-static const char *capture_key(void)
-{
-    static char out[BIND_SOURCE_LEN];
-    int i, vk;
-
-    for (i = 0; k_named_keys[i].name; i++)
-        if (GetAsyncKeyState(k_named_keys[i].vk) & 0x8000) {
-            snprintf(out, sizeof out, "key:%s", k_named_keys[i].name);
-            return out;
-        }
-    for (vk = 'A'; vk <= 'Z'; vk++)
-        if (GetAsyncKeyState(vk) & 0x8000) {
-            snprintf(out, sizeof out, "key:%c", (char)vk);
-            return out;
-        }
-    for (vk = '0'; vk <= '9'; vk++)
-        if (GetAsyncKeyState(vk) & 0x8000) {
-            snprintf(out, sizeof out, "key:%c", (char)vk);
-            return out;
-        }
-    return NULL;
-}
+/* The keyboard-and-mouse capture (bind_capture_*), shared with the in-game
+ * menu so the two offer the same keys. */
+static BindCapture g_capture;
 
 /* Nothing at all held. Entering the capture with A still down would
- * otherwise bind A to whatever the person was trying to rebind. */
+ * otherwise bind A to whatever the person was trying to rebind -- and the
+ * click that opened the capture would bind the left button. */
 static int everything_released(int pad_index)
 {
-    return capture_pad(pad_index) == NULL && capture_key() == NULL &&
+    BindCapture none;
+
+    memset(&none, 0, sizeof none);
+    return capture_pad(pad_index) == NULL && bind_capture_poll(&none, -1) == NULL &&
            !(GetAsyncKeyState(VK_ESCAPE) & 0x8000);
 }
 
@@ -397,29 +382,34 @@ static void capture_tick(void)
 {
     const BindPort *bp = &g_bind.port[g_bind_port];
     int pad = bp->device == BIND_DEV_PAD ? bp->pad : 0;
+    int k = g_bind_top + g_sel - BIND_HEAD_ROWS;
     const char *got;
 
     if (!g_capture_armed) {
         g_capture_armed = everything_released(pad);
+        if (g_capture_armed)
+            bind_capture_begin(&g_capture);
         return;
     }
     if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
         g_capturing = 0;
         return;
     }
-    got = (g_bind_col == 0) ? capture_pad(pad) : capture_key();
+    got = (g_bind_col == 0) ? capture_pad(pad) : bind_capture_poll(&g_capture, k);
+    g_capture.wheel = 0;
     if (!got)
         return;
 
-    {
-        int k = g_bind_top + g_sel - BIND_HEAD_ROWS;
+    if (k >= 0 && k < BIND_CONTROLS) {
+        BindPort *dst = &g_bind.port[g_bind_port];
 
-        if (k >= 0 && k < BIND_CONTROLS) {
-            char *dst = (g_bind_col == 0) ? g_bind.port[g_bind_port].pad_src[k]
-                                          : g_bind.port[g_bind_port].key_src[k];
-            snprintf(dst, BIND_SOURCE_LEN, "%s", got);
-            g_bind_dirty = 1;
+        if (g_bind_col == 0) {
+            snprintf(dst->pad_src[k], BIND_SOURCE_LEN, "%s", got);
+        } else {
+            snprintf(dst->key_src[k], BIND_SOURCE_LEN, "%s", got);
+            bind_drop_hidden_keys(dst, k);
         }
+        g_bind_dirty = 1;
     }
     g_capturing = 0;
 }
@@ -446,13 +436,17 @@ static void settings_load(void)
     }
 }
 
+/* The file the game will read -- this title's own, or failing that the
+ * shared one, or the preset beside the executable -- so what is shown is
+ * what is played. Saved, it always goes to this title's own file. */
 static void bindings_load(void)
 {
-    char path[1024];
+    char path[1024], preset[1024];
+    int have = recomp_bindings_read_path(g_title_id, path, sizeof path);
 
-    bind_defaults(&g_bind);
-    if (bind_config_path(path, sizeof path))
-        bind_load(path, &g_bind);
+    if (!recomp_bindings_preset_path(preset, sizeof preset))
+        preset[0] = '\0';
+    bind_load_with_labels(have ? path : NULL, preset, &g_bind);
     recomp_pad_set_api(g_bind.pad_api == BIND_PAD_API_XINPUT
                        ? RECOMP_PAD_API_XINPUT : RECOMP_PAD_API_SDL);
     g_bind_dirty = 0;
@@ -462,9 +456,20 @@ static void bindings_save(void)
 {
     char path[1024];
 
-    if (g_bind_dirty && bind_config_path(path, sizeof path))
+    if (g_bind_dirty && recomp_bindings_write_path(g_title_id, path, sizeof path))
         if (bind_save(path, &g_bind))
             g_bind_dirty = 0;
+}
+
+/* What "reset" goes back to: the title's preset when it ships one, the
+ * built-in mapping when it does not. */
+static void bindings_defaults(BindConfig *d)
+{
+    char path[1024];
+
+    bind_defaults(d);
+    if (recomp_bindings_preset_path(path, sizeof path))
+        bind_load(path, d);
 }
 
 static int settings_save(void)
@@ -479,6 +484,9 @@ static int settings_save(void)
     /* Not offered, so not left on by an older file either. */
     g_settings.widescreen = 0;
     g_settings.hor_plus = 0.0;
+#endif
+#ifdef LAUNCHER_NATIVE_WIDESCREEN
+    g_settings.hor_plus = 0.0;          /* the game widens its own camera */
 #endif
     snprintf(g_settings.frame_cap, sizeof g_settings.frame_cap, "%s",
              k_frame_caps[g_frame_cap_index]);
@@ -756,13 +764,44 @@ static void nav(int dx, int dy, int accept, int cancel, int tabdelta)
                                    ? RECOMP_PAD_API_XINPUT : RECOMP_PAD_API_SDL);
                 g_bind_dirty = 1;
             }
+        } else if (k == BIND_ROW_SENS) {
+            if (dx) {
+                BindMouse *m = &g_bind.port[g_bind_port].mouse;
+                /* Steps of a tenth near 1, wider above 3, where a tenth is
+                 * not a difference anyone can feel. */
+                double step = m->sensitivity >= 3.0 ? 0.5 : 0.1;
+
+                m->sensitivity += dx * step;
+                if (m->sensitivity < 0.1) m->sensitivity = 0.1;
+                if (m->sensitivity > 20.0) m->sensitivity = 20.0;
+                m->present = 1;
+                g_bind_dirty = 1;
+            }
+        } else if (k == BIND_ROW_YSCALE) {
+            if (dx) {
+                BindMouse *m = &g_bind.port[g_bind_port].mouse;
+
+                m->y_scale += dx * 0.1;
+                if (m->y_scale < 0.2) m->y_scale = 0.2;
+                if (m->y_scale > 5.0) m->y_scale = 5.0;
+                m->present = 1;
+                g_bind_dirty = 1;
+            }
+        } else if (k == BIND_ROW_INVERT) {
+            if (dx || accept) {
+                BindMouse *m = &g_bind.port[g_bind_port].mouse;
+
+                m->invert_y = !m->invert_y;
+                m->present = 1;
+                g_bind_dirty = 1;
+            }
         } else if (k == BIND_ROW_RESET) {
             if (accept) {
                 BindConfig d;
 
                 /* This controller only: a person resetting controller 2
                  * has said nothing about the other three. */
-                bind_defaults(&d);
+                bindings_defaults(&d);
                 g_bind.port[g_bind_port] = d.port[g_bind_port];
                 g_bind_dirty = 1;
             }
@@ -856,7 +895,7 @@ static void draw(void)
             theme_text(h2, "CONTROLLER", 10, 700,
                        g_bind_col == 0 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
             h2.x += 210;
-            theme_text(h2, "KEYBOARD", 10, 700,
+            theme_text(h2, "KEYBOARD / MOUSE", 10, 700,
                        g_bind_col == 1 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
         }
 
@@ -907,6 +946,23 @@ static void draw(void)
                                    ? "Xbox controllers only (XInput)"
                                    : "All controllers (SDL3)",
                            12, 400, lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+            } else if (k == BIND_ROW_SENS) {
+                snprintf(line, sizeof line, "%.1f", bp->mouse.sensitivity);
+                theme_text(lr, "Mouse sensitivity", 12, 600,
+                           lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+                theme_text(cv, line, 12, 400,
+                           lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+            } else if (k == BIND_ROW_YSCALE) {
+                snprintf(line, sizeof line, "%.1f x side to side", bp->mouse.y_scale);
+                theme_text(lr, "Mouse up and down speed", 12, 600,
+                           lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+                theme_text(cv, line, 12, 400,
+                           lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+            } else if (k == BIND_ROW_INVERT) {
+                theme_text(lr, "Mouse up and down", 12, 600,
+                           lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+                theme_text(cv, bp->mouse.invert_y ? "Inverted" : "Normal", 12, 400,
+                           lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
             } else if (k == BIND_ROW_RESET) {
                 theme_text(lr, "Reset this controller", 12, 600,
                            lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
@@ -914,8 +970,10 @@ static void draw(void)
                            lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
             } else {
                 int c = k - BIND_HEAD_ROWS;
+                int hidden = bind_hidden_count(bp, c);
+                char key_label[64];
 
-                label = bind_control_labels[c];
+                label = bind_control_title(&g_bind, c);
                 theme_text(lr, label, 12, 600,
                            lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
 
@@ -927,15 +985,24 @@ static void draw(void)
                            (lit > 0.5 && g_bind_col == 0) ? THEME_GREEN : THEME_TEXT_DIM,
                            THEME_LEFT);
                 cv.x += 210;
+                /* "+2": this control answers to more than the one shown
+                 * (a preset's Enter and Space as well as E). Rebinding the
+                 * column replaces them all. */
+                if (hidden)
+                    snprintf(key_label, sizeof key_label, "%s  +%d",
+                             bind_source_label(bp->key_src[c]), hidden);
+                else
+                    snprintf(key_label, sizeof key_label, "%s",
+                             bind_source_label(bp->key_src[c]));
                 theme_text(cv,
                            (g_capturing && lit > 0.5 && g_bind_col == 1)
-                               ? "press a key..." : bind_source_label(bp->key_src[c]),
+                               ? "press a key or click..." : key_label,
                            12, 400,
                            (lit > 0.5 && g_bind_col == 1) ? THEME_GREEN : THEME_TEXT_DIM,
                            THEME_LEFT);
             }
 
-            if (lit > 0.5 && k <= BIND_ROW_API)
+            if (lit > 0.5 && k < BIND_HEAD_ROWS && k != BIND_ROW_RESET)
                 theme_arrows(arrows_rect(rr), 1, 1, lit);
         }
 
@@ -958,22 +1025,32 @@ static void draw(void)
             int k = g_bind_top + g_sel;
 
             theme_text_wrapped(r,
-                g_capturing ? "Press what you want this to be. Escape cancels."
+                g_capturing ? (g_bind_col == 1
+                                  ? "Press a key, click, or turn the wheel; for a stick direction, "
+                                    "move the mouse that way. Escape cancels."
+                                  : "Press what you want this to be. Escape cancels.")
                 : k == BIND_ROW_PORT   ? "Which of the four controllers these bindings are for."
                 : k == BIND_ROW_DEVICE ? "What this controller reads: a gamepad, the keyboard, or nothing."
                 : k == BIND_ROW_API    ? "All controllers reads Xbox, PlayStation, Switch and most other pads. "
                                          "Xbox controllers only is the older XInput path, for a pad that misbehaves. "
                                          "Every game uses this."
-                : k == BIND_ROW_RESET  ? "Put this controller back to the built-in mapping."
-                : "Left and right choose the controller or the keyboard column. "
-                  "A or Enter rebinds. Bindings are shared by every game.",
+                : k == BIND_ROW_SENS   ? "How far the camera turns for how far the mouse moves. "
+                                         "In the game, click the window to give it the mouse; Alt+Tab gives it back."
+                : k == BIND_ROW_YSCALE ? "Looking up and down against turning. Console games look up and down "
+                                         "slower than they turn; raise this until the two feel the same."
+                : k == BIND_ROW_INVERT ? "Inverted turns pushing the mouse away into looking down. If the game's "
+                                         "own Inverse Look is on, it inverts again: leave one of them off."
+                : k == BIND_ROW_RESET  ? "Put this controller back to the defaults: this game's own layout when "
+                                         "it has one, else the built-in mapping."
+                : "Left and right choose the controller or the keyboard and mouse column. "
+                  "A or Enter rebinds. These bindings are this game's own.",
                 11, THEME_TEXT_DIM);
         }
     } else {
         ThemeRect p = row_rect(0);
         char line[1024];
 
-        p.h = 190;
+        p.h = 214;
         theme_panel(p, 0.25);
         p.x += 24; p.y += 18; p.w -= 48; p.h = 26;
         theme_text(p, g_title_name, 15, 700, THEME_TEXT, THEME_LEFT);
@@ -989,6 +1066,16 @@ static void draw(void)
                 snprintf(line, sizeof line, "Settings  %s", path);
             else
                 snprintf(line, sizeof line, "Settings  (nowhere to write)");
+        }
+        theme_text(p, line, 11, 400, THEME_TEXT_DIM, THEME_LEFT);
+
+        p.y += 24;
+        {
+            char path[1024];
+            if (recomp_bindings_write_path(g_title_id, path, sizeof path))
+                snprintf(line, sizeof line, "Controls  %s", path);
+            else
+                snprintf(line, sizeof line, "Controls  (nowhere to write)");
         }
         theme_text(p, line, 11, 400, THEME_TEXT_DIM, THEME_LEFT);
 
@@ -1154,6 +1241,12 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         InvalidateRect(h, NULL, FALSE);
         return 0;
     }
+    case WM_MOUSEWHEEL:
+        /* A notch is a binding while one is being waited for; the capture
+         * reads it on its next tick. */
+        if (g_capturing && g_capture_armed && g_bind_col == 1)
+            bind_capture_wheel(&g_capture, GET_WHEEL_DELTA_WPARAM(wp));
+        return 0;
     case WM_MOUSEMOVE: {
         int i = hit_row(LOWORD(lp), HIWORD(lp));
 

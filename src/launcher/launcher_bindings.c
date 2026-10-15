@@ -83,6 +83,13 @@ void bind_defaults(BindConfig *c)
         c->port[p].device   = BIND_DEV_PAD;
         c->port[p].pad      = p;
         c->port[p].deadzone = 7849;          /* XInput's own left-stick value */
+        /* The runtime's MouseFeel defaults; not written until something
+         * sets them. */
+        c->port[p].mouse.sensitivity = 1.0;
+        c->port[p].mouse.exponent    = 1.0;
+        c->port[p].mouse.y_scale     = 1.0;
+        c->port[p].mouse.window_ms   = 16;
+        c->port[p].mouse.zoom_match  = 1;
         for (i = 0; i < BIND_CONTROLS; i++) {
             snprintf(c->port[p].pad_src[i], BIND_SOURCE_LEN, "%s", k_defaults[i].pad);
             /* The keyboard column is port 1 only, as in the runtime. */
@@ -92,25 +99,63 @@ void bind_defaults(BindConfig *c)
     }
 }
 
-int bind_config_path(char *out, size_t n)
+int bind_load_with_labels(const char *path, const char *preset_path, BindConfig *c)
 {
-    const char *env = getenv("RECOMP_INPUT_CONFIG");
-#if defined(_WIN32)
-    const char *home = getenv("APPDATA");
-    const char *tail = "\\xboxrecomp\\input_bindings.json";
-#else
-    const char *home = getenv("XDG_CONFIG_HOME");
-    const char *tail = "/xboxrecomp/input_bindings.json";
-#endif
+    int ok = path ? bind_load(path, c) : (bind_defaults(c), 0);
 
-    if (env && *env) {
-        snprintf(out, n, "%s", env);
-        return 1;
+    if (preset_path && *preset_path && (!path || strcmp(path, preset_path) != 0)) {
+        static BindConfig preset;          /* large: not on the stack */
+        int i;
+
+        if (bind_load(preset_path, &preset))
+            for (i = 0; i < BIND_CONTROLS; i++)
+                if (!c->action[i][0] && preset.action[i][0])
+                    snprintf(c->action[i], sizeof c->action[i], "%s", preset.action[i]);
     }
-    if (!home || !*home)
+    return ok;
+}
+
+const char *bind_control_title(const BindConfig *c, int control)
+{
+    if (control < 0 || control >= BIND_CONTROLS)
+        return "";
+    if (c && c->action[control][0])
+        return c->action[control];
+    return bind_control_labels[control];
+}
+
+int bind_is_key_or_mouse(const char *src)
+{
+    return src && (strncmp(src, "key:", 4) == 0 || strncmp(src, "mouse:", 6) == 0);
+}
+
+void bind_drop_hidden_keys(BindPort *bp, int control)
+{
+    int e, kept = 0;
+    char keep[BIND_EXTRA][BIND_SOURCE_LEN];
+
+    if (control < 0 || control >= BIND_CONTROLS)
+        return;
+    for (e = 0; e < BIND_EXTRA; e++) {
+        const char *s = bp->extra_src[control][e];
+        if (*s && !bind_is_key_or_mouse(s))
+            snprintf(keep[kept++], BIND_SOURCE_LEN, "%s", s);
+    }
+    memset(bp->extra_src[control], 0, sizeof bp->extra_src[control]);
+    for (e = 0; e < kept; e++)
+        snprintf(bp->extra_src[control][e], BIND_SOURCE_LEN, "%s", keep[e]);
+}
+
+int bind_hidden_count(const BindPort *bp, int control)
+{
+    int e, n = 0;
+
+    if (control < 0 || control >= BIND_CONTROLS)
         return 0;
-    snprintf(out, n, "%s%s", home, tail);
-    return 1;
+    for (e = 0; e < BIND_EXTRA; e++)
+        if (bp->extra_src[control][e][0])
+            n++;
+    return n;
 }
 
 /* ------------------------------------------------------------ reading */
@@ -212,20 +257,19 @@ static void set_device(BindPort *bp, const char *name)
     }
 }
 
-/* The sources for one control. The first pad source and the first key
- * source are the two the launcher shows; any beyond those are the
- * Python tool's business and are left alone by not being read -- a save
- * from here writes the two it models, which is the shape the defaults
- * have. */
+/* The sources for one control. The first pad source and the first
+ * keyboard-or-mouse source are the two the launcher shows; up to
+ * BIND_EXTRA more are kept in extra_src and written back. */
 static const char *parse_sources(const char *p, BindPort *bp, int k)
 {
     char value[BIND_SOURCE_LEN];
-    int got_pad = 0, got_key = 0;
+    int got_pad = 0, got_key = 0, extra = 0;
 
     p = ws(p);
     if (k >= 0) {
         bp->pad_src[k][0] = '\0';
         bp->key_src[k][0] = '\0';
+        memset(bp->extra_src[k], 0, sizeof bp->extra_src[k]);
     }
     if (*p == '[') {
         p = ws(p + 1);
@@ -233,13 +277,15 @@ static const char *parse_sources(const char *p, BindPort *bp, int k)
             p = jstring(p, value, sizeof value);
             if (!p)
                 return NULL;
-            if (k >= 0) {
+            if (k >= 0 && value[0]) {
                 if (strncmp(value, "pad:", 4) == 0 && !got_pad) {
                     snprintf(bp->pad_src[k], BIND_SOURCE_LEN, "%s", value);
                     got_pad = 1;
-                } else if (strncmp(value, "key:", 4) == 0 && !got_key) {
+                } else if (bind_is_key_or_mouse(value) && !got_key) {
                     snprintf(bp->key_src[k], BIND_SOURCE_LEN, "%s", value);
                     got_key = 1;
+                } else if (extra < BIND_EXTRA) {
+                    snprintf(bp->extra_src[k][extra++], BIND_SOURCE_LEN, "%s", value);
                 }
             }
             p = ws(p);
@@ -255,9 +301,9 @@ static const char *parse_sources(const char *p, BindPort *bp, int k)
     if (!p)
         return NULL;
     if (k >= 0) {
-        if (strncmp(value, "key:", 4) == 0)
+        if (bind_is_key_or_mouse(value))
             snprintf(bp->key_src[k], BIND_SOURCE_LEN, "%s", value);
-        else
+        else if (strcmp(value, "none") != 0)
             snprintf(bp->pad_src[k], BIND_SOURCE_LEN, "%s", value);
     }
     return p;
@@ -321,9 +367,53 @@ static const char *parse_controller(const char *p, BindConfig *c, int index)
         } else if (strcmp(key, "deadzone") == 0) {
             tmp.deadzone = (int)strtol(p, NULL, 10);
             p = jskip(p);
+        } else if (strncmp(key, "mouse_", 6) == 0) {
+            /* The runtime's ranges (input_bindings.c); outside them it
+             * keeps its default, and so does this. */
+            BindMouse *m = &tmp.mouse;
+            double v = strtod(p, NULL);
+            int took = 1;
+
+            if (strcmp(key, "mouse_sensitivity") == 0 && v > 0.0 && v <= 100.0)
+                m->sensitivity = v;
+            else if (strcmp(key, "mouse_deadzone") == 0 && v >= 0 && v < 32767)
+                m->deadzone = (int)v;
+            else if (strcmp(key, "mouse_exponent") == 0 && v >= 0.1 && v <= 10.0)
+                m->exponent = v;
+            else if (strcmp(key, "mouse_y_scale") == 0 && v >= 0.1 && v <= 10.0)
+                m->y_scale = v;
+            else if (strcmp(key, "mouse_invert_y") == 0)
+                m->invert_y = strncmp(p, "true", 4) == 0 || *p == '1';
+            else if (strcmp(key, "mouse_zoom_match") == 0)
+                m->zoom_match = strncmp(p, "true", 4) == 0 || *p == '1';
+            else if (strcmp(key, "mouse_window_ms") == 0 && v >= 1 && v <= 250)
+                m->window_ms = (int)v;
+            else
+                took = 0;
+            if (took)
+                m->present = 1;
+            p = jskip(p);
+            if (!p) return NULL;
         } else if (strcmp(key, "bindings") == 0) {
             p = parse_bindings_obj(p, &tmp);
             if (!p) return NULL;
+        } else if (strcmp(key, "hold") == 0 && *p == '[') {
+            /* ["rthumb", "lthumb"]: keys that hold a toggle on */
+            p = ws(p + 1);
+            tmp.hold = 0;
+            while (*p && *p != ']') {
+                int k;
+                p = jstring(p, value, sizeof value);
+                if (!p) return NULL;
+                k = control_index(value);
+                if (k >= 0)
+                    tmp.hold |= 1u << k;
+                p = ws(p);
+                if (*p == ',')
+                    p = ws(p + 1);
+            }
+            if (*p != ']') return NULL;
+            p++;
         } else {
             p = jskip(p);
             if (!p) return NULL;
@@ -378,6 +468,28 @@ int bind_load(const char *path, BindConfig *c)
             p = jstring(p, api, sizeof api);
             if (!p) break;
             c->pad_api = strcmp(api, "xinput") == 0 ? BIND_PAD_API_XINPUT : BIND_PAD_API_SDL;
+        } else if (strcmp(key, "labels") == 0 && *p == '{') {
+            /* { "rtrigger": "Fire", ... } */
+            char name[48], label[32];
+            p = ws(p + 1);
+            while (*p && *p != '}') {
+                int k;
+                p = jstring(p, name, sizeof name);
+                if (!p) break;
+                p = ws(p);
+                if (*p != ':') { p = NULL; break; }
+                p = ws(p + 1);
+                p = jstring(p, label, sizeof label);
+                if (!p) break;
+                k = control_index(name);
+                if (k >= 0)
+                    snprintf(c->action[k], sizeof c->action[k], "%s", label);
+                p = ws(p);
+                if (*p == ',')
+                    p = ws(p + 1);
+            }
+            if (!p) break;
+            if (*p == '}') p++;
         } else if (strcmp(key, "controllers") == 0 && *p == '[') {
             p = ws(p + 1);
             while (*p && *p != ']') {
@@ -429,8 +541,27 @@ int bind_save(const char *path, const BindConfig *c)
     if (!f)
         return 0;
 
-    fprintf(f, "{\n  \"version\": 1,\n  \"pad_api\": \"%s\",\n  \"controllers\": [\n",
+    fprintf(f, "{\n  \"version\": 1,\n  \"pad_api\": \"%s\",\n",
             c->pad_api == BIND_PAD_API_XINPUT ? "xinput" : "sdl");
+    /* The title's action names, kept so a save does not lose them. */
+    {
+        int any = 0, first = 1;
+
+        for (i = 0; i < BIND_CONTROLS; i++)
+            if (c->action[i][0])
+                any = 1;
+        if (any) {
+            fprintf(f, "  \"labels\": {");
+            for (i = 0; i < BIND_CONTROLS; i++)
+                if (c->action[i][0]) {
+                    fprintf(f, "%s\n    \"%s\": \"%s\"", first ? "" : ",",
+                            bind_control_names[i], c->action[i]);
+                    first = 0;
+                }
+            fprintf(f, "\n  },\n");
+        }
+    }
+    fprintf(f, "  \"controllers\": [\n");
     for (p = 0; p < BIND_PORTS; p++) {
         const BindPort *bp = &c->port[p];
         int first = 1;
@@ -442,10 +573,37 @@ int bind_save(const char *path, const BindConfig *c)
             fprintf(f, "      \"device\": \"gamepad:%d\",\n", bp->pad);
         else
             fprintf(f, "      \"device\": \"none\",\n");
-        fprintf(f, "      \"deadzone\": %d,\n      \"bindings\": {\n", bp->deadzone);
+        fprintf(f, "      \"deadzone\": %d,\n", bp->deadzone);
+        if (bp->mouse.present)
+            fprintf(f, "      \"mouse_sensitivity\": %.3f,\n"
+                       "      \"mouse_deadzone\": %d,\n"
+                       "      \"mouse_exponent\": %.3f,\n"
+                       "      \"mouse_y_scale\": %.3f,\n"
+                       "      \"mouse_invert_y\": %s,\n"
+                       "      \"mouse_zoom_match\": %s,\n"
+                       "      \"mouse_window_ms\": %d,\n",
+                    bp->mouse.sensitivity, bp->mouse.deadzone, bp->mouse.exponent,
+                    bp->mouse.y_scale, bp->mouse.invert_y ? "true" : "false",
+                    bp->mouse.zoom_match ? "true" : "false", bp->mouse.window_ms);
+        if (bp->hold) {
+            int any = 0;
+
+            fprintf(f, "      \"hold\": [");
+            for (i = 0; i < BIND_CONTROLS; i++)
+                if ((bp->hold >> i) & 1u)
+                    fprintf(f, "%s\"%s\"", any++ ? ", " : "", bind_control_names[i]);
+            fprintf(f, "],\n");
+        }
+        fprintf(f, "      \"bindings\": {\n");
 
         for (i = 0; i < BIND_CONTROLS; i++) {
-            const char *pd = bp->pad_src[i], *ky = bp->key_src[i];
+            const char *srcs[2 + BIND_EXTRA];
+            int n = 0, s, e;
+
+            srcs[n++] = bp->pad_src[i];
+            srcs[n++] = bp->key_src[i];
+            for (e = 0; e < BIND_EXTRA; e++)
+                srcs[n++] = bp->extra_src[i][e];
 
             /* Every control is written, including one with no sources.
              * Leaving it out does not unbind it: a control the file does
@@ -456,9 +614,9 @@ int bind_save(const char *path, const BindConfig *c)
                 fprintf(f, ",\n");
             first = 0;
             fprintf(f, "        \"%s\": [", bind_control_names[i]);
-            if (*pd) fprintf(f, "\"%s\"", pd);
-            if (*pd && *ky) fprintf(f, ", ");
-            if (*ky) fprintf(f, "\"%s\"", ky);
+            for (s = 0, e = 0; s < n; s++)
+                if (*srcs[s])
+                    fprintf(f, "%s\"%s\"", e++ ? ", " : "", srcs[s]);
             fprintf(f, "]");
         }
         fprintf(f, "\n      }\n    }%s\n", p + 1 < BIND_PORTS ? "," : "");
@@ -488,7 +646,13 @@ static const struct { const char *src, *label; } k_labels[] = {
     { "key:SPACE", "Space" }, { "key:ESCAPE", "Escape" },
     { "key:LSHIFT", "Left shift" }, { "key:RSHIFT", "Right shift" },
     { "key:LCTRL", "Left ctrl" }, { "key:RCTRL", "Right ctrl" },
-    { "key:TAB", "Tab" },
+    { "key:TAB", "Tab" }, { "key:LALT", "Left alt" }, { "key:RALT", "Right alt" },
+    { "mouse:left", "Left click" }, { "mouse:right", "Right click" },
+    { "mouse:middle", "Middle click" },
+    { "mouse:x1", "Mouse back" }, { "mouse:x2", "Mouse forward" },
+    { "mouse:wheel_up", "Wheel up" }, { "mouse:wheel_down", "Wheel down" },
+    { "mouse:x+", "Mouse right" }, { "mouse:x-", "Mouse left" },
+    { "mouse:y+", "Mouse forward" }, { "mouse:y-", "Mouse back" },
     { NULL, NULL }
 };
 
@@ -509,3 +673,113 @@ const char *bind_source_label(const char *src)
     snprintf(buf, sizeof buf, "%s", src);
     return buf;
 }
+
+/* ------------------------------------------------------------- capture */
+
+#if defined(_WIN32)
+
+/* The key names the runtime knows by name (its KEYS table); everything
+ * else is a letter or a digit and spells itself. Not offered: Escape, which
+ * is how a person gets out of the capture; F1, the in-game menu's key; and
+ * F9-F12, the game's frame counter, frame cap, capture and screenshot keys. */
+static const struct { int vk; const char *name; } k_named_keys[] = {
+    { VK_RETURN, "RETURN" }, { VK_BACK, "BACK" }, { VK_SPACE, "SPACE" },
+    { VK_TAB, "TAB" }, { VK_UP, "UP" }, { VK_DOWN, "DOWN" },
+    { VK_LEFT, "LEFT" }, { VK_RIGHT, "RIGHT" },
+    { VK_LSHIFT, "LSHIFT" }, { VK_RSHIFT, "RSHIFT" },
+    { VK_LCONTROL, "LCTRL" }, { VK_RCONTROL, "RCTRL" },
+    { VK_LMENU, "LALT" }, { VK_RMENU, "RALT" }, { VK_CAPITAL, "CAPSLOCK" },
+    { VK_INSERT, "INSERT" }, { VK_DELETE, "DELETE" }, { VK_HOME, "HOME" },
+    { VK_END, "END" }, { VK_PRIOR, "PAGEUP" }, { VK_NEXT, "PAGEDOWN" },
+    { VK_F2, "F2" }, { VK_F3, "F3" }, { VK_F4, "F4" },
+    { VK_F5, "F5" }, { VK_F6, "F6" }, { VK_F7, "F7" }, { VK_F8, "F8" },
+    { VK_NUMPAD0, "NUMPAD0" }, { VK_NUMPAD1, "NUMPAD1" }, { VK_NUMPAD2, "NUMPAD2" },
+    { VK_NUMPAD3, "NUMPAD3" }, { VK_NUMPAD4, "NUMPAD4" }, { VK_NUMPAD5, "NUMPAD5" },
+    { VK_NUMPAD6, "NUMPAD6" }, { VK_NUMPAD7, "NUMPAD7" }, { VK_NUMPAD8, "NUMPAD8" },
+    { VK_NUMPAD9, "NUMPAD9" },
+    { VK_OEM_1, "SEMICOLON" }, { VK_OEM_PLUS, "EQUALS" }, { VK_OEM_COMMA, "COMMA" },
+    { VK_OEM_MINUS, "MINUS" }, { VK_OEM_PERIOD, "PERIOD" }, { VK_OEM_2, "SLASH" },
+    { VK_OEM_3, "GRAVE" }, { VK_OEM_4, "LBRACKET" }, { VK_OEM_5, "BACKSLASH" },
+    { VK_OEM_6, "RBRACKET" }, { VK_OEM_7, "QUOTE" },
+    { 0, NULL }
+};
+
+static const struct { int vk; const char *name; } k_mouse_buttons[] = {
+    { VK_LBUTTON, "left" }, { VK_RBUTTON, "right" }, { VK_MBUTTON, "middle" },
+    { VK_XBUTTON1, "x1" }, { VK_XBUTTON2, "x2" },
+    { 0, NULL }
+};
+
+void bind_capture_begin(BindCapture *c)
+{
+    POINT p;
+
+    memset(c, 0, sizeof *c);
+    if (GetCursorPos(&p)) {
+        c->from_x = p.x;
+        c->from_y = p.y;
+    }
+}
+
+void bind_capture_wheel(BindCapture *c, int delta)
+{
+    if (delta)
+        c->wheel = delta > 0 ? 1 : -1;
+}
+
+const char *bind_capture_poll(BindCapture *c, int control)
+{
+    static char out[BIND_SOURCE_LEN];
+    int i, vk;
+
+    for (i = 0; k_named_keys[i].name; i++)
+        if (GetAsyncKeyState(k_named_keys[i].vk) & 0x8000) {
+            snprintf(out, sizeof out, "key:%s", k_named_keys[i].name);
+            return out;
+        }
+    for (vk = 'A'; vk <= 'Z'; vk++)
+        if (GetAsyncKeyState(vk) & 0x8000) {
+            snprintf(out, sizeof out, "key:%c", (char)vk);
+            return out;
+        }
+    for (vk = '0'; vk <= '9'; vk++)
+        if (GetAsyncKeyState(vk) & 0x8000) {
+            snprintf(out, sizeof out, "key:%c", (char)vk);
+            return out;
+        }
+    for (i = 0; k_mouse_buttons[i].name; i++)
+        if (GetAsyncKeyState(k_mouse_buttons[i].vk) & 0x8000) {
+            snprintf(out, sizeof out, "mouse:%s", k_mouse_buttons[i].name);
+            return out;
+        }
+    if (c->wheel) {
+        snprintf(out, sizeof out, "mouse:%s", c->wheel > 0 ? "wheel_up" : "wheel_down");
+        return out;
+    }
+    /* Moving the mouse answers only for a stick direction: anywhere else a
+     * hand drifting to the mouse would bind it. Pushed well past a nudge,
+     * and screen up is away from the player, which is stick up. */
+    if (control >= 0 && control < BIND_CONTROLS &&
+        strstr(bind_control_names[control], "stick_")) {
+        POINT now;
+        const long reach = 80;    /* pixels; "far" is a windows.h macro */
+
+        if (GetCursorPos(&now)) {
+            long dx = now.x - c->from_x, dy = now.y - c->from_y;
+
+            if (dx > reach)  { snprintf(out, sizeof out, "mouse:x+"); return out; }
+            if (dx < -reach) { snprintf(out, sizeof out, "mouse:x-"); return out; }
+            if (dy < -reach) { snprintf(out, sizeof out, "mouse:y+"); return out; }
+            if (dy > reach)  { snprintf(out, sizeof out, "mouse:y-"); return out; }
+        }
+    }
+    return NULL;
+}
+
+#else
+
+void bind_capture_begin(BindCapture *c) { memset(c, 0, sizeof *c); }
+void bind_capture_wheel(BindCapture *c, int delta) { (void)c; (void)delta; }
+const char *bind_capture_poll(BindCapture *c, int control) { (void)c; (void)control; return NULL; }
+
+#endif

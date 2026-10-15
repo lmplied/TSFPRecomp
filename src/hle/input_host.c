@@ -37,6 +37,8 @@ enum {
     XBOX_DPAD_RIGHT = 0x0008u,
     XBOX_START = 0x0010u,
     XBOX_BACK = 0x0020u,
+    XBOX_LTHUMB = 0x0040u,
+    XBOX_RTHUMB = 0x0080u,
 };
 
 /* RECOMP_FAKE_INPUT=start,a  presses each listed button in turn, one per
@@ -54,7 +56,8 @@ static const struct { const char *name; int kind; unsigned value; int sign; } FA
     { "start", FAKE_BUTTON, XBOX_START, 0 },      { "back",  FAKE_BUTTON, XBOX_BACK, 0 },
     { "up",    FAKE_BUTTON, XBOX_DPAD_UP, 0 },    { "down",  FAKE_BUTTON, XBOX_DPAD_DOWN, 0 },
     { "left",  FAKE_BUTTON, XBOX_DPAD_LEFT, 0 },  { "right", FAKE_BUTTON, XBOX_DPAD_RIGHT, 0 },
-    { "a",     FAKE_ANALOG, HOST_ANALOG_A, 0 },   { "b",     FAKE_ANALOG, HOST_ANALOG_B, 0 },
+    { "lthumb", FAKE_BUTTON, XBOX_LTHUMB, 0 },    { "rthumb", FAKE_BUTTON, XBOX_RTHUMB, 0 },
+    { "a",   FAKE_ANALOG, HOST_ANALOG_A, 0 },   { "b",     FAKE_ANALOG, HOST_ANALOG_B, 0 },
     { "x",     FAKE_ANALOG, HOST_ANALOG_X, 0 },   { "y",     FAKE_ANALOG, HOST_ANALOG_Y, 0 },
     { "white", FAKE_ANALOG, HOST_ANALOG_WHITE, 0 }, { "black", FAKE_ANALOG, HOST_ANALOG_BLACK, 0 },
     { "lt",    FAKE_ANALOG, HOST_ANALOG_LTRIG, 0 }, { "rt",    FAKE_ANALOG, HOST_ANALOG_RTRIG, 0 },
@@ -74,9 +77,10 @@ static int fake_lookup(const char *p, size_t n)
     return -1;
 }
 
-static void fake_apply(RecompInputGamepad *g, int i)
+/* pct: how far a stick is pushed, 1-100; buttons ignore it. */
+static void fake_apply(RecompInputGamepad *g, int i, int pct)
 {
-    int16_t push = (int16_t)(FAKE[i].sign > 0 ? 32767 : -32767);
+    int16_t push = (int16_t)((FAKE[i].sign > 0 ? 32767 : -32767) * pct / 100);
 
     switch (FAKE[i].kind) {
     case FAKE_ANALOG:
@@ -101,7 +105,9 @@ static void fake_apply(RecompInputGamepad *g, int i)
  * Each step is <ms>:<control>[+<control>...][:<hold ms>]. A control is a
  * button, an analog button, or a stick direction held all the way over
  * (lstick_up, rstick_left, ...), so a script can walk and turn, not only
- * press. The clock starts the
+ * press. A stick direction takes @<percent> for a partial push
+ * (rstick_right@20), which is how a title's own stick deadzone is measured:
+ * hold a little more each time until the camera moves. The clock starts the
  * first time the title reads the pad, so a slow boot does not eat the script;
  * hold defaults to 200 ms, long enough for a title polling at 60 Hz to see the
  * press and the release. Steps may overlap, which is how a chord is held.
@@ -114,7 +120,7 @@ static void fake_apply(RecompInputGamepad *g, int i)
  * is how a run gets back to the same screen. The sequence is the save state.
  * Nothing is pressed after the last step ends. */
 #define SEQ_MAX 128
-static struct seq_step { unsigned long at, hold; int keys[4]; int nkeys; } s_seq[SEQ_MAX];
+static struct seq_step { unsigned long at, hold; int keys[4], pct[4]; int nkeys; } s_seq[SEQ_MAX];
 static int s_seq_count = -1;
 static unsigned long long s_seq_t0;
 
@@ -141,16 +147,25 @@ static void seq_parse(const char *env)
         while (q < p + len) {
             size_t n = 0;
             int k;
-            while (q + n < p + len && q[n] != '+' && q[n] != ':')
+            int pct = 100;
+            while (q + n < p + len && q[n] != '+' && q[n] != ':' && q[n] != '@')
                 n++;
             k = fake_lookup(q, n);
             if (k < 0) {
                 fprintf(stderr, "  [PAD] RECOMP_INPUT_SEQ: unknown button '%.*s'\n", (int)n, q);
                 return;
             }
-            if (s->nkeys < 4)
-                s->keys[s->nkeys++] = k;
             q += n;
+            if (q < p + len && *q == '@') {
+                pct = (int)strtol(q + 1, &end, 10);
+                if (pct < 1 || pct > 100)
+                    pct = 100;
+                q = end;
+            }
+            if (s->nkeys < 4) {
+                s->pct[s->nkeys] = pct;
+                s->keys[s->nkeys++] = k;
+            }
             if (q < p + len && *q == ':') {
                 s->hold = strtoul(q + 1, NULL, 10);
                 if (!s->hold)
@@ -206,6 +221,68 @@ static int seq_owns_pad(void)
     return !with_pad;
 }
 
+/* RECOMP_RAM_SNAPSHOT=<prefix> with RECOMP_RAM_SNAPSHOT_AT=<ms>[,<ms>...]:
+ * guest memory to <prefix><n>.bin at those times on the input script's clock,
+ * so a snapshot lands between known presses. RECOMP_RAM_SNAPSHOT_RANGE=
+ * <va>:<bytes> picks the range (default 0x00010000:0x03FF0000, the image and
+ * the heap). This is how a variable is found by what it does: snapshot,
+ * turn right, snapshot, turn right again, snapshot, look up, snapshot -- the
+ * view's yaw is the value that moved by the same amount twice and then held.
+ * A snapshot stalls the title for the length of the write. */
+extern ptrdiff_t g_xbox_mem_offset;
+
+static void ram_snapshots(unsigned long long t)
+{
+    static int configured, next, count;
+    static unsigned long at[16];
+    static const char *prefix;
+    static uint32_t va = 0x00010000u, len = 0x03FF0000u;
+
+    if (!configured) {
+        const char *spec = getenv("RECOMP_RAM_SNAPSHOT_AT"), *range;
+        char *end;
+
+        configured = 1;
+        prefix = getenv("RECOMP_RAM_SNAPSHOT");
+        while (spec && *spec && count < 16) {
+            at[count++] = strtoul(spec, &end, 10);
+            if (end == spec)
+                break;
+            spec = *end == ',' ? end + 1 : end;
+        }
+        range = getenv("RECOMP_RAM_SNAPSHOT_RANGE");
+        if (range && *range) {
+            va = (uint32_t)strtoul(range, &end, 0);
+            if (*end == ':')
+                len = (uint32_t)strtoul(end + 1, NULL, 0);
+        }
+    }
+    if (!prefix || !*prefix || next >= count || t < at[next])
+        return;
+    {
+        char path[512];
+        FILE *f;
+
+        snprintf(path, sizeof path, "%s%d.bin", prefix, next);
+        f = fopen(path, "wb");
+        if (f) {
+            fwrite((const uint8_t *)g_xbox_mem_offset + va, 1, len, f);
+            fclose(f);
+            fprintf(stderr, "  [PAD] RAM snapshot %d at %llu ms: 0x%08X+0x%X -> %s\n",
+                    next, t, va, len, path);
+            fflush(stderr);
+        }
+        next++;
+    }
+}
+
+/* The input script's clock, for a title project's own scripted test (0
+ * before the script has started, or without one). */
+unsigned long long recomp_input_script_ms(void)
+{
+    return s_seq_t0 ? GetTickCount64() - s_seq_t0 : 0;
+}
+
 static void seq_input(RecompInputGamepad *g)
 {
     unsigned long long t;
@@ -216,11 +293,12 @@ static void seq_input(RecompInputGamepad *g)
     if (!s_seq_t0)
         s_seq_t0 = GetTickCount64();
     t = GetTickCount64() - s_seq_t0;
+    ram_snapshots(t);
     for (i = 0; i < s_seq_count; i++) {
         if (t < s_seq[i].at || t >= (unsigned long long)s_seq[i].at + s_seq[i].hold)
             continue;
         for (k = 0; k < s_seq[i].nkeys; k++)
-            fake_apply(g, s_seq[i].keys[k]);
+            fake_apply(g, s_seq[i].keys[k], s_seq[i].pct[k]);
     }
 }
 
@@ -266,7 +344,7 @@ static void fake_input(RecompInputGamepad *g)
         const char *e = strchr(p, ',');
         i = fake_lookup(p, e ? (size_t)(e - p) : strlen(p));
         if (i >= 0)
-            fake_apply(g, i);
+            fake_apply(g, i, 100);
     }
 }
 

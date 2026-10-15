@@ -17,6 +17,7 @@
 
 #include "d3d8_internal.h"
 #include "d3d8_display.h"
+#include "d3d8_menu.h"         /* the settings menu, drawn after the resolve */
 #include "d3d8_fvf.h"         /* d3d8_fvf_transformed: draw_extent */
 #include "recomp_config.h"   /* RECOMP_VRR */
 #include <stdio.h>
@@ -149,6 +150,8 @@ static const IDirect3DDevice8Vtbl g_device_vtbl;
 static void up_ring_shutdown(void);
 static void present_resolve(void);
 static void interp_target_destroy(void);
+static BOOL g_interp_on;                /* frame interpolation, below */
+static void follow_scale(void);         /* xbox_D3D8RequestScale, below */
 #include "d3d8_overlay.h"
 #include "d3d8_movie.h"
 
@@ -258,6 +261,63 @@ static void keep_presented(void)
     }
 }
 
+/* xbox_D3D8RequestShot / TakeShot: one frame, for a screenshot. Taken on the
+ * presenting thread and handed over by pointer, so the thread that saves it
+ * never touches the device. */
+static volatile LONG g_shot_wanted;
+static uint8_t *volatile g_shot;
+static UINT g_shot_w, g_shot_h;
+
+void xbox_D3D8RequestShot(void)
+{
+    InterlockedExchange(&g_shot_wanted, 1);
+}
+
+uint8_t *xbox_D3D8TakeShot(UINT *width, UINT *height)
+{
+    uint8_t *px = (uint8_t *)InterlockedExchangePointer((void *volatile *)&g_shot, NULL);
+
+    if (px) {
+        if (width) *width = g_shot_w;
+        if (height) *height = g_shot_h;
+    }
+    return px;
+}
+
+static void take_shot(void)
+{
+    uint32_t w = 0, h = 0;
+    uint8_t *px, *old;
+
+    if (!InterlockedExchange(&g_shot_wanted, 0))
+        return;
+    if (rhi_swapchain_readback(NULL, 0, &w, &h) != 0 || !w || !h)
+        return;
+    if (!(px = (uint8_t *)malloc((size_t)w * h * 4u)))
+        return;
+    if (rhi_swapchain_readback(px, w * 4u, &w, &h) != 0) {
+        free(px);
+        return;
+    }
+    /* A shot nobody collected yet makes way for this one. */
+    old = (uint8_t *)InterlockedExchangePointer((void *volatile *)&g_shot, NULL);
+    free(old);
+    g_shot_w = w;
+    g_shot_h = h;
+    InterlockedExchangePointer((void *volatile *)&g_shot, px);
+}
+
+BOOL xbox_D3D8FillShape(UINT *width, UINT *height)
+{
+    UINT w = g_device_state.swap_width, h = g_device_state.swap_height;
+
+    if (!d3d8_display_fill_now() || !w || !h)
+        return FALSE;
+    if (width) *width = w;
+    if (height) *height = h;
+    return TRUE;
+}
+
 static void present_scene(void);
 
 /* Every way a frame reaches the screen comes through here: put the scene
@@ -288,14 +348,22 @@ void xbox_D3D8SetFullscreen(BOOL on)
 /* Variable refresh only while the window owns its screen: windowed, the
  * compositor shows frames at the display's fixed rate whatever the swap
  * chain does, and presenting without waiting would only tear. */
+static volatile LONG g_vrr_setting = -1;
+
+/* The vrr setting changed while the title runs (the in-game menu). */
+void xbox_D3D8SetVrr(BOOL on)
+{
+    InterlockedExchange(&g_vrr_setting, on ? 1 : 0);
+}
+
 static void follow_vrr(void)
 {
-    static int setting = -1, applied = -1;
+    static int applied = -1;
     int want;
 
-    if (setting < 0)
-        setting = recomp_config_bool("RECOMP_VRR", "vrr", 1);
-    want = setting && InterlockedCompareExchange(&g_fullscreen, 0, 0);
+    if (g_vrr_setting < 0)
+        InterlockedExchange(&g_vrr_setting, recomp_config_bool("RECOMP_VRR", "vrr", 1));
+    want = g_vrr_setting && InterlockedCompareExchange(&g_fullscreen, 0, 0);
     if (want != applied) {
         applied = want;
         rhi_swapchain_set_vrr(want);
@@ -385,6 +453,12 @@ static void present_scene(void)
         fit = d3d8_display_fit(shape_w, shape_h, s->swap_width, s->swap_height);
     }
     d3d8_display_resolve(s->rhi_scene_srv, s->width, s->height, rhi_swapchain_view(), fit);
+    /* A screenshot is the picture, not the menu over it. */
+    take_shot();
+    /* The settings menu goes over the finished picture at the window's own
+     * size, after the resolve, so it is neither stretched by a widescreen
+     * present nor softened by a supersampled one (d3d8_menu.c). */
+    d3d8_menu_draw(rhi_swapchain_view(), s->swap_width, s->swap_height);
     keep_presented();
 }
 
@@ -674,6 +748,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         /* Cleanup subsystems first */
         up_ring_shutdown();
         d3d8_overlay_shutdown();
+        d3d8_menu_shutdown();
         d3d8_movie_shutdown();
         xbox_D3D8ScreenCopyShutdown();
         d3d8_display_shutdown();
@@ -780,7 +855,11 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, co
     }
 
     present_resolve();
-    return (HRESULT)rhi_present(1);
+    {
+        HRESULT hr = (HRESULT)rhi_present(1);
+        follow_scale();
+        return hr;
+    }
 }
 
 static HRESULT __stdcall dev_GetBackBuffer(IDirect3DDevice8 *self, INT iBackBuffer, DWORD Type, IDirect3DSurface8 **ppSurface)
@@ -1683,7 +1762,7 @@ static void apply_host_viewport(void)
 void d3d8_SetTwoDSqueeze(BOOL on)
 {
     g_2d_screen_space = on ? TRUE : FALSE;
-    if (!d3d8_display_wide_now())
+    if (!d3d8_display_wide_now() || d3d8_display_title_native_wide())
         on = FALSE;
     if (g_2d_squeeze == (on ? TRUE : FALSE))
         return;
@@ -2180,8 +2259,123 @@ void xbox_D3D8SetPresentInterval(UINT interval)
     g_present_interval = interval;
 }
 
+/* xbox_D3D8RequestScale: the resolution scale, changed while the title runs.
+ * Only the scene target and the device's own depth buffer are scaled (see
+ * rt_scale_x), so a new scale is those two made again at the new size,
+ * between one frame's present and the next frame's first draw:
+ *   - the scene's image and views are replaced in the device state, and
+ *     everything that sizes itself from it follows on its own -- viewport
+ *     and scissor through rt_scale_x, the screen copy and the resolve per
+ *     call, frame interpolation's second image when it next starts;
+ *   - the depth surface object the title was given keeps its identity (the
+ *     HLE holds it, host_DeviceDepthSurface) and has its image and view
+ *     traded with a new surface's, whose release then frees the old ones.
+ * A failure to make the new targets leaves the old ones, and says so. */
+static volatile LONG g_scale_wanted;
+
+void xbox_D3D8RequestScale(UINT scale)
+{
+    if (scale >= 1 && scale <= 8)
+        InterlockedExchange(&g_scale_wanted, (LONG)scale);
+}
+
+static void follow_scale(void)
+{
+    D3D8DeviceState *s = &g_device_state;
+    LONG want = InterlockedCompareExchange(&g_scale_wanted, 0, 0);
+    RhiImageDesc sd;
+    RhiImage *img = NULL, *dimg = NULL;
+    RhiView *rtv = NULL, *srv = NULL, *dview = NULL;
+    D3D8Surface *fresh = NULL;
+    UINT w, h;
+
+    if (!want || g_interp_on || !rhi_device_ready() || !s->present_width)
+        return;
+    InterlockedExchange(&g_scale_wanted, 0);
+    if ((UINT)want * s->present_width == s->width && (UINT)want * s->present_height == s->height)
+        return;
+    w = s->present_width * (UINT)want;
+    h = s->present_height * (UINT)want;
+
+    memset(&sd, 0, sizeof sd);
+    sd.type = RHI_IMAGE_2D;
+    sd.width = w;
+    sd.height = h;
+    sd.depth = 1;
+    sd.mip_levels = 1;
+    sd.format = RHI_FORMAT_R8G8B8A8_UNORM;
+    sd.samples = 1;
+    sd.usage = RHI_USAGE_DEFAULT;
+    sd.bind = RHI_BIND_RENDER_TARGET | RHI_BIND_SAMPLED;
+    img = rhi_image_create(&sd, NULL);
+    if (img)
+        rtv = rhi_view_create(img, RHI_VIEW_RENDER_TARGET, NULL);
+    if (rtv)
+        srv = rhi_view_create(img, RHI_VIEW_SAMPLED, NULL);
+    sd.format = RHI_FORMAT_D24_UNORM_S8_UINT;
+    sd.bind = RHI_BIND_DEPTH;
+    if (srv)
+        dimg = rhi_image_create(&sd, NULL);
+    if (dimg)
+        dview = rhi_view_create(dimg, RHI_VIEW_DEPTH, NULL);
+    if (dview && g_auto_ds)
+        fresh = (D3D8Surface *)d3d8_surface_create(dimg, 0, 0, w, h, D3DFMT_D24S8,
+                                                   D3DPOOL_DEFAULT, D3DUSAGE_DEPTHSTENCIL,
+                                                   D3DMULTISAMPLE_NONE, NULL, 0);
+    if (!dview || (g_auto_ds && (!fresh || !fresh->dsv))) {
+        fprintf(stderr, "D3D8 display: the %ux%u targets for %ldx could not be made; "
+                "staying at %ux%u\n", w, h, (long)want, s->width, s->height);
+        if (fresh) IDirect3DSurface8_Release(&fresh->iface);
+        rhi_view_destroy(dview);
+        rhi_image_destroy(dimg);
+        rhi_view_destroy(srv);
+        rhi_view_destroy(rtv);
+        rhi_image_destroy(img);
+        return;
+    }
+
+    rhi_set_render_target(NULL, NULL);
+    {
+        RhiImage *old_img = s->rhi_scene_image, *old_dimg = s->depth_image;
+        RhiView *old_rtv = s->rhi_default_rtv, *old_srv = s->rhi_scene_srv;
+        RhiView *old_dview = s->depth_view;
+
+        s->rhi_scene_image = img;
+        s->rhi_default_rtv = rtv;
+        s->rhi_scene_srv = srv;
+        s->depth_image = dimg;
+        s->depth_view = dview;
+        s->width = w;
+        s->height = h;
+        if (g_auto_ds) {
+            RhiImage *ti = g_auto_ds->image;
+            RhiView *tv = g_auto_ds->dsv;
+
+            g_auto_ds->image = fresh->image;
+            g_auto_ds->dsv = fresh->dsv;
+            g_auto_ds->width = w;
+            g_auto_ds->height = h;
+            fresh->image = ti;
+            fresh->dsv = tv;
+            IDirect3DSurface8_Release(&fresh->iface);   /* the old depth goes with it */
+        }
+        rhi_view_destroy(old_srv);
+        rhi_view_destroy(old_rtv);
+        rhi_image_destroy(old_img);
+        rhi_view_destroy(old_dview);
+        rhi_image_destroy(old_dimg);
+    }
+    d3d8_display_set_scale((UINT)want);
+    rhi_set_render_target(g_cur_rt ? g_cur_rt->rtv : s->rhi_default_rtv,
+                          g_cur_ds ? g_cur_ds->dsv : NULL);
+    apply_host_viewport();
+    fprintf(stderr, "D3D8 display: rendering at %ldx now, %ux%u\n", (long)want, w, h);
+    fflush(stderr);
+}
+
 static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
 {
+    HRESULT hr;
     (void)self; (void)Flags;
 
     /* Pump Windows messages (same as dev_Present) */
@@ -2195,7 +2389,9 @@ static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
     }
 
     present_resolve();
-    return (HRESULT)rhi_present(g_present_interval);
+    hr = (HRESULT)rhi_present(g_present_interval);
+    follow_scale();
+    return hr;
 }
 
 /* ================================================================

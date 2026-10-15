@@ -82,6 +82,22 @@ static const path_rule s_rules[] = {
      * empty remainder makes it the game directory, which NtCreateFile opens
      * as a directory handle. */
     { "\\Device\\CdRom0",                     0, NULL,         NULL          },
+    /* E:\TDATA and E:\UDATA are a title's own data and its saves. XAPI 5849
+     * reaches them by device path, not through T: and U:: TimeSplitters:
+     * Future Perfect writes TitleMeta.xbx, its profiles and every save under
+     * Partition1\UDATA\45410066 and never opens U: at all. Under the
+     * Partition1 rule below they went into the game folder -- beside the
+     * disc's files, outside RECOMP_SAVE_DIR, and into any copy of the game
+     * folder handed to someone else -- so every scripted run inherited the
+     * last one's profile and took a different path through the front end.
+     * They belong with the saves. Listed before the Partition1 rule, which
+     * keeps the rest of E: in the game folder for titles that load assets
+     * from it (Wreckless links Z: there; kernel_bridge.c). Saves a player
+     * already made beside the game are copied over by migrate_saves(). */
+    { "\\Device\\Harddisk0\\Partition1\\TDATA\\", 1, "\\TDATA", "/TDATA" },
+    { "\\Device\\Harddisk0\\Partition1\\TDATA",   1, "\\TDATA", "/TDATA" },
+    { "\\Device\\Harddisk0\\Partition1\\UDATA\\", 1, "\\UDATA", "/UDATA" },
+    { "\\Device\\Harddisk0\\Partition1\\UDATA",   1, "\\UDATA", "/UDATA" },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
@@ -294,6 +310,81 @@ static BOOL xbox_partition_device_path(const char *xbox_path, WCHAR *out, DWORD 
     return TRUE;
 }
 
+/* Copy a directory tree. Existing files are left alone. */
+static BOOL copy_tree(const WCHAR *from, const WCHAR *to)
+{
+    WCHAR pattern[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    BOOL ok = TRUE;
+
+    SHCreateDirectoryExW(NULL, to, NULL);
+    swprintf_s(pattern, MAX_PATH, L"%s\\*", from);
+    h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return FALSE;
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
+            continue;
+        swprintf_s(src, MAX_PATH, L"%s\\%s", from, fd.cFileName);
+        swprintf_s(dst, MAX_PATH, L"%s\\%s", to, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            ok = copy_tree(src, dst) && ok;
+        else if (!CopyFileW(src, dst, TRUE) && GetLastError() != ERROR_FILE_EXISTS)
+            ok = FALSE;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return ok;
+}
+
+/*
+ * Saves made before the TDATA/UDATA rules above sit in the game folder, in
+ * <game>\UDATA\<title id> and <game>\TDATA\<title id>. Copy each title's
+ * folder to the save directory the first time this build runs, so a player's
+ * profile is still there after the update.
+ *
+ * Copied, not moved: the game folder is the player's, and a failed copy must
+ * not cost them a save. A title folder that already exists on the save side
+ * is never overwritten -- that is a save made since, and newer. Not for a
+ * RECOMP_SAVE_DIR run: that asked for a folder of its own, and filling it
+ * from the game folder is the leak the rules close. The per-user default and
+ * a folder the caller chose are where a player's saves live, so both get it.
+ */
+static void migrate_saves(void)
+{
+    static const WCHAR *const areas[] = { L"TDATA", L"UDATA" };
+    int a;
+
+    for (a = 0; a < (int)(sizeof areas / sizeof areas[0]); a++) {
+        WCHAR pattern[MAX_PATH], from[MAX_PATH], to[MAX_PATH];
+        WIN32_FIND_DATAW fd;
+        HANDLE h;
+
+        swprintf_s(pattern, MAX_PATH, L"%s\\%s\\*", s_game_dir, areas[a]);
+        h = FindFirstFileW(pattern, &fd);
+        if (h == INVALID_HANDLE_VALUE)
+            continue;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+                wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
+                continue;
+            swprintf_s(from, MAX_PATH, L"%s\\%s\\%s", s_game_dir, areas[a], fd.cFileName);
+            swprintf_s(to, MAX_PATH, L"%s\\%s\\%s", s_save_dir, areas[a], fd.cFileName);
+            if (GetFileAttributesW(to) != INVALID_FILE_ATTRIBUTES)
+                continue;
+            if (copy_tree(from, to))
+                fprintf(stderr, "[PATH] saves moved: copied %ls to %ls. This build keeps "
+                                "saves there; the copy in the game folder is no longer "
+                                "read and can be deleted.\n", from, to);
+            else
+                fprintf(stderr, "[PATH] could not copy every file of %ls to %ls; "
+                                "the game folder's copy is untouched\n", from, to);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    fflush(stderr);
+}
+
 void xbox_path_init(const char* game_dir, const char* save_dir)
 {
     WCHAR save_base[MAX_PATH];
@@ -405,6 +496,8 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S", s_game_dir, s_save_dir);
     fprintf(stderr, "[PATH] saves in %ls (%s)\n", s_save_dir, save_source);
     fflush(stderr);
+    if (strcmp(save_source, "RECOMP_SAVE_DIR") != 0)
+        migrate_saves();
 }
 
 /* The host path the last translation produced.

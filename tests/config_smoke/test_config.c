@@ -134,6 +134,9 @@ int main(void)
         out.hor_plus_register = 60;
         out.anisotropy        = 16;
         out.fps_overlay       = 1;
+        out.brightness        = 1.35;
+        out.mute_unfocused    = 1;
+        out.skip_intro        = 1;
         snprintf(out.frame_cap, sizeof out.frame_cap, "60");
         snprintf(out.game_dir, sizeof out.game_dir, "D:\\games\\ts2");
 
@@ -145,6 +148,9 @@ int main(void)
         check_int(back.hor_plus_register, 60, "round trip: register");
         check_int(back.anisotropy, 16, "round trip: anisotropy");
         check_int(back.fps_overlay, 1, "round trip: overlay");
+        check(back.brightness > 1.34 && back.brightness < 1.36, "round trip: brightness");
+        check_int(back.mute_unfocused, 1, "round trip: mute in the background");
+        check_int(back.skip_intro, 1, "round trip: skip intro");
         check_str(back.frame_cap, "60", "round trip: frame cap");
         check_str(back.game_dir, "D:\\games\\ts2", "round trip: game dir");
 
@@ -155,13 +161,16 @@ int main(void)
         check_int(back.resolution_scale, 4, "partial: the key that is there");
         check_int(back.anisotropy, 1, "partial: absent key keeps its default");
         check_str(back.frame_cap, "adaptive", "partial: absent word keeps default");
+        check(back.brightness == 1.0, "partial: brightness defaults to as drawn");
+        check_int(back.skip_intro, 0, "partial: intros play by default");
 
         /* Out-of-range values are clamped, not taken literally: a hand
          * edited 99 must not ask for a 99x render. */
-        write_file(rt, "resolution_scale = 99\nanisotropy = 0\n");
+        write_file(rt, "resolution_scale = 99\nanisotropy = 0\nbrightness = 9\n");
         check(recomp_settings_read(rt, &back) != 0, "clamped file read");
         check_int(back.resolution_scale, 8, "clamp: scale to 8");
         check_int(back.anisotropy, 1, "clamp: anisotropy to 1");
+        check(back.brightness == 2.0, "clamp: brightness to 2");
 
         remove(rt);
     }

@@ -70,6 +70,12 @@ typedef struct RecompAudioEngineStats {
 } RecompAudioEngineStats;
 int recomp_audio_output_engine_stats(RecompAudioEngineStats *stats);
 
+/* Silence everything while another window has the focus, or stop (the
+   mute_unfocused setting, RECOMP_MUTE_UNFOCUSED; read at the first sound
+   until this is called). Followed at the next submission. Any thread. */
+void recomp_audio_output_set_mute_unfocused(int on);
+int  recomp_audio_output_mute_unfocused(void);
+
 #ifdef __cplusplus
 }
 #endif
