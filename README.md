@@ -10,6 +10,8 @@ ultrawide, frame interpolation, an in-game settings panel and more.
 > **Work in progress.** The menus and the story's opening level are what most
 > testing has covered. Expect rough edges elsewhere, and please report them.
 
+If you like the recompile and want to show support for updates & more, I have a **[ko-fi](https://ko-fi.com/xnbdyz)**
+
 ## You need your own copy of the game
 
 **This repository contains no game code and no game files.** To build and play
