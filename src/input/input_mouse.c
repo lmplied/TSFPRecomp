@@ -48,6 +48,10 @@ static volatile LONG g_captured;
 static volatile LONG g_wanted;
 static volatile LONG g_suspended;
 static volatile LONG64 g_direct_until;     /* now_ms() the direct claim runs out */
+static volatile LONG64 g_pointer_until;    /* now_ms() the title's pointer runs out */
+static volatile LONG g_pointer_took;       /* 0 not pointing, 2 pointing, 1 and took a capture */
+static volatile LONG g_pointer_clicks;     /* buttons pressed while pointing, unread */
+static volatile LONG g_pointer_wheel;      /* wheel while pointing, unread (120 a notch) */
 static volatile LONG g_take_dx, g_take_dy;  /* counts since the last take */
 static volatile LONG g_focused = 1;        /* until a window is attached */
 static HWND g_hwnd;
@@ -99,8 +103,11 @@ void recomp_mouse_take_counts(long *dx, long *dy)
 
 static volatile LONG g_direct_ever;
 
+static void pointer_follow(void);
+
 void recomp_mouse_set_direct(int on)
 {
+    pointer_follow();
     InterlockedExchange64(&g_direct_until, on ? now_ms() + DIRECT_MS : 0);
     if (on)
         InterlockedExchange(&g_direct_ever, 1);
@@ -184,6 +191,7 @@ unsigned recomp_mouse_buttons(void)
     int64_t ms;
     int i;
 
+    pointer_follow();
     if (!g_captured)
         return 0;
     ms = now_ms();
@@ -270,16 +278,27 @@ int recomp_input_window_active(void)
     return g_focused != 0;
 }
 
+static void refresh_cursor(void);
+static void set_capture(HWND hwnd, int on);
+static volatile LONG g_suspend_took;        /* suspending let a capture go */
+
 void recomp_input_suspend(int on)
 {
     InterlockedExchange(&g_suspended, on ? 1 : 0);
     /* Released from whichever thread asks: ClipCursor is not the window
-     * thread's alone, and the pointer reappears at its next WM_SETCURSOR. */
+     * thread's alone, and the pointer is shown at once (refresh_cursor). */
     if (on && g_captured) {
         InterlockedExchange(&g_captured, 0);
         ClipCursor(NULL);
         forget_everything();
+        InterlockedExchange(&g_suspend_took, 1);
     }
+    /* Given back: the mouse too, if suspending took it and the window is
+     * still in front -- closing the settings panel goes straight back to
+     * aiming, with no click to take the mouse again. */
+    if (!on && InterlockedExchange(&g_suspend_took, 0) && g_hwnd && g_focused)
+        set_capture(g_hwnd, 1);
+    refresh_cursor();
 }
 
 int recomp_input_suspended(void)
@@ -297,6 +316,121 @@ void recomp_mouse_test_capture(int on)
     if (!on)
         forget_everything();
     InterlockedExchange(&g_captured, on ? 1 : 0);
+}
+
+/* ---- pointing at the title's menus -------------------------------------- */
+
+/* A title renews its pointer every frame its menu shows (POINTER_MS), so a
+ * stretch where it stops asking -- play resumed, a cutscene -- ends it by
+ * itself. */
+#define POINTER_MS 250
+
+static int pointing(void)
+{
+    return now_ms() < g_pointer_until;
+}
+
+static int pointer_in_window(void)
+{
+    POINT pt;
+    RECT rc;
+
+    return g_hwnd && GetCursorPos(&pt) && ScreenToClient(g_hwnd, &pt) &&
+           GetClientRect(g_hwnd, &rc) && pt.x >= 0 && pt.y >= 0 &&
+           pt.x < rc.right && pt.y < rc.bottom;
+}
+
+/* The pointer's shape is the window thread's to set, at a WM_SETCURSOR,
+ * which Windows sends only when the mouse moves: one now, so the pointer
+ * shows (or hides) as the menu comes and goes and not at the next nudge. */
+static void refresh_cursor(void)
+{
+    if (g_hwnd && pointer_in_window())
+        PostMessageW(g_hwnd, WM_SETCURSOR, (WPARAM)g_hwnd, MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+}
+
+int recomp_mouse_pointing(void)
+{
+    return pointing();
+}
+
+/* The pointer ran out -- play resumed: the game gets the mouse without
+ * another click, if pointing took it from a capture or the pointer was left
+ * over the window, as long as the window is still in front. */
+static void pointer_follow(void)
+{
+    LONG took;
+
+    if (!g_pointer_took || pointing())
+        return;
+    took = InterlockedExchange(&g_pointer_took, 0);
+    if (g_hwnd && g_focused && !g_suspended && (took == 1 || pointer_in_window()))
+        set_capture(g_hwnd, 1);
+    refresh_cursor();
+}
+
+void recomp_mouse_pointer_mode(int on)
+{
+    static int last = -1, said;
+
+    if (on != last && said < 20) {
+        said++;
+        fprintf(stderr, "[INPUT] %s\n", on ? "a menu has the pointer"
+                                           : "the menu's pointer is put away");
+        fflush(stderr);
+    }
+    last = on;
+    if (!on) {
+        InterlockedExchange64(&g_pointer_until, 0);
+        pointer_follow();
+        return;
+    }
+    if (!pointing()) {
+        InterlockedExchange(&g_pointer_clicks, 0);   /* nothing from before it began */
+        InterlockedExchange(&g_pointer_wheel, 0);
+        InterlockedExchange64(&g_pointer_until, now_ms() + POINTER_MS);
+        refresh_cursor();
+    }
+    InterlockedExchange64(&g_pointer_until, now_ms() + POINTER_MS);
+    /* 2: pointing, so when it ends the game may take the mouse (pointer_follow);
+     * 1: and it took a capture to point. */
+    InterlockedCompareExchange(&g_pointer_took, 2, 0);
+    if (g_captured) {
+        /* Released from this thread, as recomp_input_suspend does; the
+         * pointer shows again at the window's next WM_SETCURSOR. */
+        InterlockedExchange(&g_captured, 0);
+        ClipCursor(NULL);
+        forget_everything();
+        InterlockedExchange(&g_pointer_took, 1);
+    }
+}
+
+int recomp_mouse_pointer(float *x, float *y)
+{
+    POINT pt;
+    RECT rc;
+
+    if (!g_hwnd || !g_focused || g_suspended || !pointing())
+        return 0;
+    if (!GetCursorPos(&pt) || !ScreenToClient(g_hwnd, &pt) || !GetClientRect(g_hwnd, &rc))
+        return 0;
+    if (rc.right <= 0 || rc.bottom <= 0 || pt.x < 0 || pt.y < 0 ||
+        pt.x >= rc.right || pt.y >= rc.bottom)
+        return 0;
+    *x = ((float)pt.x + 0.5f) / (float)rc.right;
+    *y = ((float)pt.y + 0.5f) / (float)rc.bottom;
+    return 1;
+}
+
+unsigned recomp_mouse_pointer_clicks(int *wheel)
+{
+    LONG w = InterlockedExchange(&g_pointer_wheel, 0);
+
+    if (wheel)
+        *wheel = (int)(w / 120);
+    if (w % 120)
+        InterlockedExchangeAdd(&g_pointer_wheel, w % 120);   /* part of a notch stays */
+    return (unsigned)InterlockedExchange(&g_pointer_clicks, 0);
 }
 
 /* ---- the window side ---------------------------------------------------- */
@@ -322,7 +456,7 @@ static void clip_to_client(HWND hwnd)
 
 static void set_capture(HWND hwnd, int on)
 {
-    if (on && (!g_wanted || g_suspended))
+    if (on && (!g_wanted || g_suspended || pointing()))
         return;
     if ((g_captured != 0) == (on != 0))
         return;
@@ -388,6 +522,14 @@ static void read_raw(HRAWINPUT handle)
     if (f & RI_MOUSE_BUTTON_5_UP)        up   |= RECOMP_MOUSE_X2;
     if (f & RI_MOUSE_WHEEL)
         wheel = (short)m->usButtonData;
+    /* Pointing at a menu: the presses and the wheel are the title's to read
+     * (recomp_mouse_pointer_clicks), and nothing reaches the bindings. */
+    if (!g_captured && pointing() && g_focused && !g_suspended) {
+        if (down)
+            InterlockedOr(&g_pointer_clicks, (LONG)down);
+        if (wheel)
+            InterlockedExchangeAdd(&g_pointer_wheel, wheel);
+    }
     recomp_mouse_feed(dx, dy, down, up, wheel);
 }
 
@@ -446,8 +588,9 @@ int recomp_input_window_message(void *hwnd_, unsigned msg, uintptr_t wp,
     case WM_XBUTTONDOWN:
         /* The click that hands the mouse over is not a shot: raw input
          * delivered its press before this, outside the capture, where it
-         * was dropped. */
-        if (g_wanted && !g_captured && !g_suspended) {
+         * was dropped. A click on a menu the title is pointing at is the
+         * menu's, and captures nothing. */
+        if (g_wanted && !g_captured && !g_suspended && !pointing()) {
             set_capture(hwnd, 1);
             *result = msg == WM_XBUTTONDOWN ? TRUE : 0;
             return 1;
@@ -504,5 +647,9 @@ void recomp_mouse_set_direct(int on) { (void)on; }
 int  recomp_mouse_direct(void) { return 0; }
 int  recomp_mouse_aims_directly(void) { return 0; }
 void recomp_mouse_declare_direct(void) { }
+void recomp_mouse_pointer_mode(int on) { (void)on; }
+int  recomp_mouse_pointing(void) { return 0; }
+int  recomp_mouse_pointer(float *x, float *y) { (void)x; (void)y; return 0; }
+unsigned recomp_mouse_pointer_clicks(int *wheel) { if (wheel) *wheel = 0; return 0; }
 
 #endif

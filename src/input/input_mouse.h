@@ -114,6 +114,29 @@ int  recomp_mouse_direct(void);
 int  recomp_mouse_aims_directly(void);
 void recomp_mouse_declare_direct(void);
 
+/* ---- for a title whose menus the mouse can point at ---- */
+
+/* The title shows a menu the pointer can use (on), or not (off). Called
+ * every frame; on lapses a quarter of a second after the last call. While
+ * on, the mouse is released if it was captured -- the pointer free and
+ * shown -- a click captures nothing, and presses and the wheel go to
+ * recomp_mouse_pointer_clicks instead of the bindings. Off, or lapsed, gives
+ * back a capture that pointing took, without another click. Any thread. */
+void recomp_mouse_pointer_mode(int on);
+
+/* 1 while a menu is being pointed at: the window shows the pointer then,
+ * fullscreen too. */
+int  recomp_mouse_pointing(void);
+
+/* Where the pointer is while pointing, as fractions of the window's inside
+ * (0..1 across and down); 0 when it is outside the window, the window is not
+ * in front, or nothing is pointing. */
+int  recomp_mouse_pointer(float *x, float *y);
+
+/* Buttons pressed while pointing since the last call (RECOMP_MOUSE_* bits),
+ * and whole wheel notches in *wheel (positive away from the user). */
+unsigned recomp_mouse_pointer_clicks(int *wheel);
+
 /* ---- for tests ---- */
 
 /* What one raw mouse report carries: motion in counts, buttons that went

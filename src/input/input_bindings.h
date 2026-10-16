@@ -17,6 +17,7 @@
 #define XBOXRECOMP_INPUT_BINDINGS_H
 
 #include "xinput_xbox.h"
+#include <stddef.h>            /* size_t */
 
 #ifdef __cplusplus
 extern "C" {
@@ -79,6 +80,31 @@ int  recomp_bindings_hold_available(const char *control);
  * set takes effect at the next sample. */
 int  recomp_bindings_get_hold(unsigned port, const char *control);
 void recomp_bindings_set_hold(unsigned port, const char *control, int on);
+
+/* Hold a port's control ("a", "dpad_down", ...) for ms milliseconds, as if
+ * a key bound to it were held: how a title project turns a click on its menu
+ * into the button the menu reads. Any thread. */
+void recomp_bindings_press(unsigned port, const char *control, unsigned ms);
+
+/* Pause when the window loses the focus (pause_unfocused,
+ * RECOMP_PAUSE_UNFOCUSED, on by default): a title project names its pause
+ * control and says when a port is in play -- 1 in play, where a press
+ * pauses; anything else (a menu, the pause screen itself, a cutscene) and
+ * nothing is pressed. Register before the game starts. available: a title
+ * registered, for the menu. set: from the menu, at once. */
+/* For button prompts. generation: changes whenever the bindings are loaded
+ * again. prompt_label: the first key or mouse button a port's control is
+ * bound to, as a keycap says it ("E", "ENTER", "LMB"; UTF-8), 0 when only a
+ * pad reaches it. last_input_keyboard: 1 when the keyboard or mouse pressed
+ * something last, 0 when a pad did. */
+unsigned recomp_bindings_generation(void);
+int  recomp_bindings_prompt_label(unsigned port, const char *control, char *out, size_t n);
+int  recomp_bindings_last_input_keyboard(void);
+
+void recomp_bindings_pause_on_focus_loss(const char *control, int (*in_play)(unsigned port));
+int  recomp_bindings_pause_available(void);
+void recomp_bindings_set_pause_unfocused(int on);
+int  recomp_bindings_pause_unfocused(void);
 
 #ifdef __cplusplus
 }

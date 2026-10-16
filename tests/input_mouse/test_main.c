@@ -221,11 +221,46 @@ int main(void)
     CHECK(g_aim == 1 && g_clicks == 1, "toggle: aim %d after %d clicks", g_aim, g_clicks);
     recomp_mouse_test_capture(0);
 
+    /* Button prompts: the first key or mouse button bound to a control, as a
+     * keycap says it (Start keeps the keyboard default, Enter). */
+    {
+        char label[24];
+        CHECK(recomp_bindings_prompt_label(0, "rtrigger", label, sizeof label) &&
+              strcmp(label, "LMB") == 0, "rtrigger's prompt was not LMB");
+        CHECK(recomp_bindings_prompt_label(0, "y", label, sizeof label) &&
+              strcmp(label, "WHEEL\xE2\x86\x91") == 0, "y's prompt was not the wheel");
+        CHECK(recomp_bindings_prompt_label(0, "start", label, sizeof label) &&
+              strcmp(label, "ENTER") == 0, "start's prompt was %s, not ENTER", label);
+    }
+
+    /* A title presses a control itself (a click on its menu as A): held for
+     * the time asked, then let go. */
+    recomp_bindings_press(0, "a", 80);
+    pad = sample();
+    CHECK(pad.bAnalogButtons[XBOX_BUTTON_A] == 255, "a pressed A read %d",
+          pad.bAnalogButtons[XBOX_BUTTON_A]);
+    Sleep(120);
+    pad = sample();
+    CHECK(pad.bAnalogButtons[XBOX_BUTTON_A] == 0, "a pressed A was held past its time");
+
+    /* A menu wants the pointer: a capture is let go, and the buttons and
+     * motion stop reaching the bindings. */
+    recomp_mouse_test_capture(1);
+    recomp_mouse_pointer_mode(1);
+    CHECK(!recomp_mouse_captured(), "pointing at a menu kept the mouse captured");
+    recomp_mouse_feed(600, 0, RECOMP_MOUSE_LEFT, 0, 0);
+    pad = sample();
+    CHECK(pad.sThumbRX == 0 && pad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] == 0,
+          "while pointing the mouse turned (%d) or fired (%d)", pad.sThumbRX,
+          pad.bAnalogButtons[XBOX_BUTTON_RTRIGGER]);
+    recomp_mouse_pointer_mode(0);
+
     DeleteFileA(path);
     if (g_fail)
         return 1;
     puts("PASS: mouse motion, buttons and wheel reach the bound controls only while captured; "
          "speed scales the stick and any motion clears the title's deadzone; a direct claim "
-         "keeps motion off the stick until it lapses; a held button holds a toggle");
+         "keeps motion off the stick until it lapses; a held button holds a toggle; a "
+         "title's press holds for its time; pointing at a menu lets the mouse go");
     return 0;
 }

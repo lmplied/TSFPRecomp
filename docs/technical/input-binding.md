@@ -252,6 +252,76 @@ looks at about half the speed it turns, which the stick fallback keeps. In
 the game's own Controls page Auto Lookahead, which re-centres the view while
 walking, is better off.
 
+#### The mouse in the menus
+
+Future Perfect's lists -- the main menu, the pause menu, Arcade Type and the
+like -- can be pointed at: moving onto an option highlights it, a left click
+picks it, a right click goes back, and the wheel steps up and down. The keys
+and the pad work as before alongside.
+
+The runtime side is general (`input_mouse.h`, "for a title whose menus the
+mouse can point at"):
+
+- `recomp_mouse_pointer_mode(on)`, every frame: while on, a capture is let
+  go (the pointer free and shown -- in fullscreen too, where the window
+  otherwise hides it over the picture: `recomp_mouse_pointing`), a click
+  captures nothing, and presses and
+  the wheel go to `recomp_mouse_pointer_clicks` rather than the bindings. Off,
+  or a quarter of a second without a call, and the game takes the mouse back
+  without a click, if the window is in front and the pointer over it -- play
+  resumes ready to aim. `[INPUT] a menu has the pointer` / `the menu's pointer
+  is put away` in the log.
+- `recomp_mouse_pointer(&x, &y)`: where the pointer is, as fractions of the
+  window's inside; `xbox_D3D8PictureRect` (`d3d8_xbox.h`) says where the
+  picture is in the window, bars left out, to map it into the title's screen.
+- `recomp_bindings_press(port, "a", ms)` holds a control as if a key bound to
+  it were held: how a click becomes the button the menu reads.
+
+The title side (`titles/futureperfect/src/recomp_manual.c`, "the mouse in the
+menus") is what FP's front end looked like when read: a table of 20 widgets
+at 0x006FEBE8, lists with linked items, and in each item the box it is drawn
+in, in the front end's 640x480 screen and already squeezed for widescreen.
+The screen's widget update, `sub_0007A7B0`, is wrapped; before its outermost
+call the pointer is hit against every selectable item, and a move onto one
+selects it through the game's own `sub_00076EF0`, so the highlight, help line
+and sound are the game's. Only a move selects: a pointer left still never
+fights the keys. Not covered yet: the OPTIONS/STATUS tabs of the pause
+screen, sliders, and screens laid out as grids, which keep the keys and pad.
+
+`RECOMP_FP_POINTER_TEST=<ms>:<x>:<y>:<click>,...` puts a pointer at (x, y) in
+that 640x480 screen on the input script's clock, with 1 a left click and 2 a
+right one, since a run must not move the desktop's pointer; with
+`RECOMP_INPUT_SEQ_PAD=1` the presses it makes reach the game beside the
+script. `RECOMP_FP_UI_DUMP=<ms>` prints the widget table and every item.
+
+#### Button prompts
+
+Future Perfect's prompts ("(A) Select  (B) Back") show the pad's buttons.
+While the keyboard and mouse are in use they show the keys bound to those
+buttons instead -- an `E` keycap with a green border where the green A was,
+`F` in red for B, and so on -- and the pad's icons come back when a pad is
+used (`prompts` setting: auto, keyboard, controller; F1, General).
+
+- The icons are separate 32x32 DXT3 textures, found by drawing the main menu's
+  prompts in a capture (`d3d8_replay --list-draws`: one small texture, then
+  the text) and identified by checksum: `RECOMP_HLE_D3D8_TEX_DUMP=<folder>`
+  writes every texture of 64x64 and under as `<checksum>_<format>_<size>`,
+  decoded to a contact sheet offline. A `DDC6741B`, B `4D4970F1`, X
+  `1C76AFDD`, Y `CFBE7E42` (`fp_title_setup`, `recomp_prompts_icon`).
+- `hle_texture_replace.h` is the general part: a title's replacer is asked
+  about each texture as it is made and whenever its texels change, and
+  answers with an image of any power-of-two size; the cache makes that an
+  A8R8G8B8 texture (swizzled, so addressed from 0 to 1 like the original),
+  and every draw samples it. `xbox_D3D8TextureReplacementsChanged` has the
+  textures it knows asked again: the prompts call it when the player changes
+  hands or a key is rebound.
+- `hle_prompts.c` draws each keycap with GDI at four times its 64x64 size,
+  as masks (outline, face, label) composed into colour and alpha and averaged
+  down; the label is the first key or mouse button bound to the control
+  (`recomp_bindings_prompt_label`: `E`, `ENTER`, `LMB`). Which hand was used
+  last is the bindings sampler's: a key or click on one side, a pad button,
+  trigger or a stick pushed past 60% on the other.
+
 ### Defaults, when there is no file
 
 Exactly what the runtime did before this existed, so nothing changes for a run

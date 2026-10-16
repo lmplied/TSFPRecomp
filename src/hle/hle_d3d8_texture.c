@@ -45,7 +45,9 @@
 #ifdef _WIN32
 #include "d3d8_xbox.h"
 #include "d3d8_internal.h"
+#include "d3d8_swizzle.h"
 #include "hle_d3d8_record.h"
+#include "hle_texture_replace.h"
 
 /* Reads a RECOMP_* switch; see xbox_memory_layout.h. Declared here rather than
  * including the kernel header, which this file otherwise has no need of. */
@@ -92,6 +94,11 @@ typedef struct {
      * this is the checksum of that palette (0: not known, bake again). */
     int                p8;
     uint32_t           pal_sum;
+    /* The title's replacer knows these texels (hle_texture_replace.h), and
+     * whether the host texture is its image; rep_gen is the replacements'
+     * generation it was decided at. */
+    int                candidate, replaced;
+    long               rep_gen;
 } texture_entry;
 
 static texture_entry g_textures[TEXTURE_CACHE];
@@ -381,6 +388,59 @@ static void upload(IDirect3DTexture8 *host, const texture_layout *t)
     }
 }
 
+/* ---- a title's own images (hle_texture_replace.h) ---------------------- */
+
+#define XFMT_A8R8G8B8 0x06              /* swizzled: addressed from 0 to 1 */
+
+static xbox_TextureReplacer g_replacer;
+static volatile LONG       g_replace_gen;
+
+void xbox_D3D8SetTextureReplacer(xbox_TextureReplacer fn)
+{
+    g_replacer = fn;
+    InterlockedIncrement(&g_replace_gen);
+}
+
+void xbox_D3D8TextureReplacementsChanged(void)
+{
+    InterlockedIncrement(&g_replace_gen);
+}
+
+static int power_of_two(uint32_t v)
+{
+    return v && !(v & (v - 1));
+}
+
+/* e->host from t: the replacer's image when it has one -- A8R8G8B8 at the
+ * image's own size, swizzled as the host's upload expects of that format --
+ * or the guest's own texels. 0 when no host texture could be made. */
+static int make_host(IDirect3DDevice8 *dev, texture_entry *e, const texture_layout *t)
+{
+    XboxTextureImage img;
+    int r = g_replacer ? g_replacer(e->checksum, t->fmt, t->width, t->height, &img) : -1;
+
+    e->candidate = r >= 0;
+    e->replaced = 0;
+    e->rep_gen = g_replace_gen;
+    if (r == 1 && img.argb && power_of_two(img.width) && power_of_two(img.height) &&
+        SUCCEEDED(host_CreateTexture(dev, img.width, img.height, 1, 0,
+                                     (D3DFORMAT)XFMT_A8R8G8B8, D3DPOOL_MANAGED, &e->host)) &&
+        e->host) {
+        D3DLOCKED_RECT lr;
+        if (SUCCEEDED(host_LockRect(e->host, 0, &lr, NULL, 0))) {
+            xbox_swizzle_rect(lr.pBits, img.argb, img.width, img.height, 4);
+            host_UnlockRect(e->host, 0);
+        }
+        e->replaced = 1;
+        return 1;
+    }
+    if (FAILED(host_CreateTexture(dev, t->width, t->height, t->levels, 0,
+                                  (D3DFORMAT)t->fmt, D3DPOOL_MANAGED, &e->host)) || !e->host)
+        return 0;
+    upload(e->host, t);
+    return 1;
+}
+
 static void note_format(const texture_layout *t)
 {
     static uint32_t seen[32];
@@ -592,7 +652,8 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
         static int every_bind = -1;
         if (every_bind < 0)
             every_bind = xbox_EnvSwitch("RECOMP_HLE_D3D8_TEX_EVERY_BIND", 0);
-        if (!e->rendered && (e->checked_swap != now || every_bind)) {
+        if (!e->rendered && (e->checked_swap != now || every_bind ||
+                             (e->candidate && e->rep_gen != g_replace_gen))) {
             /* RECOMP_HLE_D3D8_TEX_REFRESH=1: upload every bound texture once
              * a frame regardless of the checksum, to tell a stale cache from
              * a wrong draw. */
@@ -603,6 +664,26 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
             e->checked_swap = now;
             if (read_layout(va, &t)) {
                 int changed = texels_changed(e, &t, now);
+                XboxTextureImage probe;
+                /* The replacer's say: a texture it knows whose answer may have
+                 * changed, or texels that are now (or were) one of its own.
+                 * The host texture is made again, since a replacement has its
+                 * own size and format; anything else uploads in place. */
+                if (g_replacer &&
+                    ((e->candidate && e->rep_gen != g_replace_gen) ||
+                     (changed && (e->replaced ||
+                                  g_replacer(e->checksum, t.fmt, t.width, t.height,
+                                             &probe) >= 0)))) {
+                    host_ReleaseTexture(e->host);
+                    e->host = NULL;
+                    if (!make_host(dev, e, &t)) {
+                        memset(e, 0, sizeof *e);
+                        return NULL;
+                    }
+                    e->pal_sum = 0;
+                    g_reuploads++;
+                    return e->host;
+                }
                 if (changed || (refresh && !same_frame)) {
                     if (same_frame && changed)
                         g_midframe_changes++;
@@ -629,18 +710,35 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     e = cache_slot(dev, now);
     if (!e)
         return NULL;
-    if (FAILED(host_CreateTexture(dev, t.width, t.height, t.levels, 0,
-                                  (D3DFORMAT)t.fmt, D3DPOOL_MANAGED, &e->host)) ||
-        !e->host) {
-        memset(e, 0, sizeof *e);
-        g_skip_create++;
-        return NULL;
-    }
     e->va = va;
     e->data = data;
     e->format = format;
     e->size = size;
     e->checksum = level0_checksum(&t);
+    /* RECOMP_HLE_D3D8_TEX_DUMP=<folder>: each small texture's guest bytes
+     * (64x64 and under), once, as <checksum>_<format>_<w>x<h>_<levels>.bin --
+     * how a title project finds the checksums of textures it replaces
+     * (xbox_D3D8SetTextureReplacer): its button icons, say. */
+    {
+        static const char *dir;
+        static int said;
+        if (!said) {
+            said = 1;
+            dir = getenv("RECOMP_HLE_D3D8_TEX_DUMP");
+        }
+        if (dir && *dir && t.width <= 64 && t.height <= 64) {
+            char path[1024];
+            FILE *f;
+            snprintf(path, sizeof path, "%s/%08X_%02X_%ux%u_%u.bin", dir, e->checksum, t.fmt,
+                     t.width, t.height, t.levels);
+            if ((f = fopen(path, "rb")) != NULL) {
+                fclose(f);
+            } else if ((f = fopen(path, "wb")) != NULL) {
+                fwrite(HLE_PTR(CONTIG_BASE + t.phys), 1, t.bytes, f);
+                fclose(f);
+            }
+        }
+    }
     e->quick = texel_sample(&t);
     /* Spread the full checks: textures made together (a level's load) would
      * otherwise all take their full hash in the same frame, every 8th frame,
@@ -650,7 +748,11 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     e->checked_swap = e->used_swap = now;
     e->p8 = t.fmt == XFMT_P8;
     e->pal_sum = 0;
-    upload(e->host, &t);
+    if (!make_host(dev, e, &t)) {
+        memset(e, 0, sizeof *e);
+        g_skip_create++;
+        return NULL;
+    }
     g_uploads++;
     return e->host;
 }

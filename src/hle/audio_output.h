@@ -76,6 +76,12 @@ int recomp_audio_output_engine_stats(RecompAudioEngineStats *stats);
 void recomp_audio_output_set_mute_unfocused(int on);
 int  recomp_audio_output_mute_unfocused(void);
 
+/* The volume of everything, 0 to 100 percent (the volume setting,
+   RECOMP_VOLUME; read at the first sound until this is called). Followed at
+   the next submission. Any thread. */
+void recomp_audio_output_set_volume_percent(int percent);
+int  recomp_audio_output_volume(void);
+
 #ifdef __cplusplus
 }
 #endif

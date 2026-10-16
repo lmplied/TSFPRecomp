@@ -71,6 +71,11 @@ unsigned long long dropped_buffers;
 float master_gain = 1.0f;
 std::atomic<int> mute_unfocused{-1};
 std::atomic<int> background_muted{0};
+/* The volume setting, percent (-1 until read), and the gain it and the
+ * mute last put on the master. master_gain is RECOMP_AUDIO_GAIN's, before
+ * either. */
+std::atomic<int> volume_percent{-1};
+float applied_gain = -1.0f;
 /* What creating and destroying source voices costs the calling thread. */
 unsigned long long voices_created, voices_destroyed;
 double create_ms_total, create_ms_max, destroy_ms_total, destroy_ms_max;
@@ -129,20 +134,35 @@ void checkCriticalError()
     if (engine && FAILED(error)) disableOutput("device", error);
 }
 
-/* mute_unfocused: silent while another window has the focus. Followed as
- * sound is submitted, which is all the time, on a thread that owns the
- * engine -- never from the window's thread, which could catch it being
- * released. */
+/* The volume setting as a gain: percent squared, so equal steps of the
+ * setting sound like equal steps (50% is about -12 dB). */
+float volumeGain()
+{
+    const float v = static_cast<float>(recomp_audio_output_volume()) / 100.0f;
+    return v * v;
+}
+
+/* mute_unfocused, silent while another window has the focus, and the
+ * volume. Followed as sound is submitted, which is all the time, on a
+ * thread that owns the engine -- never from the window's or the menu's
+ * thread, which could catch it being released. */
 void followFocus()
 {
     const int want = recomp_audio_output_mute_unfocused() && !recomp_input_window_active();
     int had = background_muted.load(std::memory_order_relaxed);
-    if (want != had && master &&
-        background_muted.compare_exchange_strong(had, want)) {
-        master->SetVolume(want ? 0.0f : master_gain);
+    float gain;
+
+    if (want != had && background_muted.compare_exchange_strong(had, want))
         std::fprintf(stderr, "[audio-output] %s\n", want
             ? "muted: the game window is in the background (mute_unfocused)"
             : "sound back: the game window has the focus");
+    gain = background_muted.load(std::memory_order_relaxed) ? 0.0f : master_gain * volumeGain();
+    if (master && gain != applied_gain) {
+        master->SetVolume(gain);
+        if (gain > 0.0f && applied_gain > 0.0f)
+            std::fprintf(stderr, "[audio-output] volume %d%% (master gain %.3f)\n",
+                         recomp_audio_output_volume(), gain);
+        applied_gain = gain;
     }
 }
 
@@ -321,7 +341,8 @@ extern "C" void recomp_audio_output_initialize(void)
         }
     }
     master_gain = static_cast<float>(gain);
-    error = master->SetVolume(master_gain);
+    applied_gain = master_gain * volumeGain();
+    error = master->SetVolume(applied_gain);
     if (FAILED(error)) {
         disableOutput("MasterSetVolume", error);
         return;
@@ -343,6 +364,24 @@ extern "C" int recomp_audio_output_mute_unfocused(void)
         mute_unfocused.compare_exchange_strong(unread, setting);
     }
     return mute_unfocused.load(std::memory_order_relaxed);
+}
+
+extern "C" void recomp_audio_output_set_volume_percent(int percent)
+{
+    volume_percent.store(percent < 0 ? 0 : (percent > 100 ? 100 : percent),
+                         std::memory_order_relaxed);
+}
+
+extern "C" int recomp_audio_output_volume(void)
+{
+    if (volume_percent.load(std::memory_order_relaxed) < 0) {
+        const char *v = recomp_config_lookup("RECOMP_VOLUME", "volume");
+        int setting = v && *v ? std::atoi(v) : 100, unread = -1;
+        if (setting < 0) setting = 0;
+        if (setting > 100) setting = 100;
+        volume_percent.compare_exchange_strong(unread, setting);
+    }
+    return volume_percent.load(std::memory_order_relaxed);
 }
 
 extern "C" void recomp_audio_output_shutdown(void)

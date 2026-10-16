@@ -24,6 +24,7 @@
 #include "launcher_bindings.h"
 #include "audio_output.h"          /* mute in the background */
 #include "hle_xmv_play.h"          /* skip intro videos */
+#include "hle_prompts.h"           /* button prompts */
 #include "../kernel/xbox_memory_layout.h"   /* the frame cap */
 
 #include <windows.h>
@@ -34,7 +35,8 @@
 enum { TAB_DISPLAY, TAB_MOUSE, TAB_CONTROLS, TAB_GENERAL, TAB_COUNT };
 static const char *const k_tab_names[TAB_COUNT] = { "Display", "Mouse", "Controls", "General" };
 
-enum { D_RES, D_WIDE, D_FOV, D_ANISO, D_BRIGHT, D_CAP, D_FPS, D_FULL, D_VRR, D_INTERP, D_COUNT };
+enum { D_RES, D_WIDE, D_FOV, D_ANISO, D_FXAA, D_BRIGHT, D_CAP, D_FPS, D_FULL, D_VRR, D_INTERP,
+       D_COUNT };
 
 /* Field of view is there only for a title that can set it: the Display
  * page's rows, and which setting each one is. */
@@ -51,7 +53,7 @@ static int disp_kind(int row)
  * zoomed aim only for a title that aims by the mouse itself, a hold-or-toggle
  * row for each control the title reports a toggle for. */
 enum { MR_SENS, MR_YSCALE, MR_INVERT, MR_ZOOM, MR_HOLD, MR_RESET };
-enum { G_MUTE, G_INTRO, G_COUNT };
+enum { G_VOLUME, G_MUTE, G_PAUSE, G_PROMPTS, G_INTRO, G_COUNT };
 enum { C_RESET = BIND_CONTROLS, C_COUNT };          /* then a reset row */
 
 /* The frame cap's stops, in xbox_Nv2aFlipGateSetMode's order, as the
@@ -91,6 +93,10 @@ static struct {
     unsigned keys[32];
     int  nkeys;
     int  wheel;
+    /* The mouse, from the window thread: moves and clicks over the panel, in
+     * the window's pixels, in order. */
+    struct { int kind, x, y; } ptr[16];
+    int  nptr;
 
     WORD pad_prev;
     int  repeat_dir;
@@ -136,7 +142,26 @@ void hle_menu_wheel(int delta)
     if (!m.open || !delta)
         return;
     EnterCriticalSection(&m.lock);
-    m.wheel = delta;
+    m.wheel += delta;
+    LeaveCriticalSection(&m.lock);
+}
+
+void hle_menu_mouse(int kind, int x, int y)
+{
+    ensure_lock();
+    if (!m.open)
+        return;
+    EnterCriticalSection(&m.lock);
+    /* Moves in a row fold into the last; a click is never dropped for one. */
+    if (kind == HLE_MENU_MOUSE_MOVE && m.nptr &&
+        m.ptr[m.nptr - 1].kind == HLE_MENU_MOUSE_MOVE)
+        m.nptr--;
+    if (m.nptr < (int)(sizeof m.ptr / sizeof m.ptr[0])) {
+        m.ptr[m.nptr].kind = kind;
+        m.ptr[m.nptr].x = x;
+        m.ptr[m.nptr].y = y;
+        m.nptr++;
+    }
     LeaveCriticalSection(&m.lock);
 }
 
@@ -261,9 +286,13 @@ static void open_menu(void)
     m.set.anisotropy = (int)p->anisotropy;
     m.set.resolution_scale = (int)p->scale;
     m.set.brightness = xbox_D3D8Brightness();
+    m.set.fxaa = xbox_D3D8Fxaa() ? 1 : 0;
     m.set.fov = recomp_fov();
     m.set.wide_fill = xbox_D3D8WideFill();
     m.set.mute_unfocused = recomp_audio_output_mute_unfocused();
+    m.set.pause_unfocused = recomp_bindings_pause_unfocused();
+    m.set.prompts = recomp_prompts_mode();
+    m.set.volume = recomp_audio_output_volume();
     m.set_dirty = 0;
 
     bindings_load();
@@ -276,6 +305,7 @@ static void open_menu(void)
     EnterCriticalSection(&m.lock);
     m.nkeys = 0;
     m.wheel = 0;
+    m.nptr = 0;
     LeaveCriticalSection(&m.lock);
     InterlockedExchange(&m.open, 1);
     fprintf(stderr, "[MENU] open\n");
@@ -392,6 +422,10 @@ static void change(int dir)
             m.set.anisotropy = k_aniso[i];
             xbox_D3D8SetAnisotropy((UINT)m.set.anisotropy);
             break;
+        case D_FXAA:
+            m.set.fxaa = !m.set.fxaa;
+            xbox_D3D8SetFxaa(m.set.fxaa ? TRUE : FALSE);
+            break;
         case D_BRIGHT:
             m.set.brightness += dir * 0.05;
             if (m.set.brightness < 0.5) m.set.brightness = 0.5;
@@ -466,9 +500,27 @@ static void change(int dir)
     }
     if (m.tab == TAB_GENERAL) {
         switch (row) {
+        case G_VOLUME:
+            m.set.volume += dir * 5;
+            if (m.set.volume < 0) m.set.volume = 0;
+            if (m.set.volume > 100) m.set.volume = 100;
+            recomp_audio_output_set_volume_percent(m.set.volume);
+            break;
         case G_MUTE:
             m.set.mute_unfocused = !m.set.mute_unfocused;
             recomp_audio_output_set_mute_unfocused(m.set.mute_unfocused);
+            break;
+        case G_PAUSE:
+            if (!recomp_bindings_pause_available())
+                return;
+            m.set.pause_unfocused = !m.set.pause_unfocused;
+            recomp_bindings_set_pause_unfocused(m.set.pause_unfocused);
+            break;
+        case G_PROMPTS:
+            if (!recomp_prompts_available())
+                return;
+            m.set.prompts = (m.set.prompts + dir + 3) % 3;
+            recomp_prompts_set_mode(m.set.prompts);
             break;
         case G_INTRO:
             m.set.skip_intro = !m.set.skip_intro;
@@ -485,7 +537,8 @@ static void accept(void)
     if (m.tab == TAB_DISPLAY) {
         int kind = disp_kind(row);
 
-        if (kind == D_WIDE || kind == D_FPS || kind == D_FULL || kind == D_VRR || kind == D_INTERP)
+        if (kind == D_WIDE || kind == D_FXAA || kind == D_FPS || kind == D_FULL || kind == D_VRR ||
+            kind == D_INTERP)
             change(1);
         return;
     }
@@ -626,6 +679,7 @@ static void build(D3D8Menu *menu)
         }
         snprintf(v, sizeof v, m.set.anisotropy > 1 ? "%dx" : "Off", m.set.anisotropy);
         row(menu, "Texture sharpness", v, 1);
+        row(menu, "Edge smoothing (FXAA)", on_off(m.set.fxaa), 1);
         snprintf(v, sizeof v, "%d%%", (int)(m.set.brightness * 100.0 + 0.5));
         row(menu, "Brightness", v, 1);
         for (i = 0; i < 4 && strcmp(k_caps[i], m.set.frame_cap) != 0; i++)
@@ -652,6 +706,8 @@ static void build(D3D8Menu *menu)
                 "How much of the world the view takes in, top to bottom. Wider shows "
                 "more at the edges; the game's own culling follows.",
                 "Sharpen textures seen at a glancing angle: floors, walls, roads.",
+                "Smooth jagged edges, cheaply. For a low resolution: at 4x and above "
+                "the supersampling has already smoothed them, and this is skipped.",
                 "Above 100% lifts the shadows, below deepens them. 100% is the game "
                 "exactly as drawn.",
                 "Adaptive paces the game the way the console did (nothing to do with "
@@ -743,13 +799,29 @@ static void build(D3D8Menu *menu)
             }
         }
     } else if (m.tab == TAB_GENERAL) {
+        snprintf(v, sizeof v, "%d%%", m.set.volume);
+        row(menu, "Volume", v, 1);
         row(menu, "Mute in the background", on_off(m.set.mute_unfocused), 1);
+        row(menu, "Pause in the background",
+            recomp_bindings_pause_available() ? on_off(m.set.pause_unfocused)
+                                              : "Not for this game", 1);
+        row(menu, "Button prompts",
+            !recomp_prompts_available() ? "Not for this game"
+            : m.set.prompts == RECOMP_PROMPTS_KEYBOARD ? "Keyboard and mouse"
+            : m.set.prompts == RECOMP_PROMPTS_CONTROLLER ? "Controller"
+            : "Automatic", 1);
         next_start(v, sizeof v, on_off(m.set.skip_intro), m.set.skip_intro != m.run_skip_intro);
         row(menu, "Skip intro videos", v, 1);
         {
             static const char *const help[G_COUNT] = {
+                "Everything the game plays, music, voices and effects together. "
+                "Changes at once.",
                 "Silence the game while another window has the focus. F12 saves a "
                 "screenshot to your Pictures folder.",
+                "Alt+Tab during play pauses the game, so it is waiting at the pause "
+                "menu when you come back.",
+                "The game's button icons as the keys bound to them. Automatic follows "
+                "whichever you used last, keyboard and mouse or a controller.",
                 "Skip the logo videos before the title screen. Read when the game starts.",
             };
             snprintf(menu->help, sizeof menu->help, "%s", help[sel]);
@@ -780,11 +852,44 @@ static void build(D3D8Menu *menu)
                      "Every key and mouse binding back to this game's own layout.");
     }
     snprintf(menu->footer, sizeof menu->footer,
-             "Arrows choose and change    Enter select    Tab next page    Esc or F1 close"
-             "    (pad: D-pad, A, LB/RB, B)");
+             "Arrows, Enter, Tab, Esc    Mouse: point, click, wheel; right-click closes"
+             "    Pad: D-pad, A, LB/RB, B");
 }
 
 /* ----------------------------------------------------------------- frame */
+
+/* The mouse over the panel: moving onto a row selects it (only a move, so a
+ * pointer left still never fights the keys); a click on a tab turns to it,
+ * on a row's arrows changes it, on the rest of a row is Enter; a right click
+ * anywhere closes, as Escape does. */
+static void mouse_act(int kind, int x, int y)
+{
+    int index, hit = xbox_D3D8MenuHit(x, y, &index);
+
+    if (kind == HLE_MENU_MOUSE_RIGHT) {
+        close_menu();
+        return;
+    }
+    if (hit == D3D8_MENU_HIT_TAB && kind == HLE_MENU_MOUSE_LEFT && index != m.tab &&
+        index >= 0 && index < TAB_COUNT) {
+        m.tab = index;
+        if (m.sel[m.tab] >= row_count(m.tab))
+            m.sel[m.tab] = 0;
+        return;
+    }
+    if ((hit != D3D8_MENU_HIT_ROW && hit != D3D8_MENU_HIT_LEFT && hit != D3D8_MENU_HIT_RIGHT) ||
+        index < 0 || index >= row_count(m.tab))
+        return;
+    m.sel[m.tab] = index;
+    if (kind != HLE_MENU_MOUSE_LEFT)
+        return;
+    if (hit == D3D8_MENU_HIT_LEFT)
+        change(-1);
+    else if (hit == D3D8_MENU_HIT_RIGHT)
+        change(1);
+    else
+        accept();
+}
 
 static void act(unsigned vk)
 {
@@ -808,7 +913,8 @@ void hle_menu_frame(void)
     RecompPadState pad;
     WORD btn = 0, pressed, dirs;
     unsigned keys[32];
-    int nkeys, wheel, i, escape = 0;
+    int nkeys, wheel, nptr, i, escape = 0;
+    struct { int kind, x, y; } ptr[16];
     ULONGLONG now = GetTickCount64();
 
     ensure_lock();
@@ -852,6 +958,9 @@ void hle_menu_frame(void)
     m.nkeys = 0;
     wheel = m.wheel;
     m.wheel = 0;
+    nptr = m.nptr;
+    memcpy(ptr, m.ptr, sizeof ptr);
+    m.nptr = 0;
     LeaveCriticalSection(&m.lock);
 
     if (m.editing) {
@@ -866,6 +975,13 @@ void hle_menu_frame(void)
     } else {
         for (i = 0; i < nkeys && m.open; i++)
             act(keys[i]);
+        /* While a control waits for a new binding (above) the mouse's clicks
+         * are the binding's, so the panel takes them only otherwise. */
+        for (i = 0; i < nptr && m.open && !m.editing; i++)
+            mouse_act(ptr[i].kind, ptr[i].x, ptr[i].y);
+        /* The wheel steps through the rows, a notch a row. */
+        for (i = wheel / 120; i != 0 && m.open && !m.editing; i += i > 0 ? -1 : 1)
+            move(i > 0 ? -1 : 1);
         if (m.open) {
             /* The pad: A, B, the shoulders, and directions that repeat
              * while held. */

@@ -45,6 +45,9 @@ if(WIN32)
         hle_menu.c
         # F12: the picture on screen, as a PNG in Pictures.
         hle_screenshot.c
+        # Button prompts for the keyboard and mouse: the pad's icons drawn
+        # as the keys bound to them (hle_texture_replace.h).
+        hle_prompts.c
     )
 endif()
 target_include_directories(xbox_hle PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

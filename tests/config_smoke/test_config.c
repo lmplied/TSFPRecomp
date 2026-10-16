@@ -136,6 +136,10 @@ int main(void)
         out.fps_overlay       = 1;
         out.brightness        = 1.35;
         out.mute_unfocused    = 1;
+        out.pause_unfocused   = 0;
+        out.volume            = 65;
+        out.fxaa              = 1;
+        out.prompts           = 2;
         out.skip_intro        = 1;
         snprintf(out.frame_cap, sizeof out.frame_cap, "60");
         snprintf(out.game_dir, sizeof out.game_dir, "D:\\games\\ts2");
@@ -150,6 +154,10 @@ int main(void)
         check_int(back.fps_overlay, 1, "round trip: overlay");
         check(back.brightness > 1.34 && back.brightness < 1.36, "round trip: brightness");
         check_int(back.mute_unfocused, 1, "round trip: mute in the background");
+        check_int(back.pause_unfocused, 0, "round trip: pause in the background");
+        check_int(back.volume, 65, "round trip: volume");
+        check_int(back.fxaa, 1, "round trip: edge smoothing");
+        check_int(back.prompts, 2, "round trip: button prompts");
         check_int(back.skip_intro, 1, "round trip: skip intro");
         check_str(back.frame_cap, "60", "round trip: frame cap");
         check_str(back.game_dir, "D:\\games\\ts2", "round trip: game dir");
@@ -163,6 +171,8 @@ int main(void)
         check_str(back.frame_cap, "adaptive", "partial: absent word keeps default");
         check(back.brightness == 1.0, "partial: brightness defaults to as drawn");
         check_int(back.skip_intro, 0, "partial: intros play by default");
+        check_int(back.pause_unfocused, 1, "partial: pausing in the background is on by default");
+        check_int(back.volume, 100, "partial: full volume by default");
 
         /* Out-of-range values are clamped, not taken literally: a hand
          * edited 99 must not ask for a 99x render. */

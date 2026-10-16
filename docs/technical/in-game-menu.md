@@ -9,6 +9,7 @@ a pad -- opens a settings panel over the game. Esc, F1 or B closes it.
 | | Widescreen: Off, 16:9, or Fill the window (a title that can draw any shape) | on or off next start (a title reads the console's video flag once); 16:9 and Fill at once |
 | | Field of view (a title that can set it) | at once |
 | | Texture sharpness | at once |
+| | Edge smoothing (FXAA): in the resolve, at the output pixel's centre on the scene; skipped where the resolve averages several taps (4x and up at 1080 lines), which is supersampling already | at once |
 | | Brightness | at once: a gamma in the resolve, 50% to 200%; 100% is the picture exactly as drawn |
 | | Frame rate | at once (the same stops as F10) |
 | | Show frame rate | at once (the same switch as F9) |
@@ -21,10 +22,31 @@ a pad -- opens a settings panel over the game. Esc, F1 or B closes it.
 | | Back to this game's defaults | at once |
 | Controls | every control's keyboard or mouse binding | at once, saved at once |
 | | Reset controls to this game's defaults | at once |
-| General | Mute in the background | at once |
+| General | Volume, 0 to 100% in fives: the master voice's gain, squared so steps sound even | at once |
+| | Mute in the background | at once |
+| | Pause in the background: on losing the focus in play, the title's pause control is pressed for it (`recomp_bindings_pause_on_focus_loss`; FP: Start, while the look builder runs) | at once |
+| | Button prompts: Automatic, Keyboard and mouse, Controller (`hle_prompts.h`; input-binding.md) | at once |
 | | Skip intro videos | next start (only the title's logo videos, which its project names) |
 
 A row that only applies at the next start says so beside its value.
+
+## With the mouse
+
+The panel takes the pointer while it is open, in fullscreen too: moving onto a
+row selects it (only a move, so a pointer left still never fights the keys),
+a click on a tab turns to that page, a click on a selected row's `<` or `>`
+changes its value, a click elsewhere on a row is Enter (a switch flips, a
+control waits for its new binding, a reset resets), the wheel steps through
+the rows, and a right click closes the panel as Escape does. While a control
+waits for a binding the clicks are the binding's, so a mouse button can still
+be bound by clicking it. Closing the panel gives the game back the mouse
+capture it had, without another click.
+
+The renderer keeps where it drew each tab, row and arrow
+(`xbox_D3D8MenuHit` in `d3d8_menu.h`, in the window's pixels), and the
+window procedure hands moves and clicks to `hle_menu_mouse`. Tested by posting
+mouse messages to the game window on a timeline (nothing reaches the
+desktop's pointer), against copies of the settings and binding files.
 
 ## Keys that work any time
 

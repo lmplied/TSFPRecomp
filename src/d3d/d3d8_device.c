@@ -416,6 +416,28 @@ static BOOL two_d_squeeze(float *k_out, float *cx_out)
     return TRUE;
 }
 
+/* Where the last present put the picture, for xbox_D3D8PictureRect. */
+static volatile LONG g_picture_known;
+static D3D8DisplayFit g_picture_fit;
+static UINT g_picture_out_w, g_picture_out_h;
+
+BOOL xbox_D3D8PictureRect(float *x, float *y, float *w, float *h)
+{
+    D3D8DisplayFit f = g_picture_fit;
+    UINT ow = g_picture_out_w, oh = g_picture_out_h;
+
+    if (!g_picture_known || !ow || !oh || !f.w || !f.h) {
+        *x = *y = 0.0f;                 /* the back buffer, stretched to the window */
+        *w = *h = 1.0f;
+        return FALSE;
+    }
+    *x = (float)f.x / (float)ow;
+    *y = (float)f.y / (float)oh;
+    *w = (float)f.w / (float)ow;
+    *h = (float)f.h / (float)oh;
+    return TRUE;
+}
+
 /* Put the scene on the back buffer, immediately before presenting it.
  * Nothing to do while unscaled: the scene target is the back buffer, and
  * this is the one call that has to stay free in that case. */
@@ -451,6 +473,10 @@ static void present_scene(void)
 
         d3d8_display_output_shape(s->width, s->height, &shape_w, &shape_h);
         fit = d3d8_display_fit(shape_w, shape_h, s->swap_width, s->swap_height);
+        g_picture_fit = fit;
+        g_picture_out_w = s->swap_width;
+        g_picture_out_h = s->swap_height;
+        InterlockedExchange(&g_picture_known, 1);
     }
     d3d8_display_resolve(s->rhi_scene_srv, s->width, s->height, rhi_swapchain_view(), fit);
     /* A screenshot is the picture, not the menu over it. */

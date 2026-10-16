@@ -278,14 +278,23 @@ D3D8DisplayFit d3d8_display_fit(UINT shape_w, UINT shape_h, UINT bb_w, UINT bb_h
  * gamma: the player's brightness (xbox_D3D8SetBrightness), as the exponent
  * that applies it -- one over the setting, so a setting above 1 lifts the
  * dark end. Exactly 1 skips the pow, so the picture is bit-for-bit the
- * game's own until someone moves the slider. */
+ * game's own until someone moves the slider.
+ *
+ * fxaa: edge smoothing (xbox_D3D8SetFxaa), the compact FXAA -- the luma of a
+ * texel's four diagonal neighbours gives the edge's direction, two and four
+ * samples along it are blended, and the four-sample blend is kept unless it
+ * strays outside the neighbourhood's luma range. On the scene, at the output
+ * pixel's centre, so a scene smaller than the window is smoothed and then
+ * magnified. Only with one tap: a resolve that averages several is already
+ * supersampling. 0 is the plain resolve, bit-for-bit. */
 typedef struct {
     float origin_x, origin_y, ratio_x, ratio_y;
     float texel_x, texel_y, inv_taps, gamma;
+    float fxaa, pad0, pad1, pad2;
 } ResolveConstants;
 
 static const char kSource[] =
-    "cbuffer Resolve : register(b7) { float4 p; float4 q; };\n"
+    "cbuffer Resolve : register(b7) { float4 p; float4 q; float4 r; };\n"
     "struct VSOut { float4 pos : SV_Position; };\n"
     "VSOut vs_main(uint id : SV_VertexID) {\n"
     "    float2 c = float2((id << 1) & 2, id & 2);\n"   /* one oversized triangle */
@@ -295,15 +304,37 @@ static const char kSource[] =
     "}\n"
     "Texture2D<float4> scene : register(t9);\n"
     "SamplerState smp : register(s9);\n"
+    "float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
+    "float3 at(float2 uv) { return scene.SampleLevel(smp, uv, 0).rgb; }\n"
+    "float4 fxaa(float2 uv, float2 t) {\n"
+    "    float4 m = scene.SampleLevel(smp, uv, 0);\n"
+    "    float nw = luma(at(uv + float2(-1, -1) * t)), ne = luma(at(uv + float2(1, -1) * t));\n"
+    "    float sw = luma(at(uv + float2(-1, 1) * t)), se = luma(at(uv + float2(1, 1) * t));\n"
+    "    float lm = luma(m.rgb);\n"
+    "    float lo = min(lm, min(min(nw, ne), min(sw, se)));\n"
+    "    float hi = max(lm, max(max(nw, ne), max(sw, se)));\n"
+    "    float2 dir = float2(-((nw + ne) - (sw + se)), (nw + sw) - (ne + se));\n"
+    "    float reduce = max((nw + ne + sw + se) * (0.25 / 8.0), 1.0 / 128.0);\n"
+    "    float scale = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);\n"
+    "    dir = clamp(dir * scale, -8.0, 8.0) * t;\n"
+    "    float3 a = 0.5 * (at(uv + dir * (1.0 / 3.0 - 0.5)) + at(uv + dir * (2.0 / 3.0 - 0.5)));\n"
+    "    float3 b = a * 0.5 + 0.25 * (at(uv - dir * 0.5) + at(uv + dir * 0.5));\n"
+    "    float lb = luma(b);\n"
+    "    return float4((lb < lo || lb > hi) ? a : b, m.a);\n"
+    "}\n"
     "float4 ps_main(VSOut i) : SV_Target {\n"
     "    float2 base = (i.pos.xy - p.xy) * p.zw;\n"
     "    float2 step = p.zw / TAPS;\n"
     "    float4 sum = 0;\n"
-    "    [unroll] for (int y = 0; y < TAPS; y++)\n"
-    "        [unroll] for (int x = 0; x < TAPS; x++)\n"
-    "            sum += scene.SampleLevel(smp,\n"
-    "                       (base + (float2(x, y) + 0.5) * step) * q.xy, 0);\n"
-    "    sum *= q.z;\n"
+    "    if (TAPS == 1 && r.x > 0.5) {\n"
+    "        sum = fxaa((base + 0.5 * p.zw) * q.xy, q.xy);\n"
+    "    } else {\n"
+    "        [unroll] for (int y = 0; y < TAPS; y++)\n"
+    "            [unroll] for (int x = 0; x < TAPS; x++)\n"
+    "                sum += scene.SampleLevel(smp,\n"
+    "                           (base + (float2(x, y) + 0.5) * step) * q.xy, 0);\n"
+    "        sum *= q.z;\n"
+    "    }\n"
     "    if (q.w != 1.0)\n"
     "        sum.rgb = pow(saturate(sum.rgb), q.w);\n"
     "    return sum;\n"
@@ -325,6 +356,21 @@ float xbox_D3D8Brightness(void)
         xbox_D3D8SetBrightness(v && *v ? (float)atof(v) : 1.0f);
     }
     return g_brightness;
+}
+
+/* Edge smoothing, live (the in-game menu); -1 until the settings are read. */
+static volatile int g_fxaa = -1;
+
+void xbox_D3D8SetFxaa(BOOL on)
+{
+    g_fxaa = on ? 1 : 0;
+}
+
+BOOL xbox_D3D8Fxaa(void)
+{
+    if (g_fxaa < 0)
+        g_fxaa = recomp_config_bool("RECOMP_FXAA", "fxaa", 0);
+    return g_fxaa != 0;
 }
 
 static struct {
@@ -472,6 +518,8 @@ HRESULT d3d8_display_resolve(RhiView *scene, UINT scene_w, UINT scene_h,
         c.texel_y = 1.0f / (float)scene_h;
         c.inv_taps = 1.0f / (float)(taps * taps);
         c.gamma = 1.0f / xbox_D3D8Brightness();
+        c.fxaa = xbox_D3D8Fxaa() ? 1.0f : 0.0f;
+        c.pad0 = c.pad1 = c.pad2 = 0.0f;
         memcpy(mapped, &c, sizeof c);
         rhi_buffer_unmap(g.cb);
     }

@@ -46,6 +46,16 @@ typedef struct D3D8Menu {
  * drawn again when something in it changed. */
 void xbox_D3D8MenuShow(const D3D8Menu *menu);
 
+/* What is under the point (x, y) of the window's inside, in pixels, on the
+ * panel as last drawn: a tab or a row (its index in *index), one of a row's
+ * arrows, the panel's background, or outside it; NONE when no menu is
+ * showing. Any thread. */
+enum {
+    D3D8_MENU_HIT_NONE, D3D8_MENU_HIT_OUTSIDE, D3D8_MENU_HIT_PANEL,
+    D3D8_MENU_HIT_TAB, D3D8_MENU_HIT_ROW, D3D8_MENU_HIT_LEFT, D3D8_MENU_HIT_RIGHT
+};
+int xbox_D3D8MenuHit(int x, int y, int *index);
+
 /* d3d8_device.c, after the resolve: draw the menu, if one is showing, onto
  * the window's buffer of w by h. */
 struct RhiView;

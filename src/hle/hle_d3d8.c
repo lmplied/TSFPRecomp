@@ -70,6 +70,7 @@
 #include "input_mouse.h"     /* the window's mouse and focus, for the bindings */
 #include "hle_menu.h"        /* the settings menu: F1 */
 #include "hle_screenshot.h"  /* F12 */
+#include "hle_prompts.h"     /* the pad's icons as keys */
 
 #ifdef _WIN32
 #include "d3d8_xbox.h"
@@ -272,6 +273,16 @@ static LRESULT CALLBACK shadow_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     case WM_MOUSEWHEEL:
         hle_menu_wheel(GET_WHEEL_DELTA_WPARAM(wp));
         break;
+    case WM_MOUSEMOVE:
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+        /* The settings panel takes the pointer while it is open. */
+        if (hle_menu_open())
+            hle_menu_mouse(msg == WM_LBUTTONDOWN ? HLE_MENU_MOUSE_LEFT
+                           : msg == WM_RBUTTONDOWN ? HLE_MENU_MOUSE_RIGHT
+                           : HLE_MENU_MOUSE_MOVE,
+                           (int)(short)LOWORD(lp), (int)(short)HIWORD(lp));
+        break;
     case SHADOW_WM_FULLSCREEN:
         shadow_set_fullscreen(hwnd, (int)wp);
         return 0;
@@ -287,8 +298,11 @@ static LRESULT CALLBACK shadow_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             return 0;                   /* no beep for Alt+Enter */
         break;
     case WM_SETCURSOR:
-        /* The game has no pointer; over a fullscreen picture it is in the way. */
-        if (g_shadow_fullscreen && LOWORD(lp) == HTCLIENT) {
+        /* The game has no pointer; over a fullscreen picture it is in the way
+         * -- unless a menu, the title's or the settings panel, is being
+         * pointed at. */
+        if (g_shadow_fullscreen && LOWORD(lp) == HTCLIENT && !recomp_mouse_pointing() &&
+            !hle_menu_open()) {
             SetCursor(NULL);
             return TRUE;
         }
@@ -2123,6 +2137,8 @@ static void overlay_frame(void)
         d3d8_overlay_draw(g_overlay_text);
     /* The settings menu: its keys, its pad, and the panel for this present. */
     hle_menu_frame();
+    /* Button prompts follow the hand the player is using. */
+    hle_prompts_frame();
 }
 
 /* What the settings menu (hle_menu.c) changes here. */

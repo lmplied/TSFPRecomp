@@ -23,9 +23,14 @@ extern "C" {
  * key (F1, or anything while it is open). */
 int  hle_menu_key(unsigned vk);
 
-/* The game window's thread, for each WM_MOUSEWHEEL: a notch, for binding
- * the wheel. */
+/* The game window's thread, for each WM_MOUSEWHEEL: a notch, to step
+ * through the rows or to bind the wheel. */
 void hle_menu_wheel(int delta);
+
+/* The game window's thread, while the menu is open: the pointer moved to,
+ * or was clicked at, (x, y) in the window's inside, in pixels. */
+enum { HLE_MENU_MOUSE_MOVE, HLE_MENU_MOUSE_LEFT, HLE_MENU_MOUSE_RIGHT };
+void hle_menu_mouse(int kind, int x, int y);
 
 /* Once a frame, on the thread that presents: read the pad, act on the keys,
  * and show or hide the panel. */

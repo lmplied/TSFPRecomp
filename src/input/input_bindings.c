@@ -822,12 +822,17 @@ static void load_bindings(void)
     fflush(stderr);
 }
 
+/* Counts loads, so whatever shows a binding (button prompts) knows to look
+ * again. */
+static volatile unsigned g_bind_generation;
+
 void recomp_bindings_init(void)
 {
     if (g_ready)
         return;
     g_ready = 1;
     load_bindings();
+    g_bind_generation++;
 }
 
 void recomp_bindings_reload(void)
@@ -837,6 +842,83 @@ void recomp_bindings_reload(void)
         return;
     }
     load_bindings();
+    g_bind_generation++;
+}
+
+unsigned recomp_bindings_generation(void)
+{
+    recomp_bindings_init();
+    return g_bind_generation;
+}
+
+/* A key's name as a prompt shows it: short, upper case, the names a keycap
+ * carries. UTF-8 (the arrows). */
+static void key_prompt_name(int vk, char *out, size_t n)
+{
+    static const struct { int vk; const char *name; } NAMES[] = {
+        { 0x0D, "ENTER" }, { 0x08, "BKSP" }, { 0x20, "SPACE" }, { 0x09, "TAB" },
+        { 0x1B, "ESC" }, { 0x10, "SHIFT" }, { 0xA0, "SHIFT" }, { 0xA1, "RSHIFT" },
+        { 0x11, "CTRL" }, { 0xA2, "CTRL" }, { 0xA3, "RCTRL" }, { 0x12, "ALT" },
+        { 0xA4, "ALT" }, { 0xA5, "RALT" }, { 0x14, "CAPS" }, { 0x2D, "INS" },
+        { 0x2E, "DEL" }, { 0x24, "HOME" }, { 0x23, "END" }, { 0x21, "PGUP" },
+        { 0x22, "PGDN" }, { 0x26, "\xE2\x86\x91" }, { 0x28, "\xE2\x86\x93" },
+        { 0x25, "\xE2\x86\x90" }, { 0x27, "\xE2\x86\x92" },
+    };
+    size_t i;
+
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
+        snprintf(out, n, "%c", vk);
+        return;
+    }
+    for (i = 0; i < sizeof NAMES / sizeof NAMES[0]; i++)
+        if (NAMES[i].vk == vk) {
+            snprintf(out, n, "%s", NAMES[i].name);
+            return;
+        }
+    for (i = 0; i < sizeof KEYS / sizeof KEYS[0]; i++)
+        if (KEYS[i].vk == vk) {
+            snprintf(out, n, "%s", KEYS[i].name);
+            return;
+        }
+    snprintf(out, n, "#%d", vk);
+}
+
+int recomp_bindings_prompt_label(unsigned port, const char *control, char *out, size_t n)
+{
+    int k = control ? control_index(control) : -1, s;
+
+    recomp_bindings_init();
+    if (port >= PORTS || k < 0 || !out || !n)
+        return 0;
+    for (s = 0; s < g_ctl[port].bind[k].count; s++) {
+        const Source *src = &g_ctl[port].bind[k].src[s];
+
+        switch (src->kind) {
+        case SRC_KEY:
+            key_prompt_name(src->arg, out, n);
+            return 1;
+        case SRC_MOUSE_BUTTON:
+            snprintf(out, n, "%s", src->arg == 1 ? "LMB" : src->arg == 2 ? "RMB"
+                                 : src->arg == 4 ? "MMB" : src->arg == 8 ? "MB4" : "MB5");
+            return 1;
+        case SRC_MOUSE_WHEEL:
+            snprintf(out, n, "%s", src->arg == 0 ? "WHEEL\xE2\x86\x91" : "WHEEL\xE2\x86\x93");
+            return 1;
+        default:
+            break;
+        }
+    }
+    return 0;
+}
+
+/* Which the player last used, the keyboard and mouse (1) or a pad (0), from
+ * the sources that pressed something: a key or a click on one side; a pad
+ * button, a trigger, or a stick pushed well past any drift on the other. */
+static volatile int g_last_keyboard = 1;
+
+int recomp_bindings_last_input_keyboard(void)
+{
+    return g_last_keyboard;
 }
 
 const char *recomp_bindings_source_path(void)
@@ -1068,6 +1150,67 @@ typedef struct {
 
 static HoldState g_hold[PORTS][CONTROL_COUNT];
 
+/* recomp_bindings_press: until when each control reads as held. */
+static volatile unsigned long long g_press_until[PORTS][CONTROL_COUNT];
+
+void recomp_bindings_press(unsigned port, const char *control, unsigned ms)
+{
+    int k = control ? control_index(control) : -1;
+
+    recomp_bindings_init();
+    if (port >= PORTS || k < 0)
+        return;
+    g_press_until[port][k] = now_ms() + ms;
+}
+
+/* Pausing when the window loses the focus (pause_unfocused): the title's
+ * pause control, whether a port is in play, the setting (-1 until read),
+ * and each port's focus at its last sample. */
+static int g_pause_control = -1;
+static int (*g_pause_in_play)(unsigned port);
+static volatile int g_pause_setting = -1;
+static int g_pause_was_active[PORTS];
+
+void recomp_bindings_pause_on_focus_loss(const char *control, int (*in_play)(unsigned port))
+{
+    g_pause_control = control ? control_index(control) : -1;
+    g_pause_in_play = in_play;
+}
+
+void recomp_bindings_set_pause_unfocused(int on)
+{
+    g_pause_setting = on ? 1 : 0;
+}
+
+int recomp_bindings_pause_unfocused(void)
+{
+    if (g_pause_setting < 0)
+        g_pause_setting = recomp_config_bool("RECOMP_PAUSE_UNFOCUSED", "pause_unfocused", 1);
+    return g_pause_setting != 0;
+}
+
+int recomp_bindings_pause_available(void)
+{
+    return g_pause_control >= 0 && g_pause_in_play != NULL;
+}
+
+/* At each sample: the window has just lost the focus, the player is in
+ * play, so the title's pause is pressed for it -- Alt+Tab in a fight comes
+ * back to the pause menu, not to the fight's end. Only in play: pressed in
+ * the pause menu, the same control would resume. */
+static void follow_focus_pause(unsigned port)
+{
+    int active = recomp_input_window_active() ? 1 : 2, was = g_pause_was_active[port];
+
+    g_pause_was_active[port] = active;
+    if (was != 1 || active != 2 || !recomp_bindings_pause_available() ||
+        !recomp_bindings_pause_unfocused() || g_pause_in_play(port) != 1)
+        return;
+    g_press_until[port][g_pause_control] = now_ms() + 120;
+    fprintf(stderr, "[INPUT] the window lost the focus in play: paused (pause_unfocused)\n");
+    fflush(stderr);
+}
+
 void recomp_bindings_toggle_reader(const char *control, int (*is_on)(unsigned port))
 {
     int k = control ? control_index(control) : -1;
@@ -1165,6 +1308,7 @@ int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
     /* The in-game menu has the input: the pad is there, and untouched. */
     if (recomp_input_suspended())
         return 1;
+    follow_focus_pause(port);
     memset(&kc, 0, sizeof kc);
     key_cache_tick();
     memset(&pad, 0, sizeof pad);
@@ -1184,6 +1328,14 @@ int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
             const Source *src = &c->bind[i].src[s];
             int m = source_magnitude(src, &kc, &pad, have_pad,
                                      c->deadzone, &ms, &c->mouse);
+            if (m >= 64) {
+                if (src->kind == SRC_KEY || src->kind == SRC_MOUSE_BUTTON ||
+                    src->kind == SRC_MOUSE_WHEEL)
+                    g_last_keyboard = 1;
+                else if (src->kind == SRC_PAD_BUTTON || src->kind == SRC_PAD_TRIGGER ||
+                         (src->kind == SRC_PAD_AXIS && m >= 160))
+                    g_last_keyboard = 0;
+            }
             if (hold && (src->kind == SRC_KEY || src->kind == SRC_MOUSE_BUTTON ||
                          src->kind == SRC_MOUSE_WHEEL || src->kind == SRC_MOUSE_AXIS)) {
                 if (m >= 64)
@@ -1198,6 +1350,8 @@ int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
             if (pulse > mag)
                 mag = pulse;
         }
+        if (g_press_until[port][i] && now_ms() < g_press_until[port][i])
+            mag = 255;                  /* recomp_bindings_press */
         if (!mag)
             continue;
         say_first_press(port, CONTROLS[i].name);

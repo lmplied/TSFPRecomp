@@ -83,6 +83,10 @@ typedef struct RecompSettings {
     int  frame_interp;          /* 1 (off) to 4: frames shown for each the game draws */
     double brightness;          /* 0.5..2.0, 1 as the game made it: a gamma on the final picture */
     int  mute_unfocused;        /* 0 or 1: silence while another window has the focus */
+    int  pause_unfocused;       /* 0 or 1: pause the game when the window loses the focus in play */
+    int  volume;                /* 0 to 100: percent, for everything the game plays */
+    int  fxaa;                  /* 0 or 1: edge smoothing as the picture is resolved */
+    int  prompts;               /* button prompts: 0 auto, 1 keyboard, 2 controller */
     int  skip_intro;            /* 0 or 1: skip the videos a title plays before its menu */
     double fov;                 /* vertical field of view in degrees, 0 the game's own;
                                  * only for a title that can set it (recomp_fov_support) */

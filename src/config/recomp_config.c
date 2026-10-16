@@ -202,6 +202,10 @@ void recomp_settings_defaults(RecompSettings *s)
     s->frame_interp      = 1;
     s->brightness        = 1.0;
     s->mute_unfocused    = 0;
+    s->pause_unfocused   = 1;
+    s->volume            = 100;
+    s->fxaa              = 0;
+    s->prompts           = 0;
     s->skip_intro        = 0;
     s->fov               = 0.0;
     snprintf(s->frame_cap, sizeof s->frame_cap, "adaptive");
@@ -264,6 +268,14 @@ int recomp_settings_read(const char *path, RecompSettings *s)
         }
         if ((v = from_table("mute_unfocused")) != NULL)
             s->mute_unfocused = !off_word(v);
+        if ((v = from_table("pause_unfocused")) != NULL)
+            s->pause_unfocused = !off_word(v);
+        if ((v = from_table("volume")) != NULL)
+            s->volume = clamp_int(atoi(v), 0, 100);
+        if ((v = from_table("fxaa")) != NULL)
+            s->fxaa = !off_word(v);
+        if ((v = from_table("prompts")) != NULL)
+            s->prompts = strcmp(v, "keyboard") == 0 ? 1 : strcmp(v, "controller") == 0 ? 2 : 0;
         if ((v = from_table("skip_intro")) != NULL)
             s->skip_intro = !off_word(v);
         if ((v = from_table("fov")) != NULL) {
@@ -389,9 +401,29 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "# shadows, below 1 deepens them. 0.5 to 2.        [RECOMP_BRIGHTNESS]\n"
         "brightness = %.2f\n"
         "\n"
+        "# Edge smoothing (FXAA) on the finished picture: cheap, and most use\n"
+        "# below a resolution scale of 4, where supersampling has not already\n"
+        "# smoothed the edges. 0 is off.                         [RECOMP_FXAA]\n"
+        "fxaa = %d\n"
+        "\n"
         "# Silence the game while another window has the focus.\n"
         "#                                             [RECOMP_MUTE_UNFOCUSED]\n"
         "mute_unfocused = %d\n"
+        "\n"
+        "# Pause the game when its window loses the focus during play (Alt+Tab),\n"
+        "# for a game whose project says how. 0 keeps it running.\n"
+        "#                                            [RECOMP_PAUSE_UNFOCUSED]\n"
+        "pause_unfocused = %d\n"
+        "\n"
+        "# Volume of everything the game plays, 0 to 100 percent.\n"
+        "#                                                     [RECOMP_VOLUME]\n"
+        "volume = %d\n"
+        "\n"
+        "# Button prompts, for a game whose project knows its button icons:\n"
+        "# auto shows the keys while the keyboard or mouse was used last and\n"
+        "# the pad's buttons while a pad was; keyboard; controller.\n"
+        "#                                                    [RECOMP_PROMPTS]\n"
+        "prompts = %s\n"
         "\n"
         "# With widescreen on, fill the window whatever its shape -- 21:9,\n"
         "# 32:9, 16:10 -- rather than a 16:9 picture between bars. Only for a\n"
@@ -409,8 +441,10 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "\n"
         "# Where the game's files are, if they are not beside the executable.\n"
         "#                                                   [RECOMP_GAME_DIR]\n",
-        s->brightness >= 0.5 ? s->brightness : 1.0, s->mute_unfocused, s->wide_fill,
-        s->skip_intro,
+        s->brightness >= 0.5 ? s->brightness : 1.0, s->fxaa ? 1 : 0, s->mute_unfocused,
+        s->pause_unfocused, s->volume < 0 ? 0 : (s->volume > 100 ? 100 : s->volume),
+        s->prompts == 1 ? "keyboard" : s->prompts == 2 ? "controller" : "auto",
+        s->wide_fill, s->skip_intro,
         s->fov > 0.0 ? s->fov : 0.0);
 
     if (s->game_dir[0])

@@ -1240,6 +1240,10 @@ void xbox_D3D8SetAnisotropy(UINT level);
  * resolved to the window, 1 leaving the picture exactly as drawn. */
 void  xbox_D3D8SetBrightness(float b);
 float xbox_D3D8Brightness(void);
+/* Edge smoothing (fxaa, RECOMP_FXAA): FXAA in that same resolve, wherever it
+ * takes one sample a pixel -- below the supersampling that makes it moot. */
+void  xbox_D3D8SetFxaa(BOOL on);
+BOOL  xbox_D3D8Fxaa(void);
 /* The resolution scale, 1 to 8, changed while the title runs: the scene and
  * its depth buffer are made again at the new size after the next present. */
 void  xbox_D3D8RequestScale(UINT scale);
@@ -1255,6 +1259,13 @@ BOOL xbox_D3D8TitleAnyAspect(void);
 void xbox_D3D8SetWideFill(BOOL on);
 BOOL xbox_D3D8WideFill(void);
 BOOL xbox_D3D8FillShape(UINT *width, UINT *height);
+
+/* Where the title's picture is in the window, as fractions of the window's
+ * inside: the bars around it left out. A title that lets the mouse point at
+ * its menus maps the pointer through it into its own screen coordinates.
+ * FALSE (and the whole window) before a scaled present has placed it. Any
+ * thread. */
+BOOL xbox_D3D8PictureRect(float *x, float *y, float *w, float *h);
 
 /* Where the title's next screen-space draws belong in widescreen, for a title
  * that knows what it is drawing. A 4:3-only title's 2D is squeezed back to

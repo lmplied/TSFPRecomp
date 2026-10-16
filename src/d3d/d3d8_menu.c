@@ -40,6 +40,13 @@ static struct {
     unsigned        pw, ph;         /* panel size, in window pixels */
     unsigned        win_w, win_h;   /* the window it was laid out for */
     int             top;            /* first row shown: the list scrolls */
+    /* Where the last drawn panel's parts are, for xbox_D3D8MenuHit: the
+     * panel's corner in the window, and the rest in panel pixels. */
+    int             x0, y0;
+    RECT            hit_tab[D3D8_MENU_TABS];
+    int             hit_tabs;
+    RECT            hit_row[D3D8_MENU_ROWS], hit_left[D3D8_MENU_ROWS], hit_right[D3D8_MENU_ROWS];
+    int             hit_shown[D3D8_MENU_ROWS];  /* in view, and not a heading */
     /* What to show, and what was last drawn. */
     CRITICAL_SECTION lock;
     int             lock_ready;
@@ -233,6 +240,11 @@ static void fill(int x, int y, int w, int h, COLORREF c)
     DeleteObject(b);
 }
 
+static void set_rect(RECT *r, int x, int y, int w, int h)
+{
+    r->left = x; r->top = y; r->right = x + w; r->bottom = y + h;
+}
+
 static void frame(int x, int y, int w, int h, int t, COLORREF c)
 {
     fill(x, y, w, t, c);
@@ -283,12 +295,15 @@ static void render(const D3D8Menu *m)
     if (m->tab_count > 0) {
         int tw = w / (m->tab_count > 4 ? 4 : m->tab_count);
         if (tw > (int)(170 * s)) tw = (int)(170 * s);
+        g.hit_tabs = 0;
         for (i = 0; i < m->tab_count && i < D3D8_MENU_TABS; i++) {
             int lit = i == m->tab;
             text(x + i * tw, y, tw, (int)(28 * s), m->tabs[i], f_tab,
                  lit ? GREEN : INK_DIM, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
             if (lit)
                 fill(x + i * tw, y + (int)(30 * s), tw - (int)(24 * s), (int)(3 * s) + 1, GREEN);
+            set_rect(&g.hit_tab[i], x + i * tw, y - (int)(6 * s), tw - (int)(12 * s), (int)(42 * s));
+            g.hit_tabs = i + 1;
         }
         y += (int)(46 * s);
     }
@@ -302,26 +317,39 @@ static void render(const D3D8Menu *m)
     if (m->selected >= g.top + visible) g.top = m->selected - visible + 1;
     if (g.top > m->row_count - visible) g.top = m->row_count - visible;
     if (g.top < 0) g.top = 0;
+    memset(g.hit_shown, 0, sizeof g.hit_shown);
     for (i = g.top; i < m->row_count && i < g.top + visible; i++) {
         const D3D8MenuRow *r = &m->rows[i];
         int lit = i == m->selected, ry = y + (i - g.top) * (rowh + gap);
         int lx = x + (int)(18 * s), vx = x + w * 52 / 100;
+        /* The arrows: two targets a mouse can hit, at the row's right end. */
+        int aw = (int)(34 * s), ax = x + w - 2 * aw - (int)(8 * s);
 
         if (r->heading) {
             text(x, ry, w, rowh, r->label, f_small, GREEN, DT_LEFT | DT_SINGLELINE | DT_BOTTOM);
             continue;
         }
+        set_rect(&g.hit_row[i], x, ry, w, rowh);
+        if (r->arrows) {
+            set_rect(&g.hit_left[i], ax, ry, aw, rowh);
+            set_rect(&g.hit_right[i], ax + aw, ry, aw, rowh);
+        } else {
+            set_rect(&g.hit_left[i], 0, 0, 0, 0);
+            set_rect(&g.hit_right[i], 0, 0, 0, 0);
+        }
+        g.hit_shown[i] = 1;
         fill(x, ry, w, rowh, lit ? ROW_LIT : ROW);
         frame(x, ry, w, rowh, 1, lit ? GREEN : GREEN_DIM);
         text(lx, ry, vx - lx, rowh, r->label, f_row, lit ? INK : INK_DIM,
              DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-        text(vx, ry, w - (vx - x) - (int)(40 * s), rowh,
+        text(vx, ry, (r->arrows ? ax : x + w - (int)(12 * s)) - vx, rowh,
              (lit && m->editing) ? "press a key, click or turn the wheel..." : r->value,
              f_value, lit ? GREEN : INK_DIM,
              DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-        if (lit && r->arrows)
-            text(x + w - (int)(40 * s), ry, (int)(30 * s), rowh, "< >", f_small, GREEN,
-                 DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        if (lit && r->arrows) {
+            text(ax, ry, aw, rowh, "<", f_row, GREEN, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            text(ax + aw, ry, aw, rowh, ">", f_row, GREEN, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        }
     }
     /* Where in a longer list. */
     if (m->row_count > visible) {
@@ -335,7 +363,7 @@ static void render(const D3D8Menu *m)
     text(x, list_bottom + (int)(10 * s), w, (int)(44 * s), m->help, f_small, INK_DIM,
          DT_LEFT | DT_WORDBREAK);
     text(x, (int)g.ph - pad - (int)(22 * s), w, (int)(22 * s), m->footer, f_small, INK,
-         DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+         DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
     GdiFlush();
     DeleteObject(f_title);
@@ -365,6 +393,45 @@ void xbox_D3D8MenuShow(const D3D8Menu *menu)
     LeaveCriticalSection(&g.lock);
 }
 
+static int in_rect(const RECT *r, int x, int y)
+{
+    return x >= r->left && x < r->right && y >= r->top && y < r->bottom;
+}
+
+int xbox_D3D8MenuHit(int wx, int wy, int *index)
+{
+    int x, y, i, hit = D3D8_MENU_HIT_OUTSIDE;
+
+    *index = -1;
+    if (!g.lock_ready)
+        return D3D8_MENU_HIT_NONE;
+    EnterCriticalSection(&g.lock);
+    if (!g.shown || !g.pw || !g.ph) {
+        LeaveCriticalSection(&g.lock);
+        return D3D8_MENU_HIT_NONE;
+    }
+    x = wx - g.x0;
+    y = wy - g.y0;
+    if (x >= 0 && y >= 0 && x < (int)g.pw && y < (int)g.ph) {
+        hit = D3D8_MENU_HIT_PANEL;
+        for (i = 0; i < g.hit_tabs; i++)
+            if (in_rect(&g.hit_tab[i], x, y)) {
+                hit = D3D8_MENU_HIT_TAB;
+                *index = i;
+            }
+        for (i = 0; i < D3D8_MENU_ROWS && hit == D3D8_MENU_HIT_PANEL; i++) {
+            if (!g.hit_shown[i] || !in_rect(&g.hit_row[i], x, y))
+                continue;
+            *index = i;
+            hit = in_rect(&g.hit_left[i], x, y) ? D3D8_MENU_HIT_LEFT
+                : in_rect(&g.hit_right[i], x, y) ? D3D8_MENU_HIT_RIGHT
+                : D3D8_MENU_HIT_ROW;
+        }
+    }
+    LeaveCriticalSection(&g.lock);
+    return hit;
+}
+
 void d3d8_menu_draw(RhiView *target, unsigned w, unsigned h)
 {
     RhiOutputState saved;
@@ -390,11 +457,12 @@ void d3d8_menu_draw(RhiView *target, unsigned w, unsigned h)
         g.drawn = g.menu;
         g.dirty = 0;
     }
-    LeaveCriticalSection(&g.lock);
-
     /* Centred, on whole pixels, so each texel is one screen pixel. */
     x0 = (int)(w - g.pw) / 2;
     y0 = (int)(h - g.ph) / 2;
+    g.x0 = x0;
+    g.y0 = y0;
+    LeaveCriticalSection(&g.lock);
 
     rhi_output_save(&saved);
     if (!(mapped = rhi_buffer_map(g.cb, RHI_MAP_WRITE_DISCARD)))
