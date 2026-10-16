@@ -137,6 +137,10 @@ int  recomp_mouse_pointer(float *x, float *y);
  * and whole wheel notches in *wheel (positive away from the user). */
 unsigned recomp_mouse_pointer_clicks(int *wheel);
 
+/* Buttons pressed while pointing and not yet let go (RECOMP_MOUSE_* bits):
+ * for a value a held button keeps stepping. */
+unsigned recomp_mouse_pointer_held(void);
+
 /* ---- for tests ---- */
 
 /* What one raw mouse report carries: motion in counts, buttons that went

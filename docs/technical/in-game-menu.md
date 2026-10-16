@@ -8,6 +8,7 @@ a pad -- opens a settings panel over the game. Esc, F1 or B closes it.
 | Display | Resolution | at once: the scene target and its depth buffer are made again at the new size between two frames (`xbox_D3D8RequestScale`) |
 | | Widescreen: Off, 16:9, or Fill the window (a title that can draw any shape) | on or off next start (a title reads the console's video flag once); 16:9 and Fill at once |
 | | Field of view (a title that can set it) | at once |
+| | Weapon field of view (a title that can set it): the held weapon's angle whatever the view's | at once |
 | | Texture sharpness | at once |
 | | Edge smoothing (FXAA): in the resolve, at the output pixel's centre on the scene; skipped where the resolve averages several taps (4x and up at 1080 lines), which is supersampling already | at once |
 | | Brightness | at once: a gamma in the resolve, 50% to 200%; 100% is the picture exactly as drawn |

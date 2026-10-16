@@ -35,19 +35,34 @@
 enum { TAB_DISPLAY, TAB_MOUSE, TAB_CONTROLS, TAB_GENERAL, TAB_COUNT };
 static const char *const k_tab_names[TAB_COUNT] = { "Display", "Mouse", "Controls", "General" };
 
-enum { D_RES, D_WIDE, D_FOV, D_ANISO, D_FXAA, D_BRIGHT, D_CAP, D_FPS, D_FULL, D_VRR, D_INTERP,
-       D_COUNT };
+enum { D_RES, D_WIDE, D_FOV, D_WFOV, D_ANISO, D_FXAA, D_BRIGHT, D_CAP, D_FPS, D_FULL, D_VRR,
+       D_INTERP, D_COUNT };
 
-/* Field of view is there only for a title that can set it: the Display
- * page's rows, and which setting each one is. */
+/* The fields of view are there only for a title that can set them: the
+ * Display page's rows, and which setting each one is. */
+static int disp_shown(int kind)
+{
+    return kind == D_FOV ? recomp_fov_game() > 0.0
+         : kind == D_WFOV ? recomp_weapon_fov_game() > 0.0 : 1;
+}
+
 static int disp_rows(void)
 {
-    return recomp_fov_game() > 0.0 ? D_COUNT : D_COUNT - 1;
+    int k, n = 0;
+
+    for (k = 0; k < D_COUNT; k++)
+        n += disp_shown(k);
+    return n;
 }
 
 static int disp_kind(int row)
 {
-    return (recomp_fov_game() > 0.0 || row < D_FOV) ? row : row + 1;
+    int k;
+
+    for (k = 0; k < D_COUNT; k++)
+        if (disp_shown(k) && row-- == 0)
+            return k;
+    return D_COUNT - 1;
 }
 /* The Mouse page's rows, in order, made when the menu opens (mouse_rows):
  * zoomed aim only for a title that aims by the mouse itself, a hold-or-toggle
@@ -288,6 +303,7 @@ static void open_menu(void)
     m.set.brightness = xbox_D3D8Brightness();
     m.set.fxaa = xbox_D3D8Fxaa() ? 1 : 0;
     m.set.fov = recomp_fov();
+    m.set.weapon_fov = recomp_weapon_fov();
     m.set.wide_fill = xbox_D3D8WideFill();
     m.set.mute_unfocused = recomp_audio_output_mute_unfocused();
     m.set.pause_unfocused = recomp_bindings_pause_unfocused();
@@ -411,6 +427,16 @@ static void change(int dir)
             if (f > RECOMP_FOV_MAX) f = RECOMP_FOV_MAX;
             m.set.fov = (f > game - 0.5 && f < game + 0.5) ? 0.0 : f;
             recomp_fov_set(m.set.fov);
+            break;
+        }
+        case D_WFOV: {
+            double game = recomp_weapon_fov_game();
+            double f = (m.set.weapon_fov > 0.0 ? m.set.weapon_fov : game) + dir * 5.0;
+
+            if (f < RECOMP_WEAPON_FOV_MIN) f = RECOMP_WEAPON_FOV_MIN;
+            if (f > RECOMP_WEAPON_FOV_MAX) f = RECOMP_WEAPON_FOV_MAX;
+            m.set.weapon_fov = (f > game - 0.5 && f < game + 0.5) ? 0.0 : f;
+            recomp_weapon_fov_set(m.set.weapon_fov);
             break;
         }
         case D_ANISO:
@@ -677,6 +703,12 @@ static void build(D3D8Menu *menu)
                      m.set.fov > 0.0 ? "" : "   the game's own");
             row(menu, "Field of view", v, 1);
         }
+        if (recomp_weapon_fov_game() > 0.0) {
+            snprintf(v, sizeof v, "%.0f\xC2\xB0%s",
+                     m.set.weapon_fov > 0.0 ? m.set.weapon_fov : recomp_weapon_fov_game(),
+                     m.set.weapon_fov > 0.0 ? "" : "   the game's own");
+            row(menu, "Weapon field of view", v, 1);
+        }
         snprintf(v, sizeof v, m.set.anisotropy > 1 ? "%dx" : "Off", m.set.anisotropy);
         row(menu, "Texture sharpness", v, 1);
         row(menu, "Edge smoothing (FXAA)", on_off(m.set.fxaa), 1);
@@ -705,6 +737,9 @@ static void build(D3D8Menu *menu)
                 "read when the game starts.",
                 "How much of the world the view takes in, top to bottom. Wider shows "
                 "more at the edges; the game's own culling follows.",
+                "How wide the weapon in your hands is drawn, whatever the view's field "
+                "of view: wider shows it smaller and further off. The game's own keeps "
+                "it as the game drew it.",
                 "Sharpen textures seen at a glancing angle: floors, walls, roads.",
                 "Smooth jagged edges, cheaply. For a low resolution: at 4x and above "
                 "the supersampling has already smoothed them, and this is skipped.",

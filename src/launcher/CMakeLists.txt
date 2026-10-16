@@ -64,12 +64,35 @@ if(WIN32)
         # 16:9 mode of its own, which it uses when the console says it is
         # widescreen. Widescreen is then all it takes, so Wide camera -- the
         # widening for a title without one -- is hidden and written off.
-        cmake_parse_arguments(_launcher "NO_WIDESCREEN;NATIVE_WIDESCREEN" "" "" ${ARGN})
+        # What else the title project supports, so the launcher offers it --
+        # each matches something the project registers at start-up:
+        #   ANY_ASPECT       xbox_D3D8SetTitleAnyAspect: Widescreen becomes
+        #                    Off / 16:9 / Fill the window (with NATIVE_WIDESCREEN)
+        #   FOV <degrees>    recomp_fov_support, with the game's own angle
+        #   WEAPON_FOV <deg> recomp_weapon_fov_support, the same for the weapon
+        #   PROMPTS          recomp_prompts_icon: the Button prompts row
+        #   PAUSE_UNFOCUSED  recomp_bindings_pause_on_focus_loss
+        #   SKIP_INTRO       xmv_set_intro_videos
+        cmake_parse_arguments(_launcher
+            "NO_WIDESCREEN;NATIVE_WIDESCREEN;ANY_ASPECT;PROMPTS;PAUSE_UNFOCUSED;SKIP_INTRO"
+            "FOV;WEAPON_FOV" "" ${ARGN})
         if(_launcher_NO_WIDESCREEN)
             target_compile_definitions(${TARGET} PRIVATE LAUNCHER_NO_WIDESCREEN=1)
         endif()
         if(_launcher_NATIVE_WIDESCREEN)
             target_compile_definitions(${TARGET} PRIVATE LAUNCHER_NATIVE_WIDESCREEN=1)
+        endif()
+        foreach(_flag ANY_ASPECT PROMPTS PAUSE_UNFOCUSED SKIP_INTRO)
+            if(_launcher_${_flag})
+                target_compile_definitions(${TARGET} PRIVATE LAUNCHER_${_flag}=1)
+            endif()
+        endforeach()
+        if(_launcher_FOV)
+            target_compile_definitions(${TARGET} PRIVATE LAUNCHER_FOV=${_launcher_FOV})
+        endif()
+        if(_launcher_WEAPON_FOV)
+            target_compile_definitions(${TARGET} PRIVATE
+                LAUNCHER_WEAPON_FOV=${_launcher_WEAPON_FOV})
         endif()
         if(MSVC)
             target_compile_options(${TARGET} PRIVATE

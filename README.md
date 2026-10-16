@@ -38,7 +38,8 @@ respective owners. This project is not affiliated with or endorsed by them.
 - Widescreen through the game's own 16:9 mode, or *Fill the window* for any
   shape — 21:9 and 32:9 included, with the game laying out its own camera and
   HUD for it.
-- Field of view from 40° to 90°.
+- Field of view from 40° to 90°, and a separate weapon field of view, so a
+  wider view no longer shrinks the gun in your hands.
 - Frame interpolation at 2×, 3× or 4× (120, 180 or 240 frames a second on
   screen) while the game itself keeps its native 60.
 - FXAA edge smoothing, texture sharpness (anisotropic filtering), brightness.
@@ -53,7 +54,10 @@ respective owners. This project is not affiliated with or endorsed by them.
 - Aim and crouch can be held or toggled.
 - Every control can be rebound in game, to keys or mouse buttons.
 - The mouse works in the game's menus (point, click, right-click to go back,
-  wheel to scroll) and in the settings panel.
+  wheel to scroll) and in the settings panel. Values such as volume and match
+  options step with a click on either side or the wheel; the pause screen's
+  OPTIONS / STATUS header, the name keyboard and character select can be
+  clicked too.
 - On-screen button prompts show your keys — "E Select", "F Back" — instead of
   the pad's A and B, and switch back when you pick up a controller.
 
@@ -226,8 +230,8 @@ game the mouse; Alt+Tab gives it back.
 - Only the USA release, and only on Windows.
 - Multiplayer beyond one screen — System Link, and play over the internet — is
   not supported, and split-screen has not been tested with a mouse.
-- A few front-end screens (the tabs at the top of the pause screen, sliders,
-  and grids such as character select) still need the keys or a pad.
+- Front-end screens not yet seen with the mouse (Mapmaker, some Challenge and
+  Extras pages) may still need the keys or a pad.
 - Button prompts cover A, B, X and Y. Other icons still show the pad's.
 - Frame interpolation adds roughly 10 ms of input delay, and a few effects the
   game moves itself (some particles) stay at 60 frames a second.

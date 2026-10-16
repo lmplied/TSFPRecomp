@@ -90,6 +90,8 @@ typedef struct RecompSettings {
     int  skip_intro;            /* 0 or 1: skip the videos a title plays before its menu */
     double fov;                 /* vertical field of view in degrees, 0 the game's own;
                                  * only for a title that can set it (recomp_fov_support) */
+    double weapon_fov;          /* the held weapon's, the same way, 0 the game's own; only
+                                 * for a title that can set it (recomp_weapon_fov_support) */
     char game_dir[512];         /* empty means beside the executable */
 } RecompSettings;
 
@@ -122,6 +124,19 @@ void   recomp_fov_support(double game_degrees);
 double recomp_fov_game(void);           /* 0 when the title cannot set it */
 double recomp_fov(void);                /* the player's, or 0 */
 void   recomp_fov_set(double degrees);
+
+/* The held weapon's field of view, for a title whose first-person weapon is
+ * drawn with an angle of its own (a shooter's usually is, narrower than the
+ * view's, and widened with it). The setting is `weapon_fov`
+ * (RECOMP_WEAPON_FOV): the weapon drawn as at that angle whatever the
+ * view's, 0 for the game's own -- the weapon as the game draws it at its own
+ * view, so widening the view leaves the weapon alone. */
+#define RECOMP_WEAPON_FOV_MIN 30.0
+#define RECOMP_WEAPON_FOV_MAX 90.0
+void   recomp_weapon_fov_support(double game_degrees);
+double recomp_weapon_fov_game(void);    /* 0 when the title cannot set it */
+double recomp_weapon_fov(void);         /* the player's, or 0 */
+void   recomp_weapon_fov_set(double degrees);
 
 /* The input bindings (src/input/input_bindings.c reads them, the launcher
  * edits them). They are per title, because a keyboard layout is a judgement

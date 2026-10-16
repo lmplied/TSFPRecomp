@@ -175,7 +175,8 @@ if(COMMAND recomp_add_launcher)
     # NATIVE_WIDESCREEN: Future Perfect has a 16:9 mode of its own, chosen
     # from the console's video flag (XGetVideoFlags, read in its device
     # set-up at 0x00023A91), so the launcher offers Widescreen alone.
-    recomp_add_launcher(${PROJECT_NAME}_launcher ${PROJECT_NAME}.exe NATIVE_WIDESCREEN)
+    recomp_add_launcher(${PROJECT_NAME}_launcher ${PROJECT_NAME}.exe NATIVE_WIDESCREEN ANY_ASPECT
+                        FOV 55 WEAPON_FOV 45 PROMPTS PAUSE_UNFOCUSED SKIP_INTRO)
     # The same preset beside the launcher, for its reset.
     add_custom_command(TARGET ${PROJECT_NAME}_launcher POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different

@@ -257,7 +257,19 @@ walking, is better off.
 Future Perfect's lists -- the main menu, the pause menu, Arcade Type and the
 like -- can be pointed at: moving onto an option highlights it, a left click
 picks it, a right click goes back, and the wheel steps up and down. The keys
-and the pad work as before alongside.
+and the pad work as before alongside. Beyond plain lists:
+
+- Values (Music ON/OFF, the volume bars, a match's Score limit, Weapon Set):
+  a click left or right of the row's middle steps it that way, held it keeps
+  going (the game's own repeat), and the wheel over it turns it. Weapon Set
+  and Bot Set end in A's prompt, which opens their editors: a click there is
+  A.
+- The pause screen's OPTIONS / STATUS header: a click beside the tab showing
+  turns to the other.
+- The profile name keyboard: its letters are items like any other.
+- Character select: moving onto a portrait walks the selection there, a click
+  picks that character (A goes once the new character has come in -- the
+  game ignores it before), a click anywhere else picks the one selected.
 
 The runtime side is general (`input_mouse.h`, "for a title whose menus the
 mouse can point at"):
@@ -285,14 +297,25 @@ The screen's widget update, `sub_0007A7B0`, is wrapped; before its outermost
 call the pointer is hit against every selectable item, and a move onto one
 selects it through the game's own `sub_00076EF0`, so the highlight, help line
 and sound are the game's. Only a move selects: a pointer left still never
-fights the keys. Not covered yet: the OPTIONS/STATUS tabs of the pause
-screen, sliders, and screens laid out as grids, which keep the keys and pad.
+fights the keys. An item with bit 4 of its +0x28 set is passed over, as the
+game's select passes over it: titles, text fields and rows of prompts drawn
+as buttons. `recomp_mouse_pointer_held` says which buttons are still down,
+for a held click on a value.
+
+The two screens without items to hit were read differently. The pause
+header's place was measured from screenshots (squeezed toward the middle in
+16:9 like the rest of the front end); which tab is showing is told by an item
+only that tab has. Character select keeps its state at 0x0078A248 on (the
+selection, the top row as a float, the player's state, a float that runs down
+as a new character comes in), found by RAM snapshots across presses; its
+portraits keep to the left edge in 16:9, not squeezed.
 
 `RECOMP_FP_POINTER_TEST=<ms>:<x>:<y>:<click>,...` puts a pointer at (x, y) in
-that 640x480 screen on the input script's clock, with 1 a left click and 2 a
-right one, since a run must not move the desktop's pointer; with
-`RECOMP_INPUT_SEQ_PAD=1` the presses it makes reach the game beside the
-script. `RECOMP_FP_UI_DUMP=<ms>` prints the widget table and every item.
+that 640x480 screen on the input script's clock -- click 1 left, 2 right, 3
+left held until the next step, 4 and 5 a wheel notch up and down -- since a
+run must not move the desktop's pointer; with `RECOMP_INPUT_SEQ_PAD=1` the
+presses it makes reach the game beside the script.
+`RECOMP_FP_UI_DUMP=<ms>[,<ms>...]` prints the widget table and every item.
 
 #### Button prompts
 

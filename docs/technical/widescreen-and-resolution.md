@@ -131,9 +131,20 @@ The game writes `+0x388` only when the view changes mode -- the zoomed angle
 going into aim mode, its own 55 coming back out -- so the `fov` setting
 (40 to 90, live from the menu) is put there whenever the player is not
 aiming, and the game derives the rest, culling included (`fp_apply_fov`).
-The weapon in hand is drawn with the same projection and changes with it.
 `recomp_fov_support` is how a title project offers the setting; the menu
 shows the row only then.
+
+The weapon in hand has a projection of its own: `sub_001B9120` sets it, draws
+the weapon and puts the view's back, and `sub_001B73F0` builds it from the
+camera's angle now times `[0x0047E298]` (1/55) times 45 -- 45 degrees against
+the view's 55, narrower with it when zoomed. So widening the view widened the
+weapon too: shrunk, arms showing. `weapon_fov` (`recomp_weapon_fov`, 30 to 90,
+0 the game's own) sets that 1/55 to (weapon / 45) / the view's own angle each
+look tick (`fp_apply_weapon_fov`), so the weapon keeps its angle whatever the
+view's and still zooms as before; the constant is read in one other place, the
+same product in the weapon's code at `0x001C3406`. Found by printing the
+projection every draw uses (two: the weapon's 1/tan of 22.5 degrees, last in
+the frame) and then the guest stack of the call that set it.
 
 ### TimeSplitters 2 has no 16:9 mode at all
 

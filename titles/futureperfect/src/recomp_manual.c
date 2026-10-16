@@ -621,6 +621,27 @@ static void fp_apply_fov(void)
     written = want;
 }
 
+/* The held weapon's field of view (recomp_weapon_fov). The weapon is drawn
+ * with a projection of its own (sub_001B9120 sets it, draws the weapon, puts
+ * the view's back), built by sub_001B73F0 from the camera's angle now
+ * (+0x384) times 1/55 times 45: 45 degrees against the view's 55, and
+ * narrower with it when zoomed. Widening the view widened the weapon as well
+ * -- shrunk, arms showing. The 1/55 is a constant at 0x0047E298 read only
+ * there and once more in the weapon's code (0x001C3406, the same product);
+ * it is made (weapon / 45) / the view's own angle (the player's, or the
+ * game's 55), so the weapon keeps its angle whatever the view's and still
+ * zooms as it did. Found by the projection each draw uses (two: 1/tan of
+ * 27.5 and of 22.5 degrees, the weapon's last) and then the guest stack of
+ * the call that set the second. */
+static void fp_apply_weapon_fov(void)
+{
+    double view = recomp_fov() > 0.0 ? recomp_fov() : recomp_fov_game();
+    double weapon = recomp_weapon_fov() > 0.0 ? recomp_weapon_fov() : recomp_weapon_fov_game();
+
+    if (view > 0.0 && weapon > 0.0)
+        FP_MEMF(0x0047E298u) = (float)(weapon / 45.0 / view);
+}
+
 /* When the look builder last ran (sub_0025CE80, below): the player is in
  * play, not in a menu, a pause or a cutscene. */
 static volatile long g_fp_look_tick;
@@ -707,14 +728,19 @@ static void fp_aspect_follow(void)
  * -- the highlight, the help line and the sound follow -- and only on a
  * move, so a stationary pointer never fights the keys or the pad. A left
  * click on an item presses A, a right click B, the wheel up and down on the
- * D-pad: what the game reads for the rest is unchanged.
+ * D-pad: what the game reads for the rest is unchanged. A value (a choice or
+ * a volume bar, fp_ui_value) is stepped instead: a click left or right of
+ * its middle presses left or right, held it stays pressed for the game's
+ * own repeat, and the wheel over it turns it. Two screens draw what a
+ * click needs without items to hit: the pause screen's OPTIONS / STATUS
+ * header (fp_ui_pause_tab) and character select's portraits (fp_cs_*).
  *
  * The pointer is asked for (recomp_mouse_pointer_mode) while a list is up
  * and the player is not in play (the look builder has not run for 100 ms):
  * the mouse is let go for the menu and taken back when play resumes.
  *
- * RECOMP_FP_UI_DUMP=<ms> prints the widget table and every item's record
- * once, at that time on the input script's clock: where to start for a
+ * RECOMP_FP_UI_DUMP=<ms>[,<ms>...] prints the widget table and every item's
+ * record at those times on the input script's clock: where to start for a
  * screen whose controls are not plain lists.
  */
 extern void sub_0007A7B0_gen(void);
@@ -726,18 +752,24 @@ extern void sub_00076EF0(void);
 
 static void fp_ui_dump(void)
 {
-    static int done = -1;
-    static unsigned long at;
+    static int parsed, count, next;
+    static unsigned long at[16];
     int e;
 
-    if (done < 0) {
+    if (!parsed) {
         const char *s = getenv("RECOMP_FP_UI_DUMP");
-        done = !(s && *s);
-        at = s ? strtoul(s, NULL, 10) : 0;
+        char *end;
+        parsed = 1;
+        while (s && *s && count < 16) {
+            at[count++] = strtoul(s, &end, 10);
+            if (end == s)
+                break;
+            s = *end == ',' ? end + 1 : end;
+        }
     }
-    if (done || recomp_input_script_ms() < at)
+    if (next >= count || recomp_input_script_ms() < at[next])
         return;
-    done = 1;
+    next++;
     fprintf(stderr, "[FP-UI] root [0x007613E4] %08X, squeeze %.4f\n", FP_MEM32(0x007613E4u),
             FP_MEMF(0x004C0460u));
     for (e = 0; e < FP_UI_WIDGETS; e++) {
@@ -751,8 +783,16 @@ static void fp_ui_dump(void)
                 FP_MEM32(w + 0x178u), FP_MEM32(w + 0x17Cu), (int)FP_MEM32(w + 0x184u),
                 FP_MEMF(w + 0xA8u), FP_MEMF(w + 0xACu), FP_MEMF(w + 0xB0u), FP_MEMF(w + 0xB4u));
         for (it = FP_MEM32(w + 0x178u); it && n < 64; it = FP_MEM32(it + 4u), n++) {
-            char line[1400];
-            int len = snprintf(line, sizeof line, "[FP-UI]   item %08X:", it);
+            char line[1400], text[48];
+            uint32_t s = FP_MEM32(it + 0x20u);
+            int len, c;
+            for (c = 0; s && c < 47; c++) {
+                uint8_t ch = FP_MEM8(s + (uint32_t)c);
+                if (ch < 0x20 || ch > 0x7E) break;
+                text[c] = (char)ch;
+            }
+            text[s ? c : 0] = '\0';
+            len = snprintf(line, sizeof line, "[FP-UI]   item %08X \"%s\":", it, text);
             for (o = 0; o < 0x10C && len < (int)sizeof line - 24; o += 4) {
                 uint32_t v = FP_MEM32(it + (uint32_t)o);
                 float fv = FP_MEMF(it + (uint32_t)o);
@@ -785,10 +825,14 @@ static void fp_ui_select(uint32_t widget, uint32_t item)
     g_edx = edx;
 }
 
+/* What a list can select: kinds 4, 7 and 8, without bit 4 of +0x28 -- the
+ * game's own select (sub_00076EF0) passes over an item with that bit to the
+ * next, so a title, a text field or a row of button prompts drawn as a
+ * button is never landed on (the name entry screen has all three). */
 static int fp_ui_selectable(uint32_t item)
 {
     uint32_t kind = FP_MEM32(item);
-    return kind == 4u || kind == 7u || kind == 8u;
+    return (kind == 4u || kind == 7u || kind == 8u) && !(FP_MEM8(item + 0x28u) & 4u);
 }
 
 /* The item under (x, y) among every list under root, and its widget; 0 for
@@ -824,12 +868,184 @@ static uint32_t fp_ui_hit(uint32_t root, float x, float y, uint32_t *widget, int
     return 0;
 }
 
+/* An item that holds a value rather than doing something: a choice (+0xB4
+ * set; +0xC0 the current one of +0xC4, the value itself at [+0xD8]) or a
+ * bar (the volumes: +0x28 0xC2000). Left and right on the D-pad change
+ * either; the buttons beside them have +0x30 2 and a handler at +0x38. From
+ * the Audio/Video Options screen. */
+static int fp_ui_value(uint32_t item)
+{
+    return FP_MEM32(item) == 7u && FP_MEM32(item + 0x30u) != 2u &&
+           (FP_MEM32(item + 0xB4u) == 1u || FP_MEM32(item + 0x28u) == 0xC2000u);
+}
+
+/* The pause screen's tabs, OPTIONS and STATUS, are no list: left and right
+ * on the D-pad turn them, and the header naming them is drawn, not hit.
+ * Which is showing is told by what is under root -- OPTIONS has Continue
+ * (+0x38 0x2EBB80), STATUS its objectives box (kind 8, +0x50 0x2F5E10).
+ * A click on the header beside the tab showing turns to the other: -1 left,
+ * 1 right, 0 not on it. The header's place was measured from screenshots in
+ * 4:3; across 16:9 the front end squeezes toward the middle by [0x004C0460]. */
+static int fp_ui_pause_tab(uint32_t root, float x, float y)
+{
+    uint32_t stack[32], w;
+    int sp = 0, guard = 0, showing = 0;
+    float squeeze = FP_MEMF(0x004C0460u), dx;
+
+    if (y < 34.0f || y > 76.0f || !(squeeze > 0.1f && squeeze <= 1.0f))
+        return 0;
+    stack[sp++] = root;
+    while (sp && guard++ < 64 && !showing) {
+        uint32_t it, c;
+        int n = 0;
+
+        w = stack[--sp];
+        if (w < FP_UI_TABLE || w >= FP_UI_TABLE + FP_UI_WIDGETS * FP_UI_SIZE || !FP_MEM32(w))
+            continue;
+        for (c = FP_MEM32(w + 0x16Cu); c && sp < 32 && n < 32; c = FP_MEM32(c + 0x30u), n++)
+            stack[sp++] = c;
+        for (it = FP_MEM32(w + 0x178u), n = 0; it && n < 128; it = FP_MEM32(it + 4u), n++) {
+            if (FP_MEM32(it) == 7u && FP_MEM32(it + 0x38u) == 0x002EBB80u)
+                showing = 1;                /* OPTIONS: its name spans dx -112..22 */
+            else if (FP_MEM32(it) == 8u && FP_MEM32(it + 0x50u) == 0x002F5E10u)
+                showing = 2;                /* STATUS: -16..102 */
+        }
+    }
+    dx = (x - 320.0f) / squeeze;
+    if (!showing || dx < -140.0f || dx > 140.0f)
+        return 0;
+    if (showing == 1)
+        return dx < -112.0f ? -1 : dx > 22.0f ? 1 : 0;
+    return dx < -16.0f ? -1 : dx > 102.0f ? 1 : 0;
+}
+
+/* Character select is no list: the portraits down the left are drawn by a
+ * screen of its own, whose one item covers everything above the button
+ * prompts (0,0 to 640,414, +0x28 0xC0000). Its state, found by RAM
+ * snapshots across presses of up and down: the character selected at
+ * [0x0078A248], the row at the top of the column as a float at [0x0078A28C]
+ * (it scrolls smoothly; the selection sits on the fourth row once past it),
+ * and [0x0078A294] set only while the screen is up. [0x0078A27C] is the
+ * player's state, 1 choosing and 4 ready, and [0x0078A264] a float that
+ * starts near 1 when the selection changes and runs down to 0 over about a
+ * second as the new character comes in -- A is not taken until it has. How
+ * many there are to choose from is at [0x0078AC98], up wrapping from the
+ * first to the last.
+ * The rows, measured in 4:3 and the same in 16:9: 73.7 apart, the first
+ * centred at 68.8, the portraits between x 34 and 110. */
+#define FP_CS_SELECTED 0x0078A248u
+#define FP_CS_TOP      0x0078A28Cu
+#define FP_CS_ACTIVE   0x0078A294u
+#define FP_CS_COUNT    0x0078AC98u
+#define FP_CS_STATE    0x0078A27Cu
+#define FP_CS_FADE     0x0078A264u
+
+static int fp_cs_screen(uint32_t item)
+{
+    /* The item's box is squeezed toward the middle for 16:9 like any other
+     * (80 to 560 then; 639.99994 rather than 640 in 4:3), the portraits are
+     * not: they keep to the left edge. */
+    float half = 319.0f * FP_MEMF(0x004C0460u);
+    return item && FP_MEM32(FP_CS_ACTIVE) && FP_MEM32(item + 0x28u) == 0x000C0000u &&
+           FP_MEMF(item + 0x78u) <= 320.0f - half && FP_MEMF(item + 0x80u) >= 320.0f + half;
+}
+
+/* The character under (x, y), or -1. */
+static int fp_cs_row(float x, float y)
+{
+    float top = FP_MEMF(FP_CS_TOP), at;
+    int count = (int)FP_MEM32(FP_CS_COUNT), i;
+
+    if (x < 30.0f || x > 114.0f || y < 0.0f || y >= 414.0f || !(top >= 0.0f))
+        return -1;
+    at = top + (y - 68.8f) / 73.7f;
+    i = (int)floorf(at + 0.5f);
+    return i >= 0 && i < count ? i : -1;
+}
+
+/* Walking the selection to a character: one press of up or down at a time,
+ * held until the game has moved (a frame can stall while the model before
+ * loads) and then let go long enough to be seen let go, and A at the end if
+ * it was a click. */
+static struct { int target, activate, phase, from; long t, pressed_a; } g_fp_cs = { -1 };
+
+static void fp_cs_follow(unsigned port, long now)
+{
+    int sel = (int)FP_MEM32(FP_CS_SELECTED);
+
+    if (g_fp_cs.target < 0)
+        return;
+    if (g_fp_cs.phase == 1) {               /* pressing */
+        if (sel == g_fp_cs.from && now - g_fp_cs.t < 500) {
+            recomp_bindings_press(port, g_fp_cs.target > g_fp_cs.from ? "dpad_down" : "dpad_up", 50);
+            return;
+        }
+        g_fp_cs.phase = 2;
+        g_fp_cs.t = now;
+    }
+    if (g_fp_cs.phase == 2) {               /* letting go */
+        if (now - g_fp_cs.t < 80)
+            return;
+        g_fp_cs.phase = 0;
+    }
+    if (sel == g_fp_cs.target) {
+        /* A is not taken while the new character comes in, so it waits for
+         * that, and goes again until the player reads as ready (a frame can
+         * stall over the press). */
+        if (!g_fp_cs.activate || FP_MEM32(FP_CS_STATE) == 4u || now - g_fp_cs.t > 4000) {
+            g_fp_cs.target = -1;
+            return;
+        }
+        if (FP_MEMF(FP_CS_FADE) <= 0.001f && now - g_fp_cs.pressed_a >= 400) {
+            recomp_bindings_press(port, "a", 100);
+            g_fp_cs.pressed_a = now;
+        }
+        return;
+    }
+    g_fp_cs.from = sel;
+    g_fp_cs.t = now;
+    g_fp_cs.phase = 1;
+    recomp_bindings_press(port, g_fp_cs.target > sel ? "dpad_down" : "dpad_up", 50);
+}
+
+/* The pointer on character select: moving onto a portrait walks the
+ * selection there, a left click there picks it (A once it is reached), a
+ * left click anywhere else picks the one selected; the wheel and a right
+ * click stay as they are. 1 when the left click was taken. */
+static int fp_cs_mouse(unsigned port, long now, float x, float y, int moved, unsigned clicks,
+                       int wheel)
+{
+    int row = fp_cs_row(x, y);
+
+    if (wheel)
+        g_fp_cs.target = -1;                /* the wheel steers instead */
+    if (FP_MEM32(FP_CS_STATE) != 1u)
+        row = -1;                           /* ready: the portraits are fixed */
+    if (row >= 0 && (moved || (clicks & RECOMP_MOUSE_LEFT))) {
+        if (g_fp_cs.target != row)
+            g_fp_cs.activate = 0;
+        g_fp_cs.target = row;
+        if (clicks & RECOMP_MOUSE_LEFT) {
+            g_fp_cs.activate = 1;
+            g_fp_cs.t = now;
+            g_fp_cs.pressed_a = now - 1000;
+        }
+    } else if (clicks & RECOMP_MOUSE_LEFT) {
+        g_fp_cs.target = -1;
+        recomp_bindings_press(port, "a", 80);
+    }
+    fp_cs_follow(port, now);
+    return (clicks & RECOMP_MOUSE_LEFT) != 0;
+}
+
 /* RECOMP_FP_POINTER_TEST=<ms>:<x>:<y>:<click>[,...]: the pointer at (x, y)
  * in the front end's 640x480 screen from that time on the input script's
  * clock, as if the real one were there, and a click as the step begins (1
- * left, 2 right, 0 none) -- a run cannot move the desktop's pointer. 1 while
- * a test is configured, with *have whether a step has begun. */
-static int fp_pointer_test(float *x, float *y, unsigned *clicks, int *have)
+ * left, 2 right, 0 none, 3 left and held down until the next step; 4 and 5
+ * the wheel, a notch up or down) -- a run cannot move the desktop's pointer.
+ * 1 while a test is configured, with *have whether a step has begun. */
+static int fp_pointer_test(float *x, float *y, unsigned *clicks, unsigned *held, int *wheel,
+                           int *have)
 {
     static int parsed, count, done = -1;
     static struct { unsigned long at; float x, y; unsigned click; } steps[16];
@@ -860,14 +1076,21 @@ static int fp_pointer_test(float *x, float *y, unsigned *clicks, int *have)
             cur = i;
     *have = cur >= 0;
     if (cur >= 0) {
+        static const char *const what[] = { "", " left click", " right click", " left held",
+                                            " wheel up", " wheel down" };
+        unsigned click = steps[cur].click;
         *x = steps[cur].x;
         *y = steps[cur].y;
+        if (click == 3)
+            *held |= RECOMP_MOUSE_LEFT;
         if (cur != done) {
             done = cur;
-            if (steps[cur].click == 1) *clicks |= RECOMP_MOUSE_LEFT;
-            if (steps[cur].click == 2) *clicks |= RECOMP_MOUSE_RIGHT;
+            if (click == 1 || click == 3) *clicks |= RECOMP_MOUSE_LEFT;
+            if (click == 2) *clicks |= RECOMP_MOUSE_RIGHT;
+            if (click == 4) *wheel += 1;
+            if (click == 5) *wheel -= 1;
             fprintf(stderr, "[FP-UI] pointer test: (%.0f, %.0f)%s\n", *x, *y,
-                    steps[cur].click == 1 ? " left click" : steps[cur].click == 2 ? " right click" : "");
+                    click < 6 ? what[click] : "");
             fflush(stderr);
         }
     }
@@ -878,10 +1101,12 @@ static void fp_menu_mouse(uint32_t root)
 {
     static float last_x = -1.0f, last_y = -1.0f;
     static int wheel_left;
+    static uint32_t hold_item;              /* the value a held left button keeps stepping */
+    static const char *hold_dir;
     long now = (long)(clock() * 1000 / CLOCKS_PER_SEC);
-    int port = recomp_bindings_mouse_port(), lists = 0, moved, wheel = 0, have;
+    int port = recomp_bindings_mouse_port(), lists = 0, moved, wheel = 0, have, value, tab;
     uint32_t item, widget;
-    unsigned clicks;
+    unsigned clicks, held;
     float cx, cy, fx, fy, fw, fh, x = -1.0f, y = -1.0f;
 
     if (port < 0)
@@ -896,33 +1121,66 @@ static void fp_menu_mouse(uint32_t root)
         return;
     have = recomp_mouse_pointer(&cx, &cy);
     clicks = recomp_mouse_pointer_clicks(&wheel);
+    held = recomp_mouse_pointer_held();
     if (have) {
         xbox_D3D8PictureRect(&fx, &fy, &fw, &fh);
         x = (cx - fx) / fw * 640.0f;
         y = (cy - fy) / fh * 480.0f;
     }
-    fp_pointer_test(&x, &y, &clicks, &have);
+    fp_pointer_test(&x, &y, &clicks, &held, &wheel, &have);
     moved = have && (fabsf(x - last_x) >= 1.0f || fabsf(y - last_y) >= 1.0f);
     if (have) {
         last_x = x;
         last_y = y;
     }
+    if (fp_cs_screen(fp_ui_hit(root, 320.0f, 200.0f, &widget, &lists))) {
+        if (fp_cs_mouse((unsigned)port, now, have ? x : -1.0f, have ? y : -1.0f, moved, clicks,
+                        wheel))
+            clicks &= ~(unsigned)RECOMP_MOUSE_LEFT;
+    } else {
+        g_fp_cs.target = -1;
+    }
     item = have ? fp_ui_hit(root, x, y, &widget, &lists) : 0;
     if (item && (moved || (clicks & RECOMP_MOUSE_LEFT)) &&
         FP_MEM32(widget + 0x198u) != item)
         fp_ui_select(widget, item);
-    if ((clicks & RECOMP_MOUSE_LEFT) && item)
+    value = item && fp_ui_value(item);
+    /* A value that A also opens (Weapon Set and Bot Set: their editors) ends
+     * in A's prompt; a click there is A. */
+    if (value && FP_MEM32(item + 0x38u) && x >= FP_MEMF(item + 0x80u) - 32.0f)
+        value = 0;
+    if ((clicks & RECOMP_MOUSE_LEFT) && value) {
+        /* A value steps the way of the half clicked; held, the D-pad stays
+         * down and the game's own repeat carries on. */
+        hold_item = item;
+        hold_dir = x < (FP_MEMF(item + 0x78u) + FP_MEMF(item + 0x80u)) * 0.5f ? "dpad_left"
+                                                                            : "dpad_right";
+        recomp_bindings_press((unsigned)port, hold_dir, 60);
+    } else if ((clicks & RECOMP_MOUSE_LEFT) && item) {
         recomp_bindings_press((unsigned)port, "a", 80);
+    } else if ((clicks & RECOMP_MOUSE_LEFT) && have) {
+        tab = fp_ui_pause_tab(root, x, y);
+        if (tab)
+            recomp_bindings_press((unsigned)port, tab < 0 ? "dpad_left" : "dpad_right", 80);
+    }
+    if (hold_item && (held & RECOMP_MOUSE_LEFT) && item == hold_item)
+        recomp_bindings_press((unsigned)port, hold_dir, 60);
+    else if (!(clicks & RECOMP_MOUSE_LEFT))
+        hold_item = 0;
     if (clicks & RECOMP_MOUSE_RIGHT)
         recomp_bindings_press((unsigned)port, "b", 80);
-    /* The wheel, a notch a press: one at a time, so the menu sees each. */
+    /* The wheel, a notch a press: one at a time, so the menu sees each. Over
+     * a value it turns the value (up more), elsewhere it moves the
+     * selection. */
     wheel_left += wheel;
     if (wheel_left > 8) wheel_left = 8;
     if (wheel_left < -8) wheel_left = -8;
     {
         static long last_press;
         if (wheel_left && now - last_press >= 120) {
-            recomp_bindings_press((unsigned)port, wheel_left > 0 ? "dpad_up" : "dpad_down", 60);
+            const char *dir = value ? (wheel_left > 0 ? "dpad_right" : "dpad_left")
+                                    : (wheel_left > 0 ? "dpad_up" : "dpad_down");
+            recomp_bindings_press((unsigned)port, dir, 60);
             wheel_left += wheel_left > 0 ? -1 : 1;
             last_press = now;
         }
@@ -1032,6 +1290,7 @@ void sub_0025CE80(void)
 
     fp_poke();
     fp_apply_fov();
+    fp_apply_weapon_fov();
     sub_0025CE80_gen();
     g_fp_look_tick = (long)(clock() * 1000 / CLOCKS_PER_SEC);
     fp_mouse_aim(look_va);
@@ -1098,6 +1357,7 @@ void fp_title_setup(void)
     recomp_prompts_icon(0x1C76AFDDu, "x", 0x3A6CE0u);
     recomp_prompts_icon(0xCFBE7E42u, "y", 0xE8A020u);
     recomp_fov_support(55.0);               /* the camera's own, every level seen */
+    recomp_weapon_fov_support(45.0);        /* the held weapon's, at that view */
     xbox_D3D8SetTitleAnyAspect(1);          /* fp_aspect_follow: 21:9 and the rest */
     /* Frame interpolation: the projection at c60-c63, then the model-view
      * (c64), the projection times it (c68, which most programs draw with)

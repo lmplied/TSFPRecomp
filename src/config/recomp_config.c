@@ -208,6 +208,7 @@ void recomp_settings_defaults(RecompSettings *s)
     s->prompts           = 0;
     s->skip_intro        = 0;
     s->fov               = 0.0;
+    s->weapon_fov        = 0.0;
     snprintf(s->frame_cap, sizeof s->frame_cap, "adaptive");
 }
 
@@ -282,6 +283,12 @@ int recomp_settings_read(const char *path, RecompSettings *s)
             double d = atof(v);
             s->fov = d <= 0.0 ? 0.0 : (d < RECOMP_FOV_MIN ? RECOMP_FOV_MIN
                                      : (d > RECOMP_FOV_MAX ? RECOMP_FOV_MAX : d));
+        }
+        if ((v = from_table("weapon_fov")) != NULL) {
+            double d = atof(v);
+            s->weapon_fov = d <= 0.0 ? 0.0
+                          : (d < RECOMP_WEAPON_FOV_MIN ? RECOMP_WEAPON_FOV_MIN
+                          : (d > RECOMP_WEAPON_FOV_MAX ? RECOMP_WEAPON_FOV_MAX : d));
         }
         if ((v = from_table("game_dir")) != NULL)
             snprintf(s->game_dir, sizeof s->game_dir, "%s", v);
@@ -439,13 +446,18 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "# set its camera.                                         [RECOMP_FOV]\n"
         "fov = %g\n"
         "\n"
+        "# The held weapon's field of view, the same way, 30 to 90; 0 draws it\n"
+        "# as the game does at its own view, however wide the view above is.\n"
+        "# Only for a game whose project can set it.        [RECOMP_WEAPON_FOV]\n"
+        "weapon_fov = %g\n"
+        "\n"
         "# Where the game's files are, if they are not beside the executable.\n"
         "#                                                   [RECOMP_GAME_DIR]\n",
         s->brightness >= 0.5 ? s->brightness : 1.0, s->fxaa ? 1 : 0, s->mute_unfocused,
         s->pause_unfocused, s->volume < 0 ? 0 : (s->volume > 100 ? 100 : s->volume),
         s->prompts == 1 ? "keyboard" : s->prompts == 2 ? "controller" : "auto",
         s->wide_fill, s->skip_intro,
-        s->fov > 0.0 ? s->fov : 0.0);
+        s->fov > 0.0 ? s->fov : 0.0, s->weapon_fov > 0.0 ? s->weapon_fov : 0.0);
 
     if (s->game_dir[0])
         fprintf(f, "game_dir = %s\n", s->game_dir);
@@ -507,6 +519,35 @@ double recomp_fov(void)
         recomp_fov_set(v && *v ? atof(v) : 0.0);
     }
     return g_fov;
+}
+
+static double g_weapon_fov_game;               /* 0: the title cannot set it */
+static volatile double g_weapon_fov = -1.0;    /* -1 until read from the settings */
+
+void recomp_weapon_fov_support(double game_degrees)
+{
+    g_weapon_fov_game = game_degrees > 0.0 ? game_degrees : 0.0;
+}
+
+double recomp_weapon_fov_game(void)
+{
+    return g_weapon_fov_game;
+}
+
+void recomp_weapon_fov_set(double degrees)
+{
+    g_weapon_fov = degrees <= 0.0 ? 0.0
+                 : (degrees < RECOMP_WEAPON_FOV_MIN ? RECOMP_WEAPON_FOV_MIN
+                 : (degrees > RECOMP_WEAPON_FOV_MAX ? RECOMP_WEAPON_FOV_MAX : degrees));
+}
+
+double recomp_weapon_fov(void)
+{
+    if (g_weapon_fov < 0.0) {
+        const char *v = recomp_config_lookup("RECOMP_WEAPON_FOV", "weapon_fov");
+        recomp_weapon_fov_set(v && *v ? atof(v) : 0.0);
+    }
+    return g_weapon_fov;
 }
 
 /* ------------------------------------------------------------ bindings */

@@ -141,6 +141,8 @@ int main(void)
         out.fxaa              = 1;
         out.prompts           = 2;
         out.skip_intro        = 1;
+        out.fov               = 75.0;
+        out.weapon_fov        = 60.0;
         snprintf(out.frame_cap, sizeof out.frame_cap, "60");
         snprintf(out.game_dir, sizeof out.game_dir, "D:\\games\\ts2");
 
@@ -159,6 +161,8 @@ int main(void)
         check_int(back.fxaa, 1, "round trip: edge smoothing");
         check_int(back.prompts, 2, "round trip: button prompts");
         check_int(back.skip_intro, 1, "round trip: skip intro");
+        check(back.fov > 74.9 && back.fov < 75.1, "round trip: field of view");
+        check(back.weapon_fov > 59.9 && back.weapon_fov < 60.1, "round trip: weapon field of view");
         check_str(back.frame_cap, "60", "round trip: frame cap");
         check_str(back.game_dir, "D:\\games\\ts2", "round trip: game dir");
 
@@ -173,14 +177,17 @@ int main(void)
         check_int(back.skip_intro, 0, "partial: intros play by default");
         check_int(back.pause_unfocused, 1, "partial: pausing in the background is on by default");
         check_int(back.volume, 100, "partial: full volume by default");
+        check(back.weapon_fov == 0.0, "partial: the weapon is the game's own by default");
 
         /* Out-of-range values are clamped, not taken literally: a hand
          * edited 99 must not ask for a 99x render. */
-        write_file(rt, "resolution_scale = 99\nanisotropy = 0\nbrightness = 9\n");
+        write_file(rt, "resolution_scale = 99\nanisotropy = 0\nbrightness = 9\n"
+                       "weapon_fov = 10\n");
         check(recomp_settings_read(rt, &back) != 0, "clamped file read");
         check_int(back.resolution_scale, 8, "clamp: scale to 8");
         check_int(back.anisotropy, 1, "clamp: anisotropy to 1");
         check(back.brightness == 2.0, "clamp: brightness to 2");
+        check(back.weapon_fov == RECOMP_WEAPON_FOV_MIN, "clamp: weapon field of view to 30");
 
         remove(rt);
     }

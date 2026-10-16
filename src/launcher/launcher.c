@@ -49,20 +49,41 @@ typedef struct Row {
     const char *help;
     RowKind     kind;
     int         lo, hi;                 /* ROW_INT */
+    int         step;                   /* ROW_INT: 0 is 1 */
     const char *const *choices;         /* ROW_CHOICE, NULL terminated */
+    const char *const *labels;          /* ROW_CHOICE: what each choice is called */
     int        *ival;                   /* ROW_INT / ROW_BOOL / ROW_CHOICE index */
     char       *text;                   /* ROW_TEXT */
     size_t      text_len;
 } Row;
 
 static const char *const k_frame_caps[] = { "adaptive", "60", "30", "0", NULL };
+static const char *const k_frame_cap_labels[] = {
+    "Adaptive (as the console)", "60 frames a second", "30 frames a second", "Uncapped", NULL
+};
+static const char *const k_wide_choices[] = { "off", "16:9", "fill", NULL };
+static const char *const k_wide_labels[] = { "Off", "16:9", "Fill the window", NULL };
+static const char *const k_prompt_choices[] = { "auto", "keyboard", "controller", NULL };
+static const char *const k_prompt_labels[] = {
+    "Automatic", "Keyboard and mouse", "Controller", NULL
+};
 
 static RecompSettings g_settings;
 static int            g_frame_cap_index;   /* into k_frame_caps */
 static int            g_wide_camera;       /* hor_plus as a switch, see below */
+/* Settings shown in other terms than the file's, as the in-game menu shows
+ * them: widescreen and filling the window as one three-way choice, the field
+ * of view in whole degrees (the game's own when it is that), brightness as a
+ * percentage. settings_load and settings_save translate. */
+static int            g_wide_index;
+static int            g_fov_degrees;
+static int            g_weapon_fov_degrees;
+static int            g_brightness_pct;
 
-static Row  g_video_rows[12];
-static int  g_video_count;
+/* The pages that are lists of settings, each its own list. */
+enum { RT_VIDEO, RT_FRAMES, RT_GENERAL, RT_COUNT };
+static Row  g_rows[RT_COUNT][12];
+static int  g_row_count[RT_COUNT];
 
 /* ---- input ---- */
 
@@ -95,26 +116,25 @@ static int        g_sel;
 #define BIND_ROW_RESET  6
 #define BIND_TOTAL_ROWS (BIND_HEAD_ROWS + BIND_CONTROLS)
 
-static const char *frame_cap_label(int i)
-{
-    switch (i) {
-    case 0: return "Adaptive (as the console)";
-    case 1: return "60 frames a second";
-    case 2: return "30 frames a second";
-    default: return "Uncapped";
-    }
-}
-
 static void build_rows(void)
 {
-    Row *r = g_video_rows;
+    Row *r = g_rows[RT_VIDEO];
 
     r->label = "Resolution";
     r->help  = "Render larger than the console, then filter back down. Costs little.";
     r->kind  = ROW_INT; r->lo = 1; r->hi = 8; r->ival = &g_settings.resolution_scale;
     r++;
 
-#if defined(LAUNCHER_NATIVE_WIDESCREEN)
+#if defined(LAUNCHER_NATIVE_WIDESCREEN) && defined(LAUNCHER_ANY_ASPECT)
+    /* recomp_add_launcher(... NATIVE_WIDESCREEN ANY_ASPECT): the game widens
+     * itself, to 16:9 or to whatever shape the window is. */
+    r->label = "Widescreen";
+    r->help  = "The game's own widescreen mode: the view, the HUD and the menus all"
+               " widen. Fill the window draws any shape, 21:9 included.";
+    r->kind  = ROW_CHOICE; r->choices = k_wide_choices; r->labels = k_wide_labels;
+    r->ival  = &g_wide_index;
+    r++;
+#elif defined(LAUNCHER_NATIVE_WIDESCREEN)
     /* recomp_add_launcher(... NATIVE_WIDESCREEN): the game widens itself. */
     r->label = "Widescreen";
     r->help  = "16:9, the game's own widescreen mode: the view, the HUD and the"
@@ -136,25 +156,59 @@ static void build_rows(void)
     r++;
 #endif
 
+#ifdef LAUNCHER_FOV
+    /* recomp_add_launcher(... FOV <degrees>): a title whose camera angle the
+     * runtime can set, and the angle it has of its own. */
+    r->label = "Field of view";
+    r->help  = "How much of the world the view takes in, top to bottom. Wider shows"
+               " more at the edges.";
+    r->kind  = ROW_INT; r->lo = 40; r->hi = 90; r->step = 5; r->ival = &g_fov_degrees;
+    r++;
+#endif
+#ifdef LAUNCHER_WEAPON_FOV
+    /* recomp_add_launcher(... WEAPON_FOV <degrees>): the held weapon's angle,
+     * which the runtime can set apart from the view's. */
+    r->label = "Weapon field of view";
+    r->help  = "How wide the weapon in your hands is drawn, whatever the view's: wider"
+               " shows it smaller and further off.";
+    r->kind  = ROW_INT; r->lo = 30; r->hi = 90; r->step = 5; r->ival = &g_weapon_fov_degrees;
+    r++;
+#endif
+
+    r->label = "Brightness";
+    r->help  = "Above 100% lifts the shadows, below deepens them. 100% is the game"
+               " exactly as drawn.";
+    r->kind  = ROW_INT; r->lo = 50; r->hi = 200; r->step = 5; r->ival = &g_brightness_pct;
+    r++;
+
+    r->label = "Edge smoothing (FXAA)";
+    r->help  = "Smooth jagged edges, cheaply. For a low resolution: at 4x and above"
+               " the supersampling has already smoothed them.";
+    r->kind  = ROW_BOOL; r->ival = &g_settings.fxaa;
+    r++;
+
     r->label = "Texture sharpness";
     r->help  = "Sharpen textures seen at a glancing angle: floors, walls, roads.";
     r->kind  = ROW_INT; r->lo = 1; r->hi = 16; r->ival = &g_settings.anisotropy;
     r++;
 
+    r->label = "Fullscreen";
+    r->help  = "Fill the screen, without a window frame. Alt+Enter switches in game.";
+    r->kind  = ROW_BOOL; r->ival = &g_settings.fullscreen;
+    r++;
+    g_row_count[RT_VIDEO] = (int)(r - g_rows[RT_VIDEO]);
+
+    r = g_rows[RT_FRAMES];
     r->label = "Frame rate";
     r->help  = "Adaptive paces the game the way the console did (nothing to do with"
                " G-SYNC or FreeSync). F10 changes it while playing.";
-    r->kind  = ROW_CHOICE; r->choices = k_frame_caps; r->ival = &g_frame_cap_index;
+    r->kind  = ROW_CHOICE; r->choices = k_frame_caps; r->labels = k_frame_cap_labels;
+    r->ival  = &g_frame_cap_index;
     r++;
 
     r->label = "Show frame rate";
     r->help  = "Start with the counter on screen. F9 toggles it while playing.";
     r->kind  = ROW_BOOL; r->ival = &g_settings.fps_overlay;
-    r++;
-
-    r->label = "Fullscreen";
-    r->help  = "Fill the screen, without a window frame. Alt+Enter switches in game.";
-    r->kind  = ROW_BOOL; r->ival = &g_settings.fullscreen;
     r++;
 
     r->label = "G-SYNC / FreeSync";
@@ -169,8 +223,49 @@ static void build_rows(void)
                " input delay.";
     r->kind  = ROW_INT; r->lo = 1; r->hi = 4; r->ival = &g_settings.frame_interp;
     r++;
+    g_row_count[RT_FRAMES] = (int)(r - g_rows[RT_FRAMES]);
 
-    g_video_count = (int)(r - g_video_rows);
+    r = g_rows[RT_GENERAL];
+    r->label = "Volume";
+    r->help  = "Everything the game plays, music, voices and effects together.";
+    r->kind  = ROW_INT; r->lo = 0; r->hi = 100; r->step = 5; r->ival = &g_settings.volume;
+    r++;
+
+    r->label = "Mute in the background";
+    r->help  = "Silence the game while another window has the focus.";
+    r->kind  = ROW_BOOL; r->ival = &g_settings.mute_unfocused;
+    r++;
+
+#ifdef LAUNCHER_PAUSE_UNFOCUSED
+    /* recomp_add_launcher(... PAUSE_UNFOCUSED): the title project says how
+     * the game pauses (recomp_bindings_pause_on_focus_loss). */
+    r->label = "Pause in the background";
+    r->help  = "Alt+Tab during play pauses the game, so it is waiting at the pause"
+               " menu when you come back.";
+    r->kind  = ROW_BOOL; r->ival = &g_settings.pause_unfocused;
+    r++;
+#endif
+
+#ifdef LAUNCHER_PROMPTS
+    /* recomp_add_launcher(... PROMPTS): the title project names its button
+     * icons (recomp_prompts_icon). */
+    r->label = "Button prompts";
+    r->help  = "The game's button icons as the keys bound to them. Automatic"
+               " follows whichever you used last, keyboard and mouse or a pad.";
+    r->kind  = ROW_CHOICE; r->choices = k_prompt_choices; r->labels = k_prompt_labels;
+    r->ival  = &g_settings.prompts;
+    r++;
+#endif
+
+#ifdef LAUNCHER_SKIP_INTRO
+    /* recomp_add_launcher(... SKIP_INTRO): the title project names its logo
+     * videos (xmv_set_intro_videos). */
+    r->label = "Skip intro videos";
+    r->help  = "Skip the logo videos before the title screen.";
+    r->kind  = ROW_BOOL; r->ival = &g_settings.skip_intro;
+    r++;
+#endif
+    g_row_count[RT_GENERAL] = (int)(r - g_rows[RT_GENERAL]);
 }
 
 static void row_value(const Row *r, char *out, size_t n)
@@ -183,6 +278,18 @@ static void row_value(const Row *r, char *out, size_t n)
         if (r->ival == &g_settings.resolution_scale)
             snprintf(out, n, *r->ival == 1 ? "Console (640x480)" : "%dx (%dx%d)",
                      *r->ival, 640 * *r->ival, 480 * *r->ival);
+        else if (r->ival == &g_brightness_pct || r->ival == &g_settings.volume)
+            snprintf(out, n, "%d%%", *r->ival);
+#ifdef LAUNCHER_FOV
+        else if (r->ival == &g_fov_degrees)
+            snprintf(out, n, *r->ival == LAUNCHER_FOV ? "%d\xB0  (the game's own)" : "%d\xB0",
+                     *r->ival);
+#endif
+#ifdef LAUNCHER_WEAPON_FOV
+        else if (r->ival == &g_weapon_fov_degrees)
+            snprintf(out, n, *r->ival == LAUNCHER_WEAPON_FOV ? "%d\xB0  (the game's own)"
+                                                              : "%d\xB0", *r->ival);
+#endif
         else if (*r->ival == 1)
             snprintf(out, n, "Off");
         else if (r->ival == &g_settings.frame_interp)
@@ -191,7 +298,7 @@ static void row_value(const Row *r, char *out, size_t n)
             snprintf(out, n, "%dx", *r->ival);
         break;
     case ROW_CHOICE:
-        snprintf(out, n, "%s", frame_cap_label(*r->ival));
+        snprintf(out, n, "%s", r->labels ? r->labels[*r->ival] : r->choices[*r->ival]);
         break;
     default:
         snprintf(out, n, "%s", r->text && r->text[0] ? r->text : "Beside the game");
@@ -206,7 +313,7 @@ static void row_move(Row *r, int delta)
         *r->ival = !*r->ival;
         break;
     case ROW_INT:
-        *r->ival += delta;
+        *r->ival += delta * (r->step ? r->step : 1);
         if (*r->ival < r->lo) *r->ival = r->lo;
         if (*r->ival > r->hi) *r->ival = r->hi;
         break;
@@ -425,6 +532,17 @@ static void settings_load(void)
         recomp_settings_read(path, &g_settings);
 
     g_wide_camera = g_settings.hor_plus > 0.01;
+    g_wide_index = !g_settings.widescreen ? 0 : g_settings.wide_fill ? 2 : 1;
+    g_brightness_pct = (int)(g_settings.brightness * 100.0 + 0.5);
+    if (g_brightness_pct < 50) g_brightness_pct = 50;
+    if (g_brightness_pct > 200) g_brightness_pct = 200;
+#ifdef LAUNCHER_FOV
+    g_fov_degrees = g_settings.fov > 0.0 ? (int)(g_settings.fov + 0.5) : LAUNCHER_FOV;
+#endif
+#ifdef LAUNCHER_WEAPON_FOV
+    g_weapon_fov_degrees = g_settings.weapon_fov > 0.0 ? (int)(g_settings.weapon_fov + 0.5)
+                                                       : LAUNCHER_WEAPON_FOV;
+#endif
     g_frame_cap_index = 0;
     {
         int i;
@@ -487,6 +605,20 @@ static int settings_save(void)
 #endif
 #ifdef LAUNCHER_NATIVE_WIDESCREEN
     g_settings.hor_plus = 0.0;          /* the game widens its own camera */
+#endif
+#if defined(LAUNCHER_NATIVE_WIDESCREEN) && defined(LAUNCHER_ANY_ASPECT)
+    g_settings.widescreen = g_wide_index > 0;
+    g_settings.wide_fill = g_wide_index == 2;
+#endif
+    g_settings.brightness = g_brightness_pct / 100.0;
+#ifdef LAUNCHER_FOV
+    /* The game's own angle is written as 0, as the in-game menu does, so a
+     * title whose own angle changes is not held at this one. */
+    g_settings.fov = g_fov_degrees == LAUNCHER_FOV ? 0.0 : (double)g_fov_degrees;
+#endif
+#ifdef LAUNCHER_WEAPON_FOV
+    g_settings.weapon_fov = g_weapon_fov_degrees == LAUNCHER_WEAPON_FOV
+                          ? 0.0 : (double)g_weapon_fov_degrees;
 #endif
     snprintf(g_settings.frame_cap, sizeof g_settings.frame_cap, "%s",
              k_frame_caps[g_frame_cap_index]);
@@ -606,8 +738,10 @@ static int pad_poll(int *dx, int *dy, int *accept, int *cancel, int *tab)
 
 /* ----------------------------------------------------------------- state */
 
-typedef enum { TAB_VIDEO, TAB_INPUT, TAB_ABOUT, TAB_COUNT } Tab;
-static const char *const k_tab_names[TAB_COUNT] = { "VIDEO", "INPUT", "ABOUT" };
+typedef enum { TAB_VIDEO, TAB_FRAMES, TAB_INPUT, TAB_GENERAL, TAB_ABOUT, TAB_COUNT } Tab;
+static const char *const k_tab_names[TAB_COUNT] = {
+    "VIDEO", "FRAME RATE", "INPUT", "GENERAL", "ABOUT"
+};
 
 static Tab    g_tab;
 static Tab    g_tab_from;
@@ -677,9 +811,19 @@ static void set_tab(Tab t)
     g_sel = 0;
 }
 
+/* The list of settings the current tab shows, or -1 for the tabs that are
+ * not one (Input, About). */
+static int row_tab(void)
+{
+    return g_tab == TAB_VIDEO ? RT_VIDEO : g_tab == TAB_FRAMES ? RT_FRAMES
+         : g_tab == TAB_GENERAL ? RT_GENERAL : -1;
+}
+
 static void rows_for_tab(void)
 {
-    g_rows_on_tab = (g_tab == TAB_VIDEO) ? g_video_count
+    int rt = row_tab();
+
+    g_rows_on_tab = rt >= 0 ? g_row_count[rt]
                   : (g_tab == TAB_INPUT) ? BIND_ROWS_VISIBLE : 0;
     if (g_sel >= g_rows_on_tab)
         g_sel = g_rows_on_tab ? g_rows_on_tab - 1 : 0;
@@ -820,8 +964,8 @@ static void nav(int dx, int dy, int accept, int cancel, int tabdelta)
 
     if (dy && g_rows_on_tab)
         g_sel = (g_sel + dy + g_rows_on_tab) % g_rows_on_tab;
-    if (dx && g_tab == TAB_VIDEO && g_rows_on_tab)
-        row_move(&g_video_rows[g_sel], dx);
+    if (dx && row_tab() >= 0 && g_rows_on_tab)
+        row_move(&g_rows[row_tab()][g_sel], dx);
     if (accept)
         do_play();
     if (cancel)
@@ -855,9 +999,12 @@ static void draw(void)
         theme_tab_underline(a, b, g_tab_t);
     }
 
-    if (g_tab == TAB_VIDEO) {
-        for (i = 0; i < g_video_count; i++) {
-            Row *row = &g_video_rows[i];
+    if (row_tab() >= 0) {
+        Row *rows = g_rows[row_tab()];
+        int count = g_row_count[row_tab()];
+
+        for (i = 0; i < count; i++) {
+            Row *row = &rows[i];
             ThemeRect rr = row_rect(i), lr, vr, ar;
             double lit = (i == g_sel) ? 1.0 : 0.0;
 
@@ -877,10 +1024,10 @@ static void draw(void)
         }
 
         /* The selected row's explanation, under the list. */
-        r.x = 62; r.y = 168 + g_video_count * 62 + 10;
+        r.x = 62; r.y = 168 + count * 62 + 10;
         r.w = g_cw - 124; r.h = 46;
-        if (g_sel < g_video_count)
-            theme_text(r, g_video_rows[g_sel].help, 11, 400, THEME_TEXT_DIM, THEME_LEFT);
+        if (g_sel < count)
+            theme_text_wrapped(r, rows[g_sel].help, 11, THEME_TEXT_DIM);
     } else if (g_tab == TAB_INPUT) {
         BindPort *bp = &g_bind.port[g_bind_port];
         char line[160];
@@ -1124,9 +1271,9 @@ static int hit_row(int mx, int my)
 {
     int i;
 
-    if (g_tab != TAB_VIDEO)
+    if (row_tab() < 0)
         return -1;
-    for (i = 0; i < g_video_count; i++) {
+    for (i = 0; i < g_row_count[row_tab()]; i++) {
         ThemeRect r = row_rect(i);
 
         if (mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h)
@@ -1234,7 +1381,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             g_sel = i;
             /* Back or forward on the arrows; anywhere else on the row steps
              * it forward, which is how a toggle is clicked. */
-            row_move(&g_video_rows[i], dir ? dir : 1);
+            row_move(&g_rows[row_tab()][i], dir ? dir : 1);
         }
         if (hit_play(mx, my))
             do_play();

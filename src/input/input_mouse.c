@@ -51,6 +51,7 @@ static volatile LONG64 g_direct_until;     /* now_ms() the direct claim runs out
 static volatile LONG64 g_pointer_until;    /* now_ms() the title's pointer runs out */
 static volatile LONG g_pointer_took;       /* 0 not pointing, 2 pointing, 1 and took a capture */
 static volatile LONG g_pointer_clicks;     /* buttons pressed while pointing, unread */
+static volatile LONG g_pointer_held;       /* buttons pressed while pointing, still down */
 static volatile LONG g_pointer_wheel;      /* wheel while pointing, unread (120 a notch) */
 static volatile LONG g_take_dx, g_take_dy;  /* counts since the last take */
 static volatile LONG g_focused = 1;        /* until a window is attached */
@@ -387,6 +388,7 @@ void recomp_mouse_pointer_mode(int on)
     }
     if (!pointing()) {
         InterlockedExchange(&g_pointer_clicks, 0);   /* nothing from before it began */
+        InterlockedExchange(&g_pointer_held, 0);
         InterlockedExchange(&g_pointer_wheel, 0);
         InterlockedExchange64(&g_pointer_until, now_ms() + POINTER_MS);
         refresh_cursor();
@@ -431,6 +433,11 @@ unsigned recomp_mouse_pointer_clicks(int *wheel)
     if (w % 120)
         InterlockedExchangeAdd(&g_pointer_wheel, w % 120);   /* part of a notch stays */
     return (unsigned)InterlockedExchange(&g_pointer_clicks, 0);
+}
+
+unsigned recomp_mouse_pointer_held(void)
+{
+    return pointing() ? (unsigned)g_pointer_held : 0u;
 }
 
 /* ---- the window side ---------------------------------------------------- */
@@ -525,11 +532,17 @@ static void read_raw(HRAWINPUT handle)
     /* Pointing at a menu: the presses and the wheel are the title's to read
      * (recomp_mouse_pointer_clicks), and nothing reaches the bindings. */
     if (!g_captured && pointing() && g_focused && !g_suspended) {
-        if (down)
+        if (down) {
             InterlockedOr(&g_pointer_clicks, (LONG)down);
+            InterlockedOr(&g_pointer_held, (LONG)down);
+        }
         if (wheel)
             InterlockedExchangeAdd(&g_pointer_wheel, wheel);
     }
+    /* A release counts wherever it happens, or a button let go outside the
+     * window would stay held. */
+    if (up)
+        InterlockedAnd(&g_pointer_held, ~(LONG)up);
     recomp_mouse_feed(dx, dy, down, up, wheel);
 }
 
@@ -651,5 +664,6 @@ void recomp_mouse_pointer_mode(int on) { (void)on; }
 int  recomp_mouse_pointing(void) { return 0; }
 int  recomp_mouse_pointer(float *x, float *y) { (void)x; (void)y; return 0; }
 unsigned recomp_mouse_pointer_clicks(int *wheel) { if (wheel) *wheel = 0; return 0; }
+unsigned recomp_mouse_pointer_held(void) { return 0; }
 
 #endif
