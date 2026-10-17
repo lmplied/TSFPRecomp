@@ -52,10 +52,31 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 #define XBOX_BYTES_PER_SECTOR       512u
 #define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
 
+/* Two machines in lockstep (xbox_LockstepClockOn) must be told the same about
+ * their files as about the time: a save's dates and the space left on the
+ * drive come from each host's own disk, and a title that shows them, sorts by
+ * them or decides by them would part the two. Under the lockstep clock every
+ * file is dated 1 January 2005, as the clock starts (kernel_hal.c), and the
+ * drive has the space a fresh console's has. */
+int xbox_LockstepClockOn(void);
+
+#define LOCKSTEP_FILE_TIME   127491552000000000LL
+#define LOCKSTEP_TOTAL_UNITS 1048576
+#define LOCKSTEP_FREE_UNITS  524288
+
 /* ======================================================================== */
 #if defined(_WIN32)
 /* ====================  Win32 backend  =================================== */
 /* ======================================================================== */
+
+static void lockstep_file_times(LARGE_INTEGER *created, LARGE_INTEGER *accessed,
+                                LARGE_INTEGER *written, LARGE_INTEGER *changed)
+{
+    if (!xbox_LockstepClockOn())
+        return;
+    created->QuadPart = accessed->QuadPart = LOCKSTEP_FILE_TIME;
+    written->QuadPart = changed->QuadPart = LOCKSTEP_FILE_TIME;
+}
 
 /* Convert Xbox create disposition to Win32 */
 static DWORD xbox_disposition_to_win32(ULONG Disposition)
@@ -405,6 +426,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             info->LastWriteTime.LowPart   = fi.ftLastWriteTime.dwLowDateTime;
             info->LastWriteTime.HighPart  = fi.ftLastWriteTime.dwHighDateTime;
             info->ChangeTime = info->LastWriteTime;
+            lockstep_file_times(&info->CreationTime, &info->LastAccessTime,
+                                &info->LastWriteTime, &info->ChangeTime);
             info->FileAttributes = fi.dwFileAttributes;
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_BASIC_INFORMATION);
@@ -448,6 +471,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             info->LastWriteTime.LowPart   = fi.ftLastWriteTime.dwLowDateTime;
             info->LastWriteTime.HighPart  = fi.ftLastWriteTime.dwHighDateTime;
             info->ChangeTime = info->LastWriteTime;
+            lockstep_file_times(&info->CreationTime, &info->LastAccessTime,
+                                &info->LastWriteTime, &info->ChangeTime);
             info->EndOfFile.QuadPart = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
             info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
             info->FileAttributes = fi.dwFileAttributes;
@@ -582,7 +607,8 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
-            if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
+            if (!xbox_LockstepClockOn() &&
+                GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
@@ -591,8 +617,8 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             } else {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
-                info->TotalAllocationUnits.QuadPart = 1048576;
-                info->AvailableAllocationUnits.QuadPart = 524288;
+                info->TotalAllocationUnits.QuadPart = LOCKSTEP_TOTAL_UNITS;
+                info->AvailableAllocationUnits.QuadPart = LOCKSTEP_FREE_UNITS;
             }
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_FS_SIZE_INFORMATION);
@@ -641,6 +667,8 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     FileInformation->LastWriteTime.LowPart   = fad.ftLastWriteTime.dwLowDateTime;
     FileInformation->LastWriteTime.HighPart  = fad.ftLastWriteTime.dwHighDateTime;
     FileInformation->ChangeTime = FileInformation->LastWriteTime;
+    lockstep_file_times(&FileInformation->CreationTime, &FileInformation->LastAccessTime,
+                        &FileInformation->LastWriteTime, &FileInformation->ChangeTime);
     FileInformation->EndOfFile.QuadPart = ((LONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
     FileInformation->AllocationSize.QuadPart = (FileInformation->EndOfFile.QuadPart + 4095) & ~4095LL;
     FileInformation->FileAttributes = fad.dwFileAttributes;
@@ -774,6 +802,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry->LastWriteTime.LowPart  = ctx->find_data.ftLastWriteTime.dwLowDateTime;
     entry->LastWriteTime.HighPart = ctx->find_data.ftLastWriteTime.dwHighDateTime;
     entry->ChangeTime = entry->LastWriteTime;
+    lockstep_file_times(&entry->CreationTime, &entry->LastAccessTime,
+                        &entry->LastWriteTime, &entry->ChangeTime);
     entry->EndOfFile.QuadPart = ((LONGLONG)ctx->find_data.nFileSizeHigh << 32) | ctx->find_data.nFileSizeLow;
     entry->AllocationSize.QuadPart = (entry->EndOfFile.QuadPart + 4095) & ~4095LL;
     entry->FileAttributes = ctx->find_data.dwFileAttributes;
@@ -1135,8 +1165,8 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
                 info->TotalAllocationUnits.QuadPart = total / cs;
                 info->AvailableAllocationUnits.QuadPart = avail / cs;
             } else {
-                info->TotalAllocationUnits.QuadPart = 1048576;
-                info->AvailableAllocationUnits.QuadPart = 524288;
+                info->TotalAllocationUnits.QuadPart = LOCKSTEP_TOTAL_UNITS;
+                info->AvailableAllocationUnits.QuadPart = LOCKSTEP_FREE_UNITS;
             }
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_FS_SIZE_INFORMATION);

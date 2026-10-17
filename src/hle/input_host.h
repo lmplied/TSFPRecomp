@@ -26,4 +26,13 @@ bool recomp_input_host_sample_port(unsigned port, RecompInputGamepad *gamepad);
 /* Port 0, for callers that only ever had one pad. */
 bool recomp_input_host_sample(RecompInputGamepad *gamepad);
 
+/* The ports RECOMP_INPUT_SEQ presses on (steps written p2.a and so on), as
+ * bits: those read as a pad plugged in, and only the script drives them. */
+unsigned recomp_input_seq_ports(void);
+
+/* This machine's player's controls -- `port`'s devices (0, or 1 for a
+ * second copy of the game on the same PC: hle_netplay.c) and port 0's
+ * script -- as netplay sends them, whichever game port that player plays. */
+void recomp_input_host_sample_local(unsigned port, RecompInputGamepad *gamepad);
+
 #endif

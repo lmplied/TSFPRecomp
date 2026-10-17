@@ -205,6 +205,8 @@ typedef struct {
     char label[48];
 } Controller;
 
+static int pad_of(const Controller *c, int port);
+
 static Controller g_ctl[PORTS];
 /* Where a load builds the ports before they replace g_ctl in one copy:
  * a title polling its pads during a reload (the in-game menu rebinding a
@@ -1117,8 +1119,8 @@ static void say_first_press(unsigned port, const char *control)
         char name[64];
         said[port] = 1;
         name[0] = '\0';
-        if (g_ctl[port].device == DEV_PAD)
-            recomp_pad_name(g_ctl[port].pad, name, sizeof name);
+        if (pad_of(&g_ctl[port], (int)port) >= 0)
+            recomp_pad_name(pad_of(&g_ctl[port], (int)port), name, sizeof name);
         fprintf(stderr, "[INPUT] port %u first press: %s (%s%s%s)\n", port + 1,
                 control, g_ctl[port].label, name[0] ? ": " : "", name);
         fflush(stderr);
@@ -1187,6 +1189,39 @@ int recomp_bindings_pause_unfocused(void)
     if (g_pause_setting < 0)
         g_pause_setting = recomp_config_bool("RECOMP_PAUSE_UNFOCUSED", "pause_unfocused", 1);
     return g_pause_setting != 0;
+}
+
+/* keyboard_alone: the keyboard and mouse are player 1 on their own, and the
+ * pads start at player 2 -- a friend on Steam Remote Play or Parsec, whose
+ * pad is this machine's first, joins as player 2 rather than steering
+ * player 1 beside the keyboard. -1 until read. */
+static volatile int g_kb_alone = -1;
+
+void recomp_bindings_set_keyboard_alone(int on)
+{
+    g_kb_alone = on ? 1 : 0;
+}
+
+int recomp_bindings_keyboard_alone(void)
+{
+    if (g_kb_alone < 0)
+        g_kb_alone = recomp_config_bool("RECOMP_KEYBOARD_ALONE", "keyboard_alone", 0);
+    return g_kb_alone != 0;
+}
+
+/* The pad slot a port reads, or -1: its own, unless keyboard_alone moves the
+ * pads along by one -- player 1 (with keys or the mouse bound) reads none,
+ * and each later player the pad before the one it names. A port the file
+ * gave the first pad keeps it. */
+static int pad_of(const Controller *c, int port)
+{
+    if (c->device != DEV_PAD)
+        return -1;
+    if (!recomp_bindings_keyboard_alone())
+        return c->pad;
+    if (port == 0)
+        return (c->has_key || c->has_mouse) ? -1 : c->pad;
+    return c->pad > 0 ? c->pad - 1 : c->pad;
 }
 
 int recomp_bindings_pause_available(void)
@@ -1312,8 +1347,8 @@ int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
     memset(&kc, 0, sizeof kc);
     key_cache_tick();
     memset(&pad, 0, sizeof pad);
-    if (c->device == DEV_PAD)
-        have_pad = recomp_pad_read(c->pad, &pad);
+    if (pad_of(c, (int)port) >= 0)
+        have_pad = recomp_pad_read(pad_of(c, (int)port), &pad);
     memset(&ms, 0, sizeof ms);
     if (c->has_mouse) {
         recomp_mouse_velocity((unsigned)c->mouse.window_ms, &ms.vx, &ms.vy);
@@ -1402,9 +1437,9 @@ unsigned recomp_bindings_present_mask(void)
         if (c->device == DEV_KEYBOARD ||
             (c->device == DEV_PAD && (c->has_key || c->has_mouse))) {
             mask |= 1u << i;
-        } else if (c->device == DEV_PAD) {
+        } else if (pad_of(c, i) >= 0) {
             RecompPadState st;
-            if (recomp_pad_read(c->pad, &st))
+            if (recomp_pad_read(pad_of(c, i), &st))
                 mask |= 1u << i;
         }
     }
@@ -1453,6 +1488,6 @@ void recomp_bindings_set_mouse(unsigned port, const RecompMouseSettings *in)
 void recomp_bindings_rumble(unsigned port, unsigned short low, unsigned short high)
 {
     recomp_bindings_init();
-    if (port < PORTS && g_ctl[port].device == DEV_PAD)
-        recomp_pad_rumble(g_ctl[port].pad, low, high);
+    if (port < PORTS && pad_of(&g_ctl[port], (int)port) >= 0)
+        recomp_pad_rumble(pad_of(&g_ctl[port], (int)port), low, high);
 }

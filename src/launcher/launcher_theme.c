@@ -23,6 +23,52 @@ static HBITMAP  g_bmp, g_old;
 static uint32_t *g_px;
 static int      g_w, g_h;
 
+/* The Xbox green, as it always was. */
+static ThemePalette g_pal = {
+    RGB(0x18, 0x1E, 0x12), RGB(0x30, 0x76, 0x23),
+    RGB(0x0A, 0x12, 0x08), RGB(0x22, 0x4E, 0x16),
+    RGB(0x9B, 0xCE, 0x1E), RGB(0x9B, 0xCE, 0x1E),
+    RGB(0xE8, 0xF2, 0xD8), RGB(0x8A, 0x97, 0x7C),
+    0.85,
+};
+
+void theme_set_palette(const ThemePalette *p)
+{
+    if (p)
+        g_pal = *p;
+}
+
+const ThemePalette *theme_palette(void)
+{
+    return &g_pal;
+}
+
+/* a + (b - a) * t, per channel, of two 0xRRGGBB. */
+static COLORREF mix(unsigned a, unsigned b, double t)
+{
+    int ar = (int)(a >> 16) & 0xFF, ag = (int)(a >> 8) & 0xFF, ab = (int)a & 0xFF;
+    int br = (int)(b >> 16) & 0xFF, bg = (int)(b >> 8) & 0xFF, bb = (int)b & 0xFF;
+
+    return RGB((int)(ar + (br - ar) * t), (int)(ag + (bg - ag) * t), (int)(ab + (bb - ab) * t));
+}
+
+void theme_palette_from(ThemePalette *out, unsigned dark, unsigned mid, unsigned ink)
+{
+    out->bg_edge   = mix(0, dark, 0.62);
+    out->bg_glow   = mix(dark, 0xFFFFFF, 0.06);
+    out->panel     = mix(0, dark, 0.55);
+    out->panel_lit = mix(dark, mid, 0.85);
+    out->line      = mix(ink, ink, 0.0);        /* ink itself */
+    out->accent    = out->line;
+    out->text      = out->line;
+    out->text_dim  = mix(ink, mid, 0.42);
+    out->vignette  = 0.5;               /* a coloured ground, not a black one */
+}
+
+#define CH_R(c) ((int)GetRValue(c))
+#define CH_G(c) ((int)GetGValue(c))
+#define CH_B(c) ((int)GetBValue(c))
+
 int theme_begin(int width, int height)
 {
     BITMAPINFO bi;
@@ -115,10 +161,10 @@ void theme_background(double pulse)
             double d = sqrt(dx * dx + dy * dy);
             double a = clamp01(1.0 - d / big);
             double b = clamp01(1.0 - d / small);
-            double v = a * a * 0.22 + b * b * 0.28;
-            int r = (int)(0x18 + v * 0x30);
-            int g = (int)(0x1E + v * 0xB0);
-            int bl = (int)(0x12 + v * 0x22);
+            double v = (a * a * 0.22 + b * b * 0.28) * 2.0;   /* 0..1 */
+            int r = (int)(CH_R(g_pal.bg_edge) + (CH_R(g_pal.bg_glow) - CH_R(g_pal.bg_edge)) * v);
+            int g = (int)(CH_G(g_pal.bg_edge) + (CH_G(g_pal.bg_glow) - CH_G(g_pal.bg_edge)) * v);
+            int bl = (int)(CH_B(g_pal.bg_edge) + (CH_B(g_pal.bg_glow) - CH_B(g_pal.bg_edge)) * v);
 
             g_px[(size_t)y * g_w + x] =
                 ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)bl;
@@ -133,7 +179,7 @@ void theme_background(double pulse)
             double v = clamp01((d - 0.75) / 0.75);
 
             if (v > 0)
-                blend(x, y, 0, 0, 0, v * 0.85);
+                blend(x, y, 0, 0, 0, v * g_pal.vignette);
         }
 }
 
@@ -175,25 +221,26 @@ void theme_panel(ThemeRect r, double lit)
             double d = rrect_distance(x + 0.5, y + 0.5, r, radius);
 
             if (d < 0) {
-                /* Inside: a dark slab that greens as it lights up. */
+                /* Inside: a dark slab that takes the lit colour as it lights. */
                 double edge = clamp01(-d);            /* antialias the rim */
                 double fill = 0.55 + 0.20 * lit;
 
-                blend(x, y, (int)(0x0A + 0x18 * lit),
-                            (int)(0x12 + 0x3C * lit),
-                            (int)(0x08 + 0x0E * lit), fill * edge);
+                blend(x, y, (int)(CH_R(g_pal.panel) + (CH_R(g_pal.panel_lit) - CH_R(g_pal.panel)) * lit),
+                            (int)(CH_G(g_pal.panel) + (CH_G(g_pal.panel_lit) - CH_G(g_pal.panel)) * lit),
+                            (int)(CH_B(g_pal.panel) + (CH_B(g_pal.panel_lit) - CH_B(g_pal.panel)) * lit),
+                      fill * edge);
             } else {
                 /* Outside: the glow, which only exists when lit. */
                 double g = exp(-d / (4.0 + 7.0 * lit)) * (0.07 + 0.42 * lit);
 
-                blend(x, y, 0x9B, 0xCE, 0x1E, g);
+                blend(x, y, CH_R(g_pal.line), CH_G(g_pal.line), CH_B(g_pal.line), g);
             }
             /* The rim itself, brightest right on the boundary. */
             if (d > -2.0 && d < 1.0) {
                 double rim = 1.0 - fabs(d + 0.5) / 1.5;
 
                 if (rim > 0)
-                    blend(x, y, 0x9B, 0xCE, 0x1E, rim * (0.25 + 0.6 * lit));
+                    blend(x, y, CH_R(g_pal.line), CH_G(g_pal.line), CH_B(g_pal.line), rim * (0.25 + 0.6 * lit));
             }
         }
     }
@@ -219,11 +266,11 @@ void theme_tab_underline(ThemeRect from, ThemeRect to, double t)
 
         if (run < 10) edge = run / 10.0;        /* fade the ends */
         if (left < 10) edge = left / 10.0;
-        blend(x, y,     0x9B, 0xCE, 0x1E, 0.95 * edge);
-        blend(x, y + 1, 0x9B, 0xCE, 0x1E, 0.95 * edge);
-        blend(x, y + 2, 0x9B, 0xCE, 0x1E, 0.45 * edge);
-        blend(x, y + 3, 0x9B, 0xCE, 0x1E, 0.18 * edge);
-        blend(x, y - 1, 0x9B, 0xCE, 0x1E, 0.25 * edge);
+        blend(x, y,     CH_R(g_pal.line), CH_G(g_pal.line), CH_B(g_pal.line), 0.95 * edge);
+        blend(x, y + 1, CH_R(g_pal.line), CH_G(g_pal.line), CH_B(g_pal.line), 0.95 * edge);
+        blend(x, y + 2, CH_R(g_pal.line), CH_G(g_pal.line), CH_B(g_pal.line), 0.45 * edge);
+        blend(x, y + 3, CH_R(g_pal.line), CH_G(g_pal.line), CH_B(g_pal.line), 0.18 * edge);
+        blend(x, y - 1, CH_R(g_pal.line), CH_G(g_pal.line), CH_B(g_pal.line), 0.25 * edge);
     }
 }
 
@@ -239,9 +286,9 @@ void theme_arrows(ThemeRect r, int can_left, int can_right, double lit)
 
         for (j = -run / 2; j <= run / 2; j++) {
             if (can_left)
-                blend(r.x + i, cy + j, 0x9B, 0xCE, 0x1E, a);
+                blend(r.x + i, cy + j, CH_R(g_pal.line), CH_G(g_pal.line), CH_B(g_pal.line), a);
             if (can_right)
-                blend(r.x + r.w - 1 - i, cy + j, 0x9B, 0xCE, 0x1E, a);
+                blend(r.x + r.w - 1 - i, cy + j, CH_R(g_pal.line), CH_G(g_pal.line), CH_B(g_pal.line), a);
         }
     }
 }

@@ -71,6 +71,8 @@
 #include "hle_menu.h"        /* the settings menu: F1 */
 #include "hle_screenshot.h"  /* F12 */
 #include "hle_prompts.h"     /* the pad's icons as keys */
+#include "hle_lockstep.h"    /* frames counted, memory hashed */
+#include "hle_netplay.h"     /* an online session's notices */
 
 #ifdef _WIN32
 #include "d3d8_xbox.h"
@@ -268,6 +270,10 @@ static LRESULT CALLBACK shadow_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     case WM_KEYDOWN:
         /* F1 opens the settings menu; while it is open every key is its. */
         if (hle_menu_key((unsigned)wp))
+            return 0;
+        break;
+    case WM_CHAR:
+        if (hle_menu_open() && hle_menu_char((unsigned)wp))
             return 0;
         break;
     case WM_MOUSEWHEEL:
@@ -1956,6 +1962,8 @@ HLE_EXPORT(Direct3D_CreateDevice)
 
 /* HRESULT D3DDevice_Clear(DWORD Count, const D3DRECT *pRects, DWORD Flags,
  *     D3DCOLOR Color, float Z, DWORD Stencil)                               */
+static int draw_kept(void);     /* xbox_D3D8SetDrawFilter, below */
+
 HLE_EXPORT(D3DDevice_Clear)
 {
     static int seen;
@@ -1976,7 +1984,8 @@ HLE_EXPORT(D3DDevice_Clear)
         if (g_shadow_clears < 4)
             fprintf(stderr, "[HLE-D3D8] shadow Clear: flags 0x%08X color 0x%08X "
                     "z %g stencil %u\n", flags, color, z, stencil);
-        host_Clear(g_shadow, 0, NULL, xbox_clear_flags_to_host(flags), color, z, stencil);
+        if (draw_kept())
+            host_Clear(g_shadow, 0, NULL, xbox_clear_flags_to_host(flags), color, z, stencil);
         g_shadow_clears++;
         g_shadow_last_color = color;
         if (shadow_trace_on())
@@ -2132,6 +2141,8 @@ static void overlay_frame(void)
 
     g_overlay_shown = enabled;
     notice = hle_screenshot_frame();
+    if (!notice)
+        notice = hle_net_notice();
     g_overlay_text = shot ? NULL : notice ? notice : enabled ? line : NULL;
     if (g_overlay_text)
         d3d8_overlay_draw(g_overlay_text);
@@ -2342,6 +2353,7 @@ HLE_EXPORT(D3DDevice_Swap)
     /* Counted before anything else here runs, so RECOMP_FPS means the same
      * thing whatever is switched on below. */
     xbox_FpsCountSwap();
+    hle_lockstep_swap();
 #ifdef _WIN32
     if (g_backbuffer_va)
         note_framebuffer_phys(HLE_MEM32(g_backbuffer_va + 4));
@@ -2404,6 +2416,7 @@ HLE_EXPORT(D3DDevice_Present)
     }
 
     xbox_FpsCountSwap();
+    hle_lockstep_swap();
 #ifdef _WIN32
     if (g_backbuffer_va)
         note_framebuffer_phys(HLE_MEM32(g_backbuffer_va + 4));
@@ -4561,6 +4574,22 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
     return out;
 }
 
+/* xbox_D3D8SetDrawFilter: a title that draws more than this machine shows --
+ * online co-op draws both players' views on both machines, and each keeps
+ * only its own -- says per draw whether it is kept. Draws and clears it turns
+ * down are skipped; the state they would have used is still set. */
+static int (*g_draw_filter)(void);
+
+void xbox_D3D8SetDrawFilter(int (*keep)(void))
+{
+    g_draw_filter = keep;
+}
+
+static int draw_kept(void)
+{
+    return !g_draw_filter || g_draw_filter();
+}
+
 /* The host half of every non-indexed draw: the UP draw below and the vertex
  * buffer draws in hle_d3d8_vertex.c. `verts` is already a host pointer to the
  * first vertex; from_buffer only picks the counter the draw lands in. */
@@ -4572,6 +4601,9 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
     uint8_t *loop = NULL, *expanded;
     int failed;
     HRESULT hr;
+
+    if (!draw_kept())
+        return;
 
     if (!g_shadow || !verts || !stride || !count)
         return;
@@ -4629,6 +4661,9 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
     UINT prims, vertices = 0, i, n = 0, host_stride = stride, min_index = 0;
     int failed;
     HRESULT hr;
+
+    if (!draw_kept())
+        return;
 
     if (!g_shadow || !idx || !verts || !stride || !count)
         return;

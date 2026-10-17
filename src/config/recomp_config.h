@@ -84,6 +84,7 @@ typedef struct RecompSettings {
     double brightness;          /* 0.5..2.0, 1 as the game made it: a gamma on the final picture */
     int  mute_unfocused;        /* 0 or 1: silence while another window has the focus */
     int  pause_unfocused;       /* 0 or 1: pause the game when the window loses the focus in play */
+    int  keyboard_alone;        /* 0 or 1: keyboard and mouse are player 1 alone, pads from player 2 */
     int  volume;                /* 0 to 100: percent, for everything the game plays */
     int  fxaa;                  /* 0 or 1: edge smoothing as the picture is resolved */
     int  prompts;               /* button prompts: 0 auto, 1 keyboard, 2 controller */
@@ -93,6 +94,8 @@ typedef struct RecompSettings {
     double weapon_fov;          /* the held weapon's, the same way, 0 the game's own; only
                                  * for a title that can set it (recomp_weapon_fov_support) */
     char game_dir[512];         /* empty means beside the executable */
+    char online_address[128];   /* the launcher's Online tab: the host last joined */
+    int  online_port;           /* and the UDP port last hosted or joined on */
 } RecompSettings;
 
 void recomp_settings_defaults(RecompSettings *s);

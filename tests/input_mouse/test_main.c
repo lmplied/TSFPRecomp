@@ -1,5 +1,6 @@
 #include "input_bindings.h"
 #include "input_mouse.h"
+#include "recomp_pad.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -255,12 +256,38 @@ int main(void)
           pad.bAnalogButtons[XBOX_BUTTON_RTRIGGER]);
     recomp_mouse_pointer_mode(0);
 
+    /* keyboard_alone: one pad plugged in, and the keyboard on player 1.
+     * Shared (the default), player 2 waits for a second pad; alone, the one
+     * pad is player 2's -- a Remote Play friend's -- and the title is told a
+     * pad is there. */
+    {
+        RecompPadState st;
+        XBOX_GAMEPAD p2;
+
+        memset(&st, 0, sizeof st);
+        st.buttons = RECOMP_PAD_A;
+        recomp_pad_test_set(0, &st);
+        recomp_bindings_set_keyboard_alone(0);
+        Sleep(300);                                  /* the present mask's refresh */
+        recomp_bindings_sample(1, &p2);
+        CHECK(p2.bAnalogButtons[XBOX_BUTTON_A] == 0, "shared: player 2 read the first pad");
+        CHECK(!(recomp_bindings_present_mask() & 2u), "shared: player 2 present with one pad");
+        recomp_bindings_set_keyboard_alone(1);
+        Sleep(300);
+        recomp_bindings_sample(1, &p2);
+        CHECK(p2.bAnalogButtons[XBOX_BUTTON_A] == 255, "alone: player 2 did not read the first pad");
+        CHECK(recomp_bindings_present_mask() & 2u, "alone: player 2 not present");
+        CHECK(recomp_bindings_present_mask() & 1u, "alone: player 1 (keyboard) not present");
+        recomp_pad_test_set(0, NULL);
+        recomp_bindings_set_keyboard_alone(0);
+    }
+
     DeleteFileA(path);
     if (g_fail)
         return 1;
     puts("PASS: mouse motion, buttons and wheel reach the bound controls only while captured; "
          "speed scales the stick and any motion clears the title's deadzone; a direct claim "
          "keeps motion off the stick until it lapses; a held button holds a toggle; a "
-         "title's press holds for its time; pointing at a menu lets the mouse go");
+         "title's press holds for its time; pointing at a menu lets the mouse go; keyboard_alone moves the pads to player 2");
     return 0;
 }

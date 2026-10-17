@@ -106,6 +106,7 @@ typedef struct {
     uint32_t w, h;
     int      started;
     LARGE_INTEGER start;
+    long start_frame;           /* under the lockstep clock: the frame it started */
 
     /* The next picture, read and not yet due. */
     int      have_next;
@@ -249,6 +250,13 @@ static uint32_t movie_clock(movie *m)
 {
     LARGE_INTEGER now;
 
+    /* Under the lockstep clock, by the title's frames instead: two machines
+     * in co-op show the same picture on the same frame, and the title --
+     * which reads the movie's state -- sees the same on both. Future
+     * Perfect's attract movie, after a minute idle in the menus, parted two
+     * games by the wall clock. */
+    if (xbox_LockstepClockOn())
+        return (uint32_t)((xbox_LockstepFrames() - m->start_frame) * 1000 / 60);
     QueryPerformanceCounter(&now);
     return (uint32_t)((now.QuadPart - m->start.QuadPart) * 1000 / g_qpf.QuadPart);
 }
@@ -332,6 +340,7 @@ void xmv_play_start(int handle)
     m->started = 1;
     recomp_audio_output_reset_voice(RECOMP_AUDIO_SLOT_MOVIE);
     QueryPerformanceCounter(&m->start);
+    m->start_frame = xbox_LockstepFrames();
 }
 
 /* The next picture into m->next, if there is one. */
@@ -475,6 +484,17 @@ uint32_t xmv_play_update(int handle, uint32_t surface_va, uint32_t *pts_ms)
         /* Let the last of the sound finish before saying so. */
         uint64_t played = 0;
         uint32_t queued = 0;
+
+        /* Under the lockstep clock not by what the host's sound has played,
+         * which no two machines agree on: the end is when the last picture
+         * and the whole of the sound's length (all read by now) are due. */
+        if (xbox_LockstepClockOn()) {
+            uint32_t sound_ms = m->audio && m->rate && m->channels
+                ? (uint32_t)((uint64_t)m->pcm_len * 1000u /
+                             ((uint64_t)m->rate * m->channels * 2u))
+                : 0u;
+            return now >= m->next_pts && now >= sound_ms ? 2u : 0u;
+        }
         if (m->audio && m->pcm_off < m->pcm_len)
             return 0u;
         if (m->audio && recomp_audio_output_position(RECOMP_AUDIO_SLOT_MOVIE, &played, &queued) &&

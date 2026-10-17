@@ -70,29 +70,50 @@ if(WIN32)
         #                    Off / 16:9 / Fill the window (with NATIVE_WIDESCREEN)
         #   FOV <degrees>    recomp_fov_support, with the game's own angle
         #   WEAPON_FOV <deg> recomp_weapon_fov_support, the same for the weapon
+        # and how it looks:
+        #   PALETTE <dark> <mid> <ink>   the title's colours, as RRGGBB hex,
+        #                    in place of the Xbox green: the darks, a selected
+        #                    panel, lines and text (xbox_D3D8MenuSetPalette
+        #                    gives the in-game panel the same)
         #   PROMPTS          recomp_prompts_icon: the Button prompts row
         #   PAUSE_UNFOCUSED  recomp_bindings_pause_on_focus_loss
         #   SKIP_INTRO       xmv_set_intro_videos
+        #   NETPLAY          hle_net_session_begin from its main: an Online tab
+        #                    that hosts or joins (RECOMP_NET, hle_netplay.h)
         cmake_parse_arguments(_launcher
-            "NO_WIDESCREEN;NATIVE_WIDESCREEN;ANY_ASPECT;PROMPTS;PAUSE_UNFOCUSED;SKIP_INTRO"
-            "FOV;WEAPON_FOV" "" ${ARGN})
+            "NO_WIDESCREEN;NATIVE_WIDESCREEN;ANY_ASPECT;PROMPTS;PAUSE_UNFOCUSED;SKIP_INTRO;NETPLAY"
+            "FOV;WEAPON_FOV" "PALETTE" ${ARGN})
         if(_launcher_NO_WIDESCREEN)
             target_compile_definitions(${TARGET} PRIVATE LAUNCHER_NO_WIDESCREEN=1)
         endif()
         if(_launcher_NATIVE_WIDESCREEN)
             target_compile_definitions(${TARGET} PRIVATE LAUNCHER_NATIVE_WIDESCREEN=1)
         endif()
-        foreach(_flag ANY_ASPECT PROMPTS PAUSE_UNFOCUSED SKIP_INTRO)
+        foreach(_flag ANY_ASPECT PROMPTS PAUSE_UNFOCUSED SKIP_INTRO NETPLAY)
             if(_launcher_${_flag})
                 target_compile_definitions(${TARGET} PRIVATE LAUNCHER_${_flag}=1)
             endif()
         endforeach()
+        if(_launcher_NETPLAY)
+            target_link_libraries(${TARGET} PRIVATE xbox_net)  # this PC's addresses
+        endif()
         if(_launcher_FOV)
             target_compile_definitions(${TARGET} PRIVATE LAUNCHER_FOV=${_launcher_FOV})
         endif()
         if(_launcher_WEAPON_FOV)
             target_compile_definitions(${TARGET} PRIVATE
                 LAUNCHER_WEAPON_FOV=${_launcher_WEAPON_FOV})
+        endif()
+        list(LENGTH _launcher_PALETTE _palette_count)
+        if(_palette_count EQUAL 3)
+            list(GET _launcher_PALETTE 0 _dark)
+            list(GET _launcher_PALETTE 1 _mid)
+            list(GET _launcher_PALETTE 2 _ink)
+            target_compile_definitions(${TARGET} PRIVATE
+                LAUNCHER_PALETTE_DARK=0x${_dark} LAUNCHER_PALETTE_MID=0x${_mid}
+                LAUNCHER_PALETTE_INK=0x${_ink})
+        elseif(_palette_count GREATER 0)
+            message(FATAL_ERROR "recomp_add_launcher: PALETTE takes three RRGGBB colours")
         endif()
         if(MSVC)
             target_compile_options(${TARGET} PRIVATE

@@ -1527,7 +1527,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * hardware whether or not anyone is asleep. GetTickCount() shares the
          * millisecond unit, so the rate matches. */
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
-                               + g_memory_offset) = GetTickCount();
+                               + g_memory_offset) =
+            xbox_LockstepClockOn()
+                /* lockstep: the frames only -- a loading screen's vblanks are
+                 * as many as the load took here (hle_dsound.c says more) */
+                ? 0x00100000u + (uint32_t)(xbox_LockstepFrames() * 1000 / 60)
+                : GetTickCount();
 
         nv2a_ack_wait();
     }

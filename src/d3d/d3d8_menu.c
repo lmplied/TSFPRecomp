@@ -8,7 +8,8 @@
  * table, and nothing on the device left changed for the title.
  *
  * The look follows the launcher (src/launcher/launcher_theme.h): near-black
- * panels, one green for structure and focus, light text.
+ * panels, one green for structure and focus, light text -- or the title's
+ * own colours (xbox_D3D8MenuSetPalette), as its launcher has them.
  */
 #include "d3d8_internal.h"
 #include "d3d8_menu.h"
@@ -16,13 +17,42 @@
 #include <stdio.h>
 #include <string.h>
 
-#define GREEN      RGB(0x9B, 0xCE, 0x1E)
-#define GREEN_DIM  RGB(0x4E, 0x6C, 0x14)
-#define INK        RGB(0xE8, 0xF2, 0xD8)
-#define INK_DIM    RGB(0x8A, 0x97, 0x7C)
-#define PANEL      RGB(0x0C, 0x0F, 0x0A)
-#define ROW        RGB(0x14, 0x19, 0x10)
-#define ROW_LIT    RGB(0x1E, 0x2C, 0x0E)
+static struct {
+    COLORREF accent, accent_dim, ink, ink_dim, panel, row, row_lit;
+} g_pal = {
+    RGB(0x9B, 0xCE, 0x1E), RGB(0x4E, 0x6C, 0x14), RGB(0xE8, 0xF2, 0xD8),
+    RGB(0x8A, 0x97, 0x7C), RGB(0x0C, 0x0F, 0x0A), RGB(0x14, 0x19, 0x10),
+    RGB(0x1E, 0x2C, 0x0E),
+};
+
+#define GREEN      g_pal.accent
+#define GREEN_DIM  g_pal.accent_dim
+#define INK        g_pal.ink
+#define INK_DIM    g_pal.ink_dim
+#define PANEL      g_pal.panel
+#define ROW        g_pal.row
+#define ROW_LIT    g_pal.row_lit
+
+/* a + (b - a) * t, per channel, of two 0xRRGGBB. */
+static COLORREF mix(unsigned a, unsigned b, double t)
+{
+    int ar = (int)(a >> 16) & 0xFF, ag = (int)(a >> 8) & 0xFF, ab = (int)a & 0xFF;
+    int br = (int)(b >> 16) & 0xFF, bg = (int)(b >> 8) & 0xFF, bb = (int)b & 0xFF;
+
+    return RGB((int)(ar + (br - ar) * t), (int)(ag + (bg - ag) * t), (int)(ab + (bb - ab) * t));
+}
+
+void xbox_D3D8MenuSetPalette(unsigned dark, unsigned mid, unsigned ink)
+{
+    /* As the launcher derives its own from the same three (theme_palette_from). */
+    g_pal.accent     = mix(ink, ink, 0.0);
+    g_pal.accent_dim = mix(dark, ink, 0.35);
+    g_pal.ink        = g_pal.accent;
+    g_pal.ink_dim    = mix(ink, mid, 0.42);
+    g_pal.panel      = mix(0, dark, 0.72);
+    g_pal.row        = mix(0, dark, 0.92);
+    g_pal.row_lit    = mix(dark, mid, 0.85);
+}
 
 static struct {
     int             tried, failed;
@@ -293,7 +323,7 @@ static void render(const D3D8Menu *m)
 
     /* Tabs, left to right; the current one lit and underlined. */
     if (m->tab_count > 0) {
-        int tw = w / (m->tab_count > 4 ? 4 : m->tab_count);
+        int tw = w / m->tab_count;
         if (tw > (int)(170 * s)) tw = (int)(170 * s);
         g.hit_tabs = 0;
         for (i = 0; i < m->tab_count && i < D3D8_MENU_TABS; i++) {

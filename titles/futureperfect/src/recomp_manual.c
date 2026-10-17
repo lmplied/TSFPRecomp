@@ -27,6 +27,7 @@
 #include "input_bindings.h"   /* the mouse settings, for 1:1 aim */
 #include "input_mouse.h"      /* the mouse's counts, for 1:1 aim */
 #include "hle_xmv_play.h"     /* the intro videos to skip */
+#include "hle_netplay.h"      /* online co-op: what both machines must agree on */
 #include "recomp_config.h"    /* the field of view */
 
 /* One diagnostic report, one piece.
@@ -488,6 +489,58 @@ static int fp_mouse_test(long *dx, long *dy, int *logging)
     return 1;                       /* a test is configured: treat as captured */
 }
 
+/* In a session: for the player being looked at, this machine's own turn is
+ * worked out as offline (counts times sensitivity and zoom, inverted or not)
+ * and handed to netplay, and every player's turn for this frame -- both
+ * machines have the same -- is added to their angles. */
+static void fp_mouse_aim_net(uint32_t look_va)
+{
+    RecompMouseSettings ms;
+    FpLook rd;
+    float ay, ap, yaw, pitch;
+    int me = hle_net_local_port(), port = recomp_bindings_mouse_port(), idx;
+
+    (void)look_va;
+    if (!fp_look_reader(&rd)) {
+        recomp_mouse_set_direct(0);
+        return;
+    }
+    idx = (int)FP_MEM32(rd.pl + 4u);
+    /* This machine's player, turned by this machine's mouse -- unless the
+     * mouse is not this copy's (player 2's, both games on one PC). */
+    if (idx == me && port == hle_net_local_input_port()) {
+        long dx = 0, dy = 0;
+        int logging, testing = fp_mouse_test(&dx, &dy, &logging);
+        if (recomp_mouse_captured()) {
+            long rx, ry;
+            recomp_mouse_take_counts(&rx, &ry);
+            dx += rx;
+            dy += ry;
+        }
+        if (port >= 0 && (recomp_mouse_captured() || testing) &&
+            recomp_bindings_get_mouse((unsigned)port, &ms)) {
+            double k = FP_DEG_PER_COUNT * ms.sensitivity *
+                       fp_zoom_scale(rd.pl, rd.aim, ms.zoom_match);
+            recomp_mouse_set_direct(1);
+            if (dx || dy)
+                hle_net_add_local_aim((float)(-dx * k),
+                                      (float)((ms.invert_y ? dy : -dy) * k * ms.y_scale));
+        }
+    }
+    if (idx < 0 || !hle_net_port_aim((unsigned)idx, &ay, &ap) || (ay == 0.0f && ap == 0.0f))
+        return;
+    yaw = FP_MEMF(rd.pl + 0x100u) + ay;
+    pitch = FP_MEMF(rd.pl + 0x104u) + ap;
+    if (yaw >= 360.0f || yaw < 0.0f)
+        yaw -= 360.0f * floorf(yaw / 360.0f);
+    if (pitch > 89.0f) pitch = 89.0f;
+    if (pitch < -89.0f) pitch = -89.0f;
+    if (ay != 0.0f)
+        FP_MEMF(rd.pl + 0x100u) = yaw;
+    if (ap != 0.0f)
+        FP_MEMF(rd.pl + 0x104u) = pitch;
+}
+
 static void fp_mouse_aim(uint32_t look_va)
 {
     static int enabled = -1;
@@ -508,6 +561,13 @@ static void fp_mouse_aim(uint32_t look_va)
     }
     if (!enabled)
         return;
+    /* Online: this machine's turn goes out with its controls, and each
+     * player's turn is applied from what both machines agree on -- written
+     * here directly, it would turn one machine's player only (hle_netplay.h). */
+    if (hle_net_local_port() >= 0) {
+        fp_mouse_aim_net(look_va);
+        return;
+    }
     port = recomp_bindings_mouse_port();
     testing = fp_mouse_test(&dx, &dy, &logging);
     if (recomp_mouse_captured()) {
@@ -604,7 +664,9 @@ static void fp_apply_fov(void)
 {
     static float game_fov, written;
     uint32_t pl = FP_MEM32(0x007B0C7Cu), cam;
-    double user = recomp_fov();
+    /* Online: the game's own angle on both machines (a player's setting
+     * would turn only their machine's camera). */
+    double user = hle_net_local_port() >= 0 ? 0.0 : recomp_fov();
     FpLook rd;
     float target, want;
 
@@ -635,8 +697,10 @@ static void fp_apply_fov(void)
  * the call that set the second. */
 static void fp_apply_weapon_fov(void)
 {
-    double view = recomp_fov() > 0.0 ? recomp_fov() : recomp_fov_game();
-    double weapon = recomp_weapon_fov() > 0.0 ? recomp_weapon_fov() : recomp_weapon_fov_game();
+    int online = hle_net_local_port() >= 0;      /* the game's own, as fp_apply_fov */
+    double view = !online && recomp_fov() > 0.0 ? recomp_fov() : recomp_fov_game();
+    double weapon = !online && recomp_weapon_fov() > 0.0 ? recomp_weapon_fov()
+                                                         : recomp_weapon_fov_game();
 
     if (view > 0.0 && weapon > 0.0)
         FP_MEMF(0x0047E298u) = (float)(weapon / 45.0 / view);
@@ -670,6 +734,7 @@ extern void xbox_D3D8SetInterpRegisters(int projection, int affine_first, int af
 extern void xbox_Nv2aFlipGateSetTitlePaced(int on);
 extern void recomp_prompts_icon(uint32_t checksum, const char *control, uint32_t rgb);
 extern int xbox_D3D8PictureRect(float *x, float *y, float *w, float *h);
+extern void xbox_D3D8MenuSetPalette(unsigned dark, unsigned mid, unsigned ink);
 
 static void fp_aspect_follow(void)
 {
@@ -681,7 +746,9 @@ static void fp_aspect_follow(void)
             return;
         wide = 1;
     }
-    if (xbox_D3D8FillShape(&w, &h) && h) {
+    /* Online: 16:9 on both machines -- the game lays its world and HUD out
+     * by this shape, and two machines must lay them out alike. */
+    if (hle_net_local_port() < 0 && xbox_D3D8FillShape(&w, &h) && h) {
         if (w * 3u < h * 4u) {
             w = 4;                          /* narrower than 4:3 stays 4:3 */
             h = 3;
@@ -1021,6 +1088,8 @@ static int fp_cs_mouse(unsigned port, long now, float x, float y, int moved, uns
         g_fp_cs.target = -1;                /* the wheel steers instead */
     if (FP_MEM32(FP_CS_STATE) != 1u)
         row = -1;                           /* ready: the portraits are fixed */
+    if (hle_net_local_port() > 0)
+        row = -1;                           /* online player 2: FP_CS_SELECTED is player 1's */
     if (row >= 0 && (moved || (clicks & RECOMP_MOUSE_LEFT))) {
         if (g_fp_cs.target != row)
             g_fp_cs.activate = 0;
@@ -1141,9 +1210,15 @@ static void fp_menu_mouse(uint32_t root)
         g_fp_cs.target = -1;
     }
     item = have ? fp_ui_hit(root, x, y, &widget, &lists) : 0;
-    if (item && (moved || (clicks & RECOMP_MOUSE_LEFT)) &&
-        FP_MEM32(widget + 0x198u) != item)
+    /* Online, pointing does not select: that writes the game's menu state on
+     * one machine only. A click then picks only what is already selected. */
+    if (hle_net_local_port() >= 0) {
+        if (item && FP_MEM32(widget + 0x198u) != item)
+            item = 0;
+    } else if (item && (moved || (clicks & RECOMP_MOUSE_LEFT)) &&
+               FP_MEM32(widget + 0x198u) != item) {
         fp_ui_select(widget, item);
+    }
     value = item && fp_ui_value(item);
     /* A value that A also opens (Weapon Set and Bot Set: their editors) ends
      * in A's prompt; a click there is A. */
@@ -1187,12 +1262,185 @@ static void fp_menu_mouse(uint32_t root)
     }
 }
 
+/* -- Future Perfect: co-op, straight to the main menu -------------------- */
+
+/*
+ * Between the game starting and its main menu come how many players and a
+ * profile for each: in co-op on two PCs, always two, and a profile each.
+ * Gone through here for the players, as they would: each machine presses for
+ * its own player only, through its own controls (recomp_bindings_press on
+ * hle_net_local_input_port), so the presses go to the other machine like
+ * any others and both games see the same. What to press is read from the
+ * game -- the same on both -- by the screen's lists, whose items say what
+ * they are (+0x20, the label):
+ *
+ *   "1 Player" .. "4 Player"      the host: down to 2 Player, A
+ *   two profile panels (kind 3), the host's player 1's then player 2's:
+ *     "Press START to Join"        Start
+ *     "Create New Profile" + profiles
+ *                                  the first profile free (not bit 0 or 2
+ *                                  of +0x28: taken by the other player, or
+ *                                  a title), else Create New Profile; A
+ *     "Enter Name"                 the name it offers ("Player 2"): Done, A
+ *     "Select Storage Device"      Xbox Hard Disk, A
+ *     "Ready"                      nothing: the other player
+ *   "Story Co-op"                 the main menu with both in: stop, and
+ *                                  leave the rest -- Change Players
+ *                                  included -- to the players
+ *
+ * A press, then a pause for the screen to follow. RECOMP_FP_COOP_AUTO=0
+ * leaves all of it to the players.
+ */
+static int fp_ui_label_is(uint32_t item, const char *want)
+{
+    uint32_t s = item ? FP_MEM32(item + 0x20u) : 0;
+    int c;
+
+    if (!s)
+        return !*want;
+    for (c = 0; want[c]; c++)
+        if (FP_MEM8(s + (uint32_t)c) != (uint8_t)want[c])
+            return 0;
+    return FP_MEM8(s + (uint32_t)c) == 0;
+}
+
+static int fp_ui_label_empty(uint32_t item)
+{
+    uint32_t s = FP_MEM32(item + 0x20u);
+    return !s || !FP_MEM8(s);
+}
+
+/* The first item in a widget's list labelled `want`, or 0. */
+static uint32_t fp_ui_find(uint32_t widget, const char *want)
+{
+    uint32_t it;
+    int n = 0;
+
+    for (it = FP_MEM32(widget + 0x178u); it && n < 128; it = FP_MEM32(it + 4u), n++)
+        if (fp_ui_label_is(it, want))
+            return it;
+    return 0;
+}
+
+static int fp_ui_index(uint32_t widget, uint32_t item)
+{
+    uint32_t it;
+    int n = 0;
+
+    for (it = FP_MEM32(widget + 0x178u); it && n < 128; it = FP_MEM32(it + 4u), n++)
+        if (it == item)
+            return n;
+    return -1;
+}
+
+/* Every widget under root with a list, in the order the game keeps them. */
+static int fp_ui_lists(uint32_t root, uint32_t *out, int max)
+{
+    uint32_t queue[32];
+    int head = 0, tail = 0, n = 0, guard = 0;
+
+    queue[tail++] = root;
+    while (head < tail && guard++ < 64) {
+        uint32_t w = queue[head++], c;
+        int k = 0;
+
+        if (w < FP_UI_TABLE || w >= FP_UI_TABLE + FP_UI_WIDGETS * FP_UI_SIZE || !FP_MEM32(w))
+            continue;
+        if (FP_MEM32(w + 0x178u) && n < max)
+            out[n++] = w;
+        for (c = FP_MEM32(w + 0x16Cu); c && tail < 32 && k < 32; c = FP_MEM32(c + 0x30u), k++)
+            queue[tail++] = c;
+    }
+    return n;
+}
+
+/* Toward `target` in a list: A on it, else a step up or down. */
+static const char *fp_coop_toward(uint32_t widget, uint32_t target)
+{
+    uint32_t sel = FP_MEM32(widget + 0x198u);
+    int at = fp_ui_index(widget, sel), to = fp_ui_index(widget, target);
+
+    if (sel == target)
+        return "a";
+    if (at < 0 || to < 0)
+        return "dpad_down";
+    return to > at ? "dpad_down" : "dpad_up";
+}
+
+static void fp_coop_auto(uint32_t root)
+{
+    static int enabled = -1, done;
+    static long next;
+    static unsigned presses;
+    long now = (long)(clock() * 1000 / CLOCKS_PER_SEC);
+    uint32_t lists[8], panel = 0, it;
+    int n, i, me, panels = 0;
+    const char *press = NULL;
+
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_FP_COOP_AUTO");
+        enabled = !(e && *e && strcmp(e, "0") == 0);
+    }
+    if (!enabled || done || (me = hle_net_local_port()) < 0 || now < next)
+        return;
+    n = fp_ui_lists(root, lists, 8);
+    for (i = 0; i < n; i++)
+        if (fp_ui_find(lists[i], "Story Co-op")) {
+            done = 1;
+            fprintf(stderr, "[FP] co-op: both players are in, at the main menu (%u presses)\n",
+                    presses);
+            fflush(stderr);
+            return;
+        }
+    for (i = 0; i < n && !press; i++) {
+        uint32_t w = lists[i];
+
+        if (fp_ui_find(w, "1 Player") && fp_ui_find(w, "2 Player")) {
+            if (me == 0)
+                press = fp_coop_toward(w, fp_ui_find(w, "2 Player"));
+            break;
+        }
+        if (FP_MEM32(w) == 3u && panels++ == me)
+            panel = w;
+    }
+    if (!press && panel) {
+        if (fp_ui_find(panel, "Press START to Join")) {
+            press = "start";
+        } else if ((it = fp_ui_find(panel, "Create New Profile")) != 0) {
+            uint32_t create = it, pick = 0, p;
+            int k = 0;
+            for (p = FP_MEM32(it + 4u); p && k < 64 && !pick; p = FP_MEM32(p + 4u), k++)
+                if (FP_MEM32(p) == 7u && !(FP_MEM32(p + 0x28u) & 5u) && !fp_ui_label_empty(p))
+                    pick = p;
+            press = fp_coop_toward(panel, pick ? pick : create);
+        } else if (fp_ui_find(panel, "Enter Name")) {
+            press = fp_ui_label_is(FP_MEM32(panel + 0x198u), "Done") ? "a"
+                  : (presses & 1u) ? "dpad_left" : "dpad_up";
+        } else if ((it = fp_ui_find(panel, "Xbox Hard Disk")) != 0) {
+            press = fp_coop_toward(panel, it);
+        }
+    }
+    if (!press)
+        return;
+    if (++presses > 200) {
+        done = 1;                       /* something unforeseen: leave it to the players */
+        fprintf(stderr, "[FP] co-op: the screens before the main menu are the players' now\n");
+        fflush(stderr);
+        return;
+    }
+    recomp_bindings_press((unsigned)hle_net_local_input_port(), press, 80);
+    next = now + (strcmp(press, "a") == 0 || strcmp(press, "start") == 0 ? 700 : 250);
+}
+
 /* A screen's widgets, once a frame (above): the mouse first, at the
- * outermost call; the calls it makes for the children come back in here. */
+ * outermost call; the calls it makes for the children come back in here.
+ * In co-op, the screens before the main menu are gone through first. */
 void sub_0007A7B0(void)
 {
     static int depth;
 
+    if (!depth)
+        fp_coop_auto(FP_MEM32(g_esp + 4u));
     if (!depth)
         fp_menu_mouse(FP_MEM32(g_esp + 4u));
     depth++;
@@ -1200,11 +1448,90 @@ void sub_0007A7B0(void)
     depth--;
 }
 
+/* -- Future Perfect: "Xbox Live" and "System Link" renamed --------------- */
+
+/*
+ * The game's text is two banks, each a table of pointers to its strings and
+ * then the strings, at [0x006B7B08] (0x291C0 bytes at [0x006B7B0C], 4149
+ * strings: everything the game says) and [0x006B7B10] (size at 0x006B7B14,
+ * 3463: the front end's), found by the strings in a RAM snapshot and the
+ * globals pointing at their tables. Menus take their labels from these
+ * strings by pointer, so a string changed in place is a label changed. Each
+ * new name is shorter than the old, so it fits: the rest of the string moves
+ * up. A bank is patched when it appears or moves, and again if a patched
+ * string reads as it did before (loaded again at the same place).
+ */
+static const struct { const char *from, *to; } k_fp_names[] = {
+    { "on Xbox Live or System Link", "online or over LAN" },   /* the main menu's help */
+    { "System Link", "LAN" },
+    { "Xbox Live",   "Online" },
+};
+
+/* Every occurrence in [p, p + n) changed, string by string; the first
+ * change's place in *mark (0 for none) and which name it was in *which.
+ * Returns how many. */
+static int fp_rename_block(uint32_t va, uint32_t n, uint32_t *mark, int *which)
+{
+    uint8_t *p = FP_GUEST(va), *end = p + n;
+    int count = 0;
+    size_t k;
+
+    *mark = 0;
+    for (k = 0; k < sizeof k_fp_names / sizeof k_fp_names[0]; k++) {
+        size_t fl = strlen(k_fp_names[k].from), tl = strlen(k_fp_names[k].to);
+        uint8_t *q;
+
+        for (q = p; q + fl <= end; q++) {
+            uint8_t *z;
+            if (*q != (uint8_t)k_fp_names[k].from[0] || memcmp(q, k_fp_names[k].from, fl) != 0)
+                continue;
+            for (z = q + fl; z < end && *z; z++)
+                ;                               /* the string's end */
+            if (z >= end)
+                break;
+            memcpy(q, k_fp_names[k].to, tl);
+            memmove(q + tl, q + fl, (size_t)(z - (q + fl)) + 1u);
+            memset(z + 1 - (fl - tl), 0, fl - tl);
+            if (!*mark) {
+                *mark = va + (uint32_t)(q - p);
+                *which = (int)k;
+            }
+            count++;
+        }
+    }
+    return count;
+}
+
+static void fp_rename(void)
+{
+    static uint32_t bank[2], size[2], mark[2];
+    static int which[2];
+    int b;
+
+    for (b = 0; b < 2; b++) {
+        uint32_t va = FP_MEM32(0x006B7B08u + 8u * (uint32_t)b);
+        uint32_t n = FP_MEM32(0x006B7B0Cu + 8u * (uint32_t)b);
+
+        if (!va || n < 16u || n > 0x100000u)
+            continue;
+        if (va == bank[b] && n == size[b] &&
+            (!mark[b] || memcmp(FP_GUEST(mark[b]), k_fp_names[which[b]].from,
+                                strlen(k_fp_names[which[b]].from)) != 0))
+            continue;                           /* as left */
+        bank[b] = va;
+        size[b] = n;
+        if (fp_rename_block(va, n, &mark[b], &which[b]) > 0)
+            fprintf(stderr, "[FP] text bank %d at %08X: Xbox Live / System Link renamed\n",
+                    b, va);
+    }
+}
+
 /* The screen's width and height in the game's terms, and whether it is
  * wider than 4:3 (the original: exactly 16:9). */
 void sub_0003C400(void)
 {
     fp_ui_dump();
+    fp_rename();
     fp_aspect_follow();
     g_eax = FP_MEM32(0x004C0458u);
     g_esp += 4u;
@@ -1298,6 +1625,175 @@ void sub_0025CE80(void)
     fp_scan(look_va, 0);
 }
 
+/* -- Future Perfect: lockstep ---------------------------------------------- */
+
+/*
+ * Two copies of the game in lockstep must step their worlds alike, and the
+ * world steps by the vblanks since the last frame: the frame clock
+ * (sub_001538C0) reads the vblank count through sub_00022030 -- the count
+ * at 0x00563918, raised by the vblank interrupt's handler sub_00022020 --
+ * and takes the difference from the count it kept at 0x007A58AC, spinning
+ * while it is under one, three at most. Vblanks arrive with real time, so a
+ * frame that took long on one machine stepped further there. The one other
+ * reader is the loading screen's loop (sub_00156CB0), which draws a frame
+ * of it (sub_00156890) for each vblank until the load is done.
+ *
+ * Under RECOMP_LOCKSTEP_CLOCK the frame clock is answered "one more than
+ * last time": every frame steps exactly once, whatever the timing, with
+ * Swap still held to the vblank for pacing. The loading loop keeps the real
+ * count -- it must, to notice the load end -- and RECOMP_LOCKSTEP_LOADER=skip
+ * leaves out the loading screen's drawing, to see whether its frames reach
+ * the game's state.
+ */
+extern int xbox_LockstepClockOn(void);
+extern void xbox_LockstepGateThread(uint32_t start_context);
+extern void sub_00022030_gen(void);
+extern void sub_00156890_gen(void);
+
+void sub_00022030(void)
+{
+    if (xbox_LockstepClockOn() && FP_MEM32(g_esp) == 0x00153975u) {
+        g_eax = FP_MEM32(0x007A58ACu) + 1u;         /* the frame clock: one step */
+        g_esp += 4u;
+        return;
+    }
+    sub_00022030_gen();
+}
+
+void sub_00156890(void)
+{
+    static int skip = -1;
+
+    if (skip < 0) {
+        const char *e = getenv("RECOMP_LOCKSTEP_LOADER");
+        skip = xbox_LockstepClockOn() && e && strcmp(e, "skip") == 0;
+    }
+    if (skip) {
+        g_esp += 4u;                                /* cdecl: the caller pops */
+        return;
+    }
+    sub_00156890_gen();
+}
+
+/* -- Future Perfect: one player's view, the whole screen ------------------ */
+
+/*
+ * Online co-op runs split-screen co-op on both machines, and each shows only
+ * its own player. Split screen is laid out per camera by sub_0025A570(player,
+ * rect): it asks how many screens there are (sub_001CDAE0) and gives the
+ * camera's rectangle block -- the camera's +0x224, filled by sub_00055D90(rect,
+ * x0, y0, x1, y1) with the corners, centre, size and share of the screen --
+ * the whole screen, a half, or a quarter. The view, its aspect, its scissor
+ * and the HUD all follow that block. Found by watching a write to player 2's
+ * (+0x238, the top row: 240) back to sub_00055D90 and its caller.
+ *
+ * Two machines in lockstep must lay the screen out alike -- giving each
+ * player's camera a size of its own made them part within frames (buffers
+ * sized by the view, characters animated by whether they are seen) -- so in
+ * a network session (hle_net_local_port) every player's camera is given the
+ * whole screen, on both machines. Both views are still drawn, one after the
+ * other, as split screen draws them; each machine keeps only its own
+ * player's draws (fp_keep_draw, xbox_D3D8SetDrawFilter).
+ * FP_SOLO_VIEW=<player index> does the same without a session, to test one
+ * view.
+ */
+extern void sub_0025A570_gen(void);
+extern void sub_00055D90(void);
+extern void xbox_D3D8SetDrawFilter(int (*keep)(void));
+
+
+static int fp_solo_view(void)
+{
+    static int fixed = -2;
+    if (fixed == -2) {
+        const char *e = getenv("FP_SOLO_VIEW");
+        fixed = e && *e ? atoi(e) : -1;
+    }
+    return fixed >= 0 ? fixed : hle_net_local_port();
+}
+
+static void fp_set_rect(uint32_t rect, int x0, int y0, int x1, int y1)
+{
+    uint32_t eax = g_eax, ecx = g_ecx, edx = g_edx;
+
+    g_esp -= 4u; FP_MEM32(g_esp) = (uint32_t)y1;
+    g_esp -= 4u; FP_MEM32(g_esp) = (uint32_t)x1;
+    g_esp -= 4u; FP_MEM32(g_esp) = (uint32_t)y0;
+    g_esp -= 4u; FP_MEM32(g_esp) = (uint32_t)x0;
+    g_esp -= 4u; FP_MEM32(g_esp) = rect;
+    g_esp -= 4u; FP_MEM32(g_esp) = 0u;          /* the return address; it pops it */
+    sub_00055D90();
+    g_esp += 20u;
+    g_eax = eax;
+    g_ecx = ecx;
+    g_edx = edx;
+}
+
+void sub_0025A570(void)
+{
+    uint32_t rect = FP_MEM32(g_esp + 8u);
+
+    sub_0025A570_gen();
+    if (fp_solo_view() >= 0 && rect)
+        fp_set_rect(rect, 0, 0, (int)FP_MEM32(0x004E8CF0u) - 1, (int)FP_MEM32(0x004E8CF4u) - 1);
+}
+
+/* The draw filter. The frame (sub_0003C440) draws the screens in two loops,
+ * each setting the current player ([0x007B0C7C]) and camera ([0x007B0CC0])
+ * before a call: the world, sub_000C8120 (from 0x0003C794), then each
+ * player's HUD, sub_000C84A0 (from 0x0003C842). Those calls are the other
+ * player's to leave out -- their clears too, which would wipe this player's
+ * view. Everything else is kept: the frame's first clear, cutscenes (one
+ * camera, drawn outside the loops), rendered textures, menus. Measured: 392
+ * draws for player 1's world, 331 for player 2's, 26 and 15 for the HUDs. */
+extern void sub_000C8120_gen(void);
+extern void sub_000C84A0_gen(void);
+
+static volatile int g_fp_view = -1;      /* whose screen is being drawn, or -1 */
+extern unsigned long hle_lockstep_frame(void);
+
+static void fp_view_pass(void (*draw)(void), uint32_t loop_return)
+{
+    uint32_t cur = FP_MEM32(0x007B0C7Cu);
+    int was = g_fp_view;
+
+    /* Only in play -- the look builder ran within 150 ms; a cutscene stops it
+     * -- and only with the player's own camera ([0x007B0CC0] is [player+8]):
+     * a cutscene goes through the same loop, everyone's to see. */
+    if (fp_solo_view() >= 0 && FP_MEM32(g_esp) == loop_return && cur &&
+        FP_MEM32(0x007B0CC0u) == FP_MEM32(cur + 8u) &&
+        (long)(clock() * 1000 / CLOCKS_PER_SEC) - g_fp_look_tick <= 150)
+        g_fp_view = (int)FP_MEM32(cur + 4u);
+    draw();
+    g_fp_view = was;
+}
+
+void sub_000C8120(void) { fp_view_pass(sub_000C8120_gen, 0x0003C799u); }
+void sub_000C84A0(void) { fp_view_pass(sub_000C84A0_gen, 0x0003C847u); }
+
+/* The other player's screen is left out only while this player has one of
+ * their own: a level's intro is drawn through player 1's camera alone (player
+ * 2's pass draws a handful of things), and player 2 must see it. So each
+ * pass's draws are counted, and the last frame's count decides. */
+static unsigned long g_fp_pass_draws[4], g_fp_pass_last[4], g_fp_pass_frame;
+
+static int fp_keep_draw(void)
+{
+    int solo = fp_solo_view();
+    unsigned long frame;
+
+    if (solo < 0 || solo > 3 || g_fp_view < 0 || g_fp_view > 3)
+        return 1;
+    frame = hle_lockstep_frame();
+    if (frame != g_fp_pass_frame) {
+        memcpy(g_fp_pass_last, g_fp_pass_draws, sizeof g_fp_pass_last);
+        memset(g_fp_pass_draws, 0, sizeof g_fp_pass_draws);
+        g_fp_pass_frame = frame;
+    }
+    g_fp_pass_draws[g_fp_view]++;
+    return g_fp_view == solo || g_fp_pass_last[solo] < 50;
+}
+
 /* -- Future Perfect: what the runtime is told before the game starts ----- */
 
 /* Aim mode, for holding the aim button rather than clicking it
@@ -1359,6 +1855,17 @@ void fp_title_setup(void)
     recomp_fov_support(55.0);               /* the camera's own, every level seen */
     recomp_weapon_fov_support(45.0);        /* the held weapon's, at that view */
     xbox_D3D8SetTitleAnyAspect(1);          /* fp_aspect_follow: 21:9 and the rest */
+    /* The F1 panel in Future Perfect's blues, as its launcher is
+     * (titles/futureperfect/CMakeLists.txt, PALETTE). */
+    xbox_D3D8MenuSetPalette(0x3B5382u, 0x5E8387u, 0xFFFFFFu);
+    /* Lockstep: the sound worker (sub_00030160: DirectSoundDoWork and the
+     * game's stream service, then a 16 ms sleep) may run one pass a frame
+     * (RECOMP_LOCKSTEP_GATE=1; not needed, see docs/technical/lockstep.md),
+     * and the game's objects -- the contiguous heap from 0x82000000 -- are
+     * what two machines compare to catch a desync. */
+    xbox_LockstepGateThread(0x00030160u);
+    hle_net_hash_range(0x82000000u, 0x01400000u);
+    xbox_D3D8SetDrawFilter(fp_keep_draw);
     /* Frame interpolation: the projection at c60-c63, then the model-view
      * (c64), the projection times it (c68, which most programs draw with)
      * and a second model-view (c72). Bones are indexed from c96 and are not

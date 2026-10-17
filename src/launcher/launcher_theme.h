@@ -8,7 +8,8 @@
  *
  * The look is the original Xbox dashboard's: black, a green glow that
  * comes from behind, panels with soft edges, and the selected thing
- * lit rather than outlined. None of the console's own artwork is used
+ * lit rather than outlined -- in green unless the title gives colours of
+ * its own (theme_set_palette). None of the console's own artwork is used
  * or reproduced -- no logos, no wordmarks, no fonts, no ripped
  * textures. What is here is drawn from arithmetic at run time.
  */
@@ -19,11 +20,27 @@
 
 typedef struct ThemeRect { int x, y, w, h; } ThemeRect;
 
-/* The Xbox green, and the darker shades that go with it. */
-#define THEME_GREEN      RGB(0x9B, 0xCE, 0x1E)
-#define THEME_GREEN_DIM  RGB(0x4E, 0x6C, 0x14)
-#define THEME_TEXT       RGB(0xE8, 0xF2, 0xD8)
-#define THEME_TEXT_DIM   RGB(0x8A, 0x97, 0x7C)
+/* The colours. The default is the Xbox green; a title can have its own
+ * (theme_palette_from: Future Perfect's blues and white, as its menus are). */
+typedef struct ThemePalette {
+    COLORREF bg_edge, bg_glow;      /* the background, at its edges and in the glow */
+    COLORREF panel, panel_lit;      /* a panel's slab, resting and selected */
+    COLORREF line;                  /* rims, their glow, the tab underline, arrows */
+    COLORREF accent;                /* the selected tab and value */
+    COLORREF text, text_dim;
+    double   vignette;              /* how dark the corners fall, 0..1 */
+} ThemePalette;
+
+void theme_set_palette(const ThemePalette *p);
+const ThemePalette *theme_palette(void);
+
+/* A palette from three colours, 0xRRGGBB: the darks, the colour a selected
+ * panel takes, and the one lines and text are drawn in. */
+void theme_palette_from(ThemePalette *out, unsigned dark, unsigned mid, unsigned ink);
+
+#define THEME_ACCENT     (theme_palette()->accent)
+#define THEME_TEXT       (theme_palette()->text)
+#define THEME_TEXT_DIM   (theme_palette()->text_dim)
 
 /* A back buffer the size of the window. Everything below draws into it
  * and theme_present puts it on screen in one go, so nothing flickers. */

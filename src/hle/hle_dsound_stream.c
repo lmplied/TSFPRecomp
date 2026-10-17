@@ -191,7 +191,16 @@ static void lock(void)
     EnterCriticalSection(&g_lock);
 }
 static void unlock(void) { LeaveCriticalSection(&g_lock); }
-static uint64_t now_ms(void) { return GetTickCount64(); }
+int      xbox_LockstepClockOn(void);           /* kernel_bridge.c */
+uint64_t hle_dsound_lockstep_ms(void);         /* hle_dsound.c */
+
+/* Under the lockstep clock, the frames' time (hle_dsound.c), and never the
+ * host's play position: what the title sees of its streams must not depend
+ * on this machine's speakers. */
+static uint64_t now_ms(void)
+{
+    return xbox_LockstepClockOn() ? hle_dsound_lockstep_ms() : GetTickCount64();
+}
 
 /* Name the first few call sites of a replaced stream method, once each: a
  * title that waits on a status this file reports differently from the console
@@ -252,6 +261,8 @@ static uint64_t decoded_size(const Stream *s, uint32_t size)
 
 static int wallclock_only(void)
 {
+    if (xbox_LockstepClockOn())
+        return 1;
     if (g_wallclock < 0) {
         const char *v = getenv("RECOMP_DSOUND_WALLCLOCK");
         g_wallclock = v && *v && strcmp(v, "0") != 0;

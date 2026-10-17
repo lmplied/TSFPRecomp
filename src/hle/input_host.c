@@ -22,6 +22,8 @@
  */
 #include "input_host.h"
 #include "input_bindings.h"
+#include "hle_lockstep.h"      /* the frame count, for RECOMP_INPUT_SEQ_FRAMES */
+#include "hle_netplay.h"       /* lockstep: the controls both machines agree on */
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -120,7 +122,8 @@ static void fake_apply(RecompInputGamepad *g, int i, int pct)
  * is how a run gets back to the same screen. The sequence is the save state.
  * Nothing is pressed after the last step ends. */
 #define SEQ_MAX 128
-static struct seq_step { unsigned long at, hold; int keys[4], pct[4]; int nkeys; } s_seq[SEQ_MAX];
+static struct seq_step { unsigned long at, hold; int keys[4], pct[4]; int nkeys, port; } s_seq[SEQ_MAX];
+static unsigned s_seq_ports;   /* the ports some step presses on, as bits */
 static int s_seq_count = -1;
 static unsigned long long s_seq_t0;
 
@@ -144,6 +147,14 @@ static void seq_parse(const char *env)
             return;
         }
         q = end + 1;
+        /* p2. .. p4.: the step is that player's (RECOMP_INPUT_SEQ drives
+         * player 1 otherwise). A port the script presses on reads as a pad
+         * plugged in. */
+        if (q + 3 <= p + len && q[0] == 'p' && q[1] >= '1' && q[1] <= '4' && q[2] == '.') {
+            s->port = q[1] - '1';
+            q += 3;
+        }
+        s_seq_ports |= 1u << s->port;
         while (q < p + len) {
             size_t n = 0;
             int k;
@@ -276,14 +287,45 @@ static void ram_snapshots(unsigned long long t)
     }
 }
 
+/* The clock the script runs on: milliseconds, or with RECOMP_INPUT_SEQ_FRAMES=1
+ * the title's frames since the script began, a sixtieth of a second each --
+ * the same press on the same frame in every run, however long a frame took
+ * (hle_lockstep.h). s_seq_t0 is then the frame count it began at, plus one
+ * so that 0 still means "not begun". */
+static int seq_frames(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_INPUT_SEQ_FRAMES");
+        on = v && *v && strcmp(v, "0") != 0;
+    }
+    return on;
+}
+
+static unsigned long long seq_now(void)
+{
+    return seq_frames() ? (unsigned long long)hle_lockstep_frame() + 1u : GetTickCount64();
+}
+
+static unsigned long long seq_elapsed(void)
+{
+    unsigned long long d = seq_now() - s_seq_t0;
+    return seq_frames() ? d * 1000u / 60u : d;
+}
+
 /* The input script's clock, for a title project's own scripted test (0
  * before the script has started, or without one). */
 unsigned long long recomp_input_script_ms(void)
 {
-    return s_seq_t0 ? GetTickCount64() - s_seq_t0 : 0;
+    return s_seq_t0 ? seq_elapsed() : 0;
 }
 
-static void seq_input(RecompInputGamepad *g)
+unsigned recomp_input_seq_ports(void)
+{
+    return seq_active() ? s_seq_ports : 0u;
+}
+
+static void seq_input(RecompInputGamepad *g, unsigned port)
 {
     unsigned long long t;
     int i, k;
@@ -291,11 +333,12 @@ static void seq_input(RecompInputGamepad *g)
     if (!seq_active())
         return;
     if (!s_seq_t0)
-        s_seq_t0 = GetTickCount64();
-    t = GetTickCount64() - s_seq_t0;
+        s_seq_t0 = seq_now();
+    t = seq_elapsed();
     ram_snapshots(t);
     for (i = 0; i < s_seq_count; i++) {
-        if (t < s_seq[i].at || t >= (unsigned long long)s_seq[i].at + s_seq[i].hold)
+        if ((unsigned)s_seq[i].port != port ||
+            t < s_seq[i].at || t >= (unsigned long long)s_seq[i].at + s_seq[i].hold)
             continue;
         for (k = 0; k < s_seq[i].nkeys; k++)
             fake_apply(g, s_seq[i].keys[k], s_seq[i].pct[k]);
@@ -359,7 +402,12 @@ bool recomp_input_host_sample_port(unsigned port, RecompInputGamepad *gamepad)
     if (gamepad == NULL)
         return false;
     memset(gamepad, 0, sizeof *gamepad);
-    if (!(port == 0 && seq_owns_pad()) && recomp_bindings_sample(port, &pad)) {
+    /* Lockstep: both players' controls for this frame, the same on both
+     * machines (hle_netplay.h). */
+    if (hle_net_port_input(port, gamepad))
+        return true;
+    if (!((port == 0 && seq_owns_pad()) || (port > 0 && (recomp_input_seq_ports() >> port) & 1u)) &&
+        recomp_bindings_sample(port, &pad)) {
         gamepad->buttons = (uint16_t)pad.wButtons;
         for (i = 0; i < RECOMP_INPUT_ANALOG_BUTTON_COUNT; i++)
             gamepad->analog_buttons[i] = pad.bAnalogButtons[i];
@@ -370,7 +418,9 @@ bool recomp_input_host_sample_port(unsigned port, RecompInputGamepad *gamepad)
     }
     if (port == 0) {
         fake_input(gamepad);
-        seq_input(gamepad);
+        seq_input(gamepad, 0u);
+    } else if ((recomp_input_seq_ports() >> port) & 1u) {
+        seq_input(gamepad, port);
     }
     return true;
 }
@@ -378,4 +428,26 @@ bool recomp_input_host_sample_port(unsigned port, RecompInputGamepad *gamepad)
 bool recomp_input_host_sample(RecompInputGamepad *gamepad)
 {
     return recomp_input_host_sample_port(0u, gamepad);
+}
+
+/* What this machine's player is doing: a port's devices (the first's, or
+ * the second's for a second copy on one PC) and the first's script,
+ * whichever game port the player plays (netplay sends it). */
+void recomp_input_host_sample_local(unsigned port, RecompInputGamepad *gamepad)
+{
+    XBOX_GAMEPAD pad;
+    int i;
+
+    memset(gamepad, 0, sizeof *gamepad);
+    if (!seq_owns_pad() && recomp_bindings_sample(port, &pad)) {
+        gamepad->buttons = (uint16_t)pad.wButtons;
+        for (i = 0; i < RECOMP_INPUT_ANALOG_BUTTON_COUNT; i++)
+            gamepad->analog_buttons[i] = pad.bAnalogButtons[i];
+        gamepad->thumb_lx = (int16_t)pad.sThumbLX;
+        gamepad->thumb_ly = (int16_t)pad.sThumbLY;
+        gamepad->thumb_rx = (int16_t)pad.sThumbRX;
+        gamepad->thumb_ry = (int16_t)pad.sThumbRY;
+    }
+    fake_input(gamepad);
+    seq_input(gamepad, 0u);
 }

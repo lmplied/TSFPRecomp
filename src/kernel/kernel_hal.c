@@ -376,6 +376,37 @@ static void xbox_update_tick_count(void)
 
 #define XBOX_ACPI_FREQUENCY 3375000LL
 
+/* ============================================================================
+ * Lockstep time (RECOMP_LOCKSTEP_CLOCK)
+ *
+ * Two machines in lockstep must read the same time at the same point of the
+ * game, so under the lockstep clock every clock a title reads is the frame
+ * count: the main thread's frames ended, a sixtieth of a second each. A read
+ * adds a microsecond to its own thread's count within the frame, so a title
+ * waiting on the clock still sees it move -- its wait ends after the same
+ * number of reads on every machine -- and a thread's time never runs back.
+ * ========================================================================= */
+static __declspec(thread) long t_vt_frame = -1;
+static __declspec(thread) uint64_t t_vt_us, t_vt_last;
+
+/* Microseconds of lockstep time for the calling thread. */
+static uint64_t lockstep_us(void)
+{
+    long f = xbox_LockstepFrames();
+    uint64_t now;
+
+    if (t_vt_frame != f) {
+        t_vt_frame = f;
+        t_vt_us = 0;
+    }
+    t_vt_us++;
+    now = (uint64_t)f * 1000000ull / 60ull + t_vt_us;
+    if (now <= t_vt_last)
+        now = t_vt_last + 1;
+    t_vt_last = now;
+    return now;
+}
+
 static LARGE_INTEGER qpc_base;      /* host ticks at first call */
 static LONGLONG      qpc_host_freq; /* host ticks per second */
 static int           qpc_passthru;  /* RECOMP_HOST_QPC */
@@ -401,6 +432,12 @@ LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void)
 {
     LARGE_INTEGER counter;
 
+    if (xbox_LockstepClockOn()) {
+        uint64_t us = lockstep_us();
+        counter.QuadPart = (LONGLONG)((us / 1000000ull) * XBOX_ACPI_FREQUENCY +
+                                      (us % 1000000ull) * XBOX_ACPI_FREQUENCY / 1000000ull);
+        return counter;
+    }
     if (!qpc_ready)
         xbox_hal_init_timers();
     QueryPerformanceCounter(&counter);
@@ -483,6 +520,11 @@ VOID __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
 
     if (!CurrentTime)
         return;
+    if (xbox_LockstepClockOn()) {
+        /* 1 January 2005, then the frames: the same date on every machine. */
+        CurrentTime->QuadPart = 127491552000000000LL + (LONGLONG)lockstep_us() * 10LL;
+        return;
+    }
 
     InitOnceExecuteOnce(&s_time_once, anchor_system_time, NULL, NULL);
     QueryPerformanceCounter(&now);
@@ -1145,6 +1187,11 @@ uint64_t xbox_ReadTimeStampCounter(void)
     static LARGE_INTEGER freq;
     static LARGE_INTEGER origin;
     LARGE_INTEGER now;
+
+    if (xbox_LockstepClockOn()) {
+        uint64_t us = lockstep_us();
+        return (us / 1000000ull) * XBOX_TSC_HZ + (us % 1000000ull) * XBOX_TSC_HZ / 1000000ull;
+    }
 
     if (freq.QuadPart == 0) {
         QueryPerformanceFrequency(&freq);

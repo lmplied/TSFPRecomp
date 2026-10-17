@@ -69,6 +69,10 @@ void recomp_pad_name(int slot, char *out, size_t n);
  * next call. A pad without motors ignores it. */
 void recomp_pad_rumble(int slot, uint16_t low, uint16_t high);
 
+/* For tests: a pad in this slot with this state, standing in for whatever
+ * is plugged in; NULL takes it out again. */
+void recomp_pad_test_set(int slot, const RecompPadState *state);
+
 #ifdef __cplusplus
 }
 #endif

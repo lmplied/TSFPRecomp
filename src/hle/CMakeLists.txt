@@ -48,6 +48,8 @@ if(WIN32)
         # Button prompts for the keyboard and mouse: the pad's icons drawn
         # as the keys bound to them (hle_texture_replace.h).
         hle_prompts.c
+        hle_lockstep.c
+        hle_netplay.c
     )
 endif()
 target_include_directories(xbox_hle PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -56,8 +58,9 @@ target_link_libraries(xbox_hle PUBLIC xbox_kernel)
 # Host device choice and per-control bindings (src/input/input_bindings.c),
 # shared with the USB gamepad so one config file covers both input paths.
 target_link_libraries(xbox_hle PUBLIC xbox_input)
+target_link_libraries(xbox_hle PUBLIC xbox_net)       # co-op: this PC's addresses
 if(WIN32)
-    target_link_libraries(xbox_hle PRIVATE xaudio2 ole32 xinput9_1_0 shell32 uuid)
+    target_link_libraries(xbox_hle PRIVATE xaudio2 ole32 oleaut32 xinput9_1_0 shell32 uuid ws2_32)
     # The D3D8 replacements drive the host renderer in src/d3d, and open a
     # window of their own for it.
     target_link_libraries(xbox_hle PRIVATE xbox_d3d8 xbox_video user32)

@@ -26,10 +26,19 @@ a pad -- opens a settings panel over the game. Esc, F1 or B closes it.
 | General | Volume, 0 to 100% in fives: the master voice's gain, squared so steps sound even | at once |
 | | Mute in the background | at once |
 | | Pause in the background: on losing the focus in play, the title's pause control is pressed for it (`recomp_bindings_pause_on_focus_loss`; FP: Start, while the look builder runs) | at once |
+| | Keyboard and mouse: player 1 with the first controller, or player 1 alone with the controllers from player 2 (`keyboard_alone`; input-binding.md) | at once: the title is told a pad arrived or left |
 | | Button prompts: Automatic, Keyboard and mouse, Controller (`hle_prompts.h`; input-binding.md) | at once |
 | | Skip intro videos | next start (only the title's logo videos, which its project names) |
+| Co-op (a title that starts sessions: `hle_net_supported`) | Play: Host or Join | at once |
+| | Hosting: Invite code (`recomp_invite.h`), made when the page first opens; Internet address (STUN, `recomp_net_addr.h`) and On this network, each with the port. Enter or a click copies one | at once |
+| | Joining: Invite code or address, typed (Ctrl+V pastes) | saved with the settings |
+| | Port, typed | saved with the settings |
+| | Host co-op / Join co-op: Enter twice (the first arms it) | the game starts again into the session (`hle_net_restart`) |
+| | In a session: whom with, the input delay, Leave co-op (Enter twice) | Leave starts the game again on its own |
 
-A row that only applies at the next start says so beside its value.
+A row that only applies at the next start says so beside its value. The
+Co-op page's text rows take typing (`hle_menu_char`, from the window's
+WM_CHAR); everything else on it works with a pad too.
 
 ## With the mouse
 

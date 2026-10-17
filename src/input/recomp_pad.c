@@ -252,6 +252,19 @@ const char *recomp_pad_api_name(void)
     return recomp_pad_api() == RECOMP_PAD_API_XINPUT ? "XInput" : "SDL3";
 }
 
+/* recomp_pad_test_set: slots a test has filled. */
+static int            g_test_set[RECOMP_PAD_SLOTS];
+static RecompPadState g_test_state[RECOMP_PAD_SLOTS];
+
+void recomp_pad_test_set(int slot, const RecompPadState *state)
+{
+    if (slot < 0 || slot >= RECOMP_PAD_SLOTS)
+        return;
+    g_test_set[slot] = state != NULL;
+    if (state)
+        g_test_state[slot] = *state;
+}
+
 int recomp_pad_read(int slot, RecompPadState *out)
 {
     if (!out)
@@ -259,6 +272,10 @@ int recomp_pad_read(int slot, RecompPadState *out)
     memset(out, 0, sizeof *out);
     if (slot < 0 || slot >= RECOMP_PAD_SLOTS)
         return 0;
+    if (g_test_set[slot]) {
+        *out = g_test_state[slot];
+        return 1;
+    }
 #if defined(_WIN32)
     if (recomp_pad_api() == RECOMP_PAD_API_XINPUT)
         return xinput_read(slot, out);

@@ -203,12 +203,14 @@ void recomp_settings_defaults(RecompSettings *s)
     s->brightness        = 1.0;
     s->mute_unfocused    = 0;
     s->pause_unfocused   = 1;
+    s->keyboard_alone    = 0;
     s->volume            = 100;
     s->fxaa              = 0;
     s->prompts           = 0;
     s->skip_intro        = 0;
     s->fov               = 0.0;
     s->weapon_fov        = 0.0;
+    s->online_port       = 47800;
     snprintf(s->frame_cap, sizeof s->frame_cap, "adaptive");
 }
 
@@ -271,6 +273,8 @@ int recomp_settings_read(const char *path, RecompSettings *s)
             s->mute_unfocused = !off_word(v);
         if ((v = from_table("pause_unfocused")) != NULL)
             s->pause_unfocused = !off_word(v);
+        if ((v = from_table("keyboard_alone")) != NULL)
+            s->keyboard_alone = !off_word(v);
         if ((v = from_table("volume")) != NULL)
             s->volume = clamp_int(atoi(v), 0, 100);
         if ((v = from_table("fxaa")) != NULL)
@@ -292,6 +296,10 @@ int recomp_settings_read(const char *path, RecompSettings *s)
         }
         if ((v = from_table("game_dir")) != NULL)
             snprintf(s->game_dir, sizeof s->game_dir, "%s", v);
+        if ((v = from_table("online_address")) != NULL)
+            snprintf(s->online_address, sizeof s->online_address, "%s", v);
+        if ((v = from_table("online_port")) != NULL)
+            s->online_port = clamp_int(atoi(v), 1, 65535);
     }
 
     memcpy(g_entries, saved, sizeof saved);
@@ -422,6 +430,12 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "#                                            [RECOMP_PAUSE_UNFOCUSED]\n"
         "pause_unfocused = %d\n"
         "\n"
+        "# Keyboard and mouse play player 1 on their own, and controllers start\n"
+        "# at player 2: for a friend joining through Steam Remote Play or Parsec\n"
+        "# while you play on keyboard and mouse. 0 has player 1 read the first\n"
+        "# controller as well.                         [RECOMP_KEYBOARD_ALONE]\n"
+        "keyboard_alone = %d\n"
+        "\n"
         "# Volume of everything the game plays, 0 to 100 percent.\n"
         "#                                                     [RECOMP_VOLUME]\n"
         "volume = %d\n"
@@ -454,7 +468,8 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "# Where the game's files are, if they are not beside the executable.\n"
         "#                                                   [RECOMP_GAME_DIR]\n",
         s->brightness >= 0.5 ? s->brightness : 1.0, s->fxaa ? 1 : 0, s->mute_unfocused,
-        s->pause_unfocused, s->volume < 0 ? 0 : (s->volume > 100 ? 100 : s->volume),
+        s->pause_unfocused, s->keyboard_alone ? 1 : 0,
+        s->volume < 0 ? 0 : (s->volume > 100 ? 100 : s->volume),
         s->prompts == 1 ? "keyboard" : s->prompts == 2 ? "controller" : "auto",
         s->wide_fill, s->skip_intro,
         s->fov > 0.0 ? s->fov : 0.0, s->weapon_fov > 0.0 ? s->weapon_fov : 0.0);
@@ -463,6 +478,16 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         fprintf(f, "game_dir = %s\n", s->game_dir);
     else
         fprintf(f, "# game_dir =\n");
+
+    fprintf(f, "\n"
+        "# The launcher's Online tab: the host's address last joined, and the UDP\n"
+        "# port last hosted or joined on. Only the launcher reads these; the game\n"
+        "# is told what to do by RECOMP_NET (hle_netplay.h).\n");
+    if (s->online_address[0])
+        fprintf(f, "online_address = %s\n", s->online_address);
+    else
+        fprintf(f, "# online_address =\n");
+    fprintf(f, "online_port = %d\n", s->online_port > 0 ? s->online_port : 47800);
 
     fclose(f);
     return 1;

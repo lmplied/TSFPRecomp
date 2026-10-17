@@ -553,6 +553,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
 
+    /* Step 1b: an online session (RECOMP_NET), set up before anything else
+     * reads a setting or a save: the two machines must start from the same
+     * ones (hle_netplay.h). Before the memory layout too, whose timer thread
+     * reads the lockstep clock's switch the moment it starts. */
+    {
+        extern int hle_net_session_begin(const void *xbe, size_t xbe_size, const char *game_dir);
+        if (!hle_net_session_begin(xbe_data, xbe_size, g_game_dir)) {
+            free(xbe_data);
+            return 1;
+        }
+    }
+
     /* Step 2: Initialize Xbox memory layout */
     printf("Initializing Xbox memory layout...\n");
     if (!xbox_MemoryLayoutInit(xbe_data, xbe_size)) {

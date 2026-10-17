@@ -157,8 +157,26 @@ static uint64_t qpc_us(void)
     return (uint64_t)((double)t.QuadPart * 1000000.0 / (double)freq.QuadPart);
 }
 
+/* kernel_bridge.c: the lockstep clock (hle_lockstep.h). Under it the sound
+ * a title hears play advances with its frames, not the host's playback, so
+ * "has this sound finished?" has the same answer on every machine. Not the
+ * vblanks a loading screen is given while the main thread ends no frames:
+ * how many there are is how long the load took on this machine, and counted
+ * here they set every sound after a load apart by that much -- Future
+ * Perfect's level music, and the game with it, parted two machines a second
+ * after the first level began. The sound stands still while a level loads. */
+int  xbox_LockstepClockOn(void);
+long xbox_LockstepFrames(void);
+
+uint64_t hle_dsound_lockstep_ms(void)
+{
+    return 1000000u + (uint64_t)xbox_LockstepFrames() * 1000u / 60u;
+}
+
 static uint64_t now_ms(void)
 {
+    if (xbox_LockstepClockOn())
+        return hle_dsound_lockstep_ms();
     return lead_ms() ? qpc_us() / 1000u : GetTickCount64();
 }
 
@@ -1337,7 +1355,7 @@ HLE_EXPORT(DirectSoundDoWork)
     unlock();
     /* Streams: feed the host, complete packets -- on their own clock (the
      * tick count every other stream entry point reads), not this file's. */
-    hle_dsound_stream_tick(GetTickCount64());
+    hle_dsound_stream_tick(xbox_LockstepClockOn() ? hle_dsound_lockstep_ms() : GetTickCount64());
     HLE_RETURN(0);
 }
 

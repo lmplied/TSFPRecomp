@@ -165,7 +165,8 @@ static void kernel_data_init(void)
 
     /* KeTickCount (ordinal 156) - initialized to current tick count.
      * A background thread in main.c updates this every ~1ms. */
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = GetTickCount();
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) =
+        xbox_LockstepClockOn() ? 0x00100000u : GetTickCount();
 
     /* LaunchDataPage (ordinal 164).
      *
@@ -427,6 +428,8 @@ static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
     g_esp += 12;
 }
 
+static void gate_thread_start(uint32_t ctx);   /* lockstep, below */
+
 static DWORD WINAPI bridge_thread_main(LPVOID param)
 {
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
@@ -457,6 +460,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     }
     free(s);
 
+    gate_thread_start(ctx1);           /* lockstep: one pass a frame, if gated */
     bridge_run_thread_inline(fn, ctx1, ctx2);
     xbox_GuestLiftedExit();   /* no longer running lifted code */
 
@@ -1284,10 +1288,30 @@ static void bridge_HalReturnToFirmware(void)
 /* The host asking to quit -- the user closed the window. The same flushes as
  * a title's own exit above, then ExitProcess, which runs no atexit handler.
  * Called from whichever thread owns the window. */
+/* What else must happen as the game is closed: an online session tells the
+ * other player it has gone, and gives back the port it opened on the router
+ * (hle_netplay.c). In the order asked for. */
+static void (*s_host_exit_hooks[4])(void);
+
+void xbox_AtHostExit(void (*fn)(void))
+{
+    int i;
+
+    for (i = 0; i < 4; i++)
+        if (!s_host_exit_hooks[i]) {
+            s_host_exit_hooks[i] = fn;
+            return;
+        }
+}
+
 void xbox_HostExit(const char *why)
 {
+    int i;
+
     fprintf(stderr, "  [KERNEL] exiting: %s\n", why);
     fflush(stderr);
+    for (i = 0; i < 4 && s_host_exit_hooks[i]; i++)
+        s_host_exit_hooks[i]();
     RECOMP_ICALL_FEEDBACK_DUMP();
     {
         extern void recomp_profile_dump(void);
@@ -2621,6 +2645,159 @@ static LONGLONG vblank_clock_wait_us(void)
     return (s_vblank_clock.next - now.QuadPart) * 1000000 / s_vblank_clock.qpf;
 }
 
+/* RECOMP_LOCKSTEP_CLOCK=1: one vblank for each frame the title ends. A title
+ * that steps its world by the vblanks since its last frame (Future Perfect
+ * does) then steps it by exactly one every frame, however long a frame took
+ * on this machine -- the same steps on every machine, which lockstep play
+ * needs. A slow frame slows the game down instead of being caught up. The
+ * vblank still waits for its deadline, so a fast machine keeps the console's
+ * 60. Where the title's main thread ends no frame for three vblanks (it is
+ * loading, and a loading screen of its own thread waits on the vblank), the
+ * clock runs free, so nothing waiting for a vblank hangs. Those are counted
+ * and logged: a title whose world steps by the vblank count must not see
+ * them -- Future Perfect's frame clock is told one vblank a frame
+ * (titles/futureperfect, sub_00022030) -- or two machines part there. */
+static volatile LONG s_lock_frames, s_lock_delivered;
+static volatile LONG s_lock_free;
+static LONGLONG      s_lock_frame_at;
+
+/* Gated threads (xbox_LockstepGateThread): a title's worker that wakes on a
+ * timer -- Future Perfect's sound worker, every 16 ms -- would interleave with
+ * the main thread wherever the host scheduler put it, a different place on
+ * every machine. Gated, it runs one pass per frame, at the frame's end, while
+ * the main thread waits for it: its timed wait hands back to the main thread
+ * ("done") and waits for the next frame's end ("go"). While the main thread
+ * ends no frames (loading) the gate stands open, so nothing waits on it. */
+static uint32_t      s_gate_ctx[4];
+static int           s_gate_count;
+static volatile LONG s_gate_alive, s_gate_slow;
+static HANDLE        s_gate_go, s_gate_done;
+static RECOMP_TLS int t_gated;
+
+void xbox_LockstepGateThread(uint32_t start_context)
+{
+    if (s_gate_count < 4)
+        s_gate_ctx[s_gate_count++] = start_context;
+}
+
+static int lockstep_clock(void);
+
+static int gate_open(void)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return !s_lock_frame_at || now.QuadPart - s_lock_frame_at > s_vblank_clock.period * 3;
+}
+
+/* The gated thread, at a timed wait: hand back, and wait for the next frame's
+ * end -- or, loading, go on after the wait it asked for. 1 when it waited at
+ * the gate (the caller then only polls its object). */
+static volatile LONG s_gate_log;
+static void gate_log(const char *what, DWORD ms)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_LOCKSTEP_GATE_LOG") != NULL;
+    if (on && InterlockedIncrement(&s_gate_log) <= 400) {
+        fprintf(stderr, "[GATE] %llu frame %ld thread %lu %s %lu\n", GetTickCount64(),
+                s_lock_frames, GetCurrentThreadId(), what, ms, ms);
+        fflush(stderr);
+    }
+}
+
+int xbox_LockstepGatePass(DWORD timeout_ms)
+{
+    if (!t_gated)
+        return 0;
+    gate_log("pass at a timed wait", timeout_ms);
+    SetEvent(s_gate_done);
+    for (;;) {
+        if (WaitForSingleObject(s_gate_go, timeout_ms < 16 ? timeout_ms : 16) == WAIT_OBJECT_0)
+            return 1;
+        if (gate_open())
+            return 0;                   /* loading: the timer as it was */
+    }
+}
+
+static void gate_frame_end(void)
+{
+    if (!s_gate_alive)
+        return;
+    gate_log("frame end: go", 0);
+    SetEvent(s_gate_go);
+    if (WaitForSingleObject(s_gate_done, 250) != WAIT_OBJECT_0 &&
+        InterlockedIncrement(&s_gate_slow) <= 8) {
+        fprintf(stderr, "  [KERNEL] lockstep: a gated thread took longer than 250 ms "
+                        "over frame %ld\n", s_lock_frames);
+        fflush(stderr);
+    }
+}
+
+static void gate_thread_start(uint32_t ctx)
+{
+    int i;
+    /* Off by default: with the clocks and the sound on the frames (above,
+     * hle_dsound.c) Future Perfect needs no gate, and gated at the frame's end
+     * its sound worker stalls the main thread, which waits on it within a
+     * frame. RECOMP_LOCKSTEP_GATE=1 for an experiment. */
+    if (!lockstep_clock() || !xbox_EnvSwitch("RECOMP_LOCKSTEP_GATE", 0))
+        return;
+    for (i = 0; i < s_gate_count; i++)
+        if (s_gate_ctx[i] == ctx) {
+            if (!s_gate_go) {
+                s_gate_go = CreateEventW(NULL, FALSE, FALSE, NULL);
+                s_gate_done = CreateEventW(NULL, FALSE, FALSE, NULL);
+            }
+            t_gated = 1;
+            InterlockedExchange(&s_gate_alive, 1);
+            fprintf(stderr, "  [KERNEL] lockstep: thread 0x%08X runs one pass a frame\n", ctx);
+            fflush(stderr);
+            while (WaitForSingleObject(s_gate_go, 16) != WAIT_OBJECT_0 && !gate_open())
+                ;
+            gate_log("released at its start", 0);
+            return;
+        }
+}
+
+void xbox_LockstepFrameEnded(void)
+{
+    LARGE_INTEGER now;
+
+    QueryPerformanceCounter(&now);
+    s_lock_frame_at = now.QuadPart;
+    InterlockedIncrement(&s_lock_frames);
+    if (lockstep_clock())
+        gate_frame_end();
+}
+
+long xbox_LockstepFreeVblanks(void)
+{
+    return s_lock_free;
+}
+
+long xbox_LockstepFrames(void)
+{
+    return s_lock_frames;
+}
+
+static int lockstep_clock(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = xbox_EnvSwitch("RECOMP_LOCKSTEP_CLOCK", 0);
+        if (on) {
+            fprintf(stderr, "  [NV2A] vblank clock: one vblank a frame (RECOMP_LOCKSTEP_CLOCK)\n");
+            fflush(stderr);
+        }
+    }
+    return on;
+}
+
+int xbox_LockstepClockOn(void)
+{
+    return lockstep_clock();
+}
+
 static void kernel_vblank_tick(void)
 {
     if (!s_vblank_clock.configured)
@@ -2628,7 +2805,30 @@ static void kernel_vblank_tick(void)
     if (!s_vblank_clock.enabled)
         return;
 
-    if (s_vblank_clock.legacy) {
+    if (lockstep_clock() && !s_vblank_clock.legacy) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart < s_vblank_clock.next)
+            return;
+        if (s_lock_frames == s_lock_delivered) {
+            /* No frame since the last vblank: wait for one, looking again in
+             * a millisecond -- unless the title has stopped ending frames. */
+            if (s_lock_frame_at && now.QuadPart - s_lock_frame_at < s_vblank_clock.period * 3) {
+                s_vblank_clock.next = now.QuadPart + s_vblank_clock.qpf / 1000;
+                return;
+            }
+            if (InterlockedIncrement(&s_lock_free) <= 64) {
+                fprintf(stderr, "  [NV2A] lockstep clock: a vblank with no frame, after frame %ld\n",
+                        s_lock_frames);
+                fflush(stderr);
+            }
+        } else {
+            s_lock_delivered = s_lock_frames;
+        }
+        s_vblank_clock.next += s_vblank_clock.period;
+        if (s_vblank_clock.next <= now.QuadPart)
+            s_vblank_clock.next = now.QuadPart + s_vblank_clock.period;
+    } else if (s_vblank_clock.legacy) {
         long long now = (long long)GetTickCount64();
         if (now < s_vblank_clock.next_ms)
             return;

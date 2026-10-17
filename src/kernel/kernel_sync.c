@@ -15,6 +15,7 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"   /* xbox_LockstepGatePass */
 
 /* ============================================================================
  * Helper: Convert NT 100ns interval to Win32 milliseconds
@@ -212,6 +213,10 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
 {
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
     DWORD result;
+
+    /* Lockstep: a gated thread's timed wait is the frame's end (kernel_bridge.c). */
+    if (ms != INFINITE && ms > 0 && xbox_LockstepGatePass(ms))
+        ms = 0;
 
     /*
      * Same as NtWaitForSingleObject but with an explicit wait mode. We run

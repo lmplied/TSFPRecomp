@@ -26,6 +26,10 @@
 #include "launcher_bindings.h"
 #include "recomp_config.h"
 #include "recomp_pad.h"
+#ifdef LAUNCHER_NETPLAY
+#include "recomp_net_addr.h"            /* this PC's addresses, for the Co-op tab */
+#include "recomp_invite.h"              /* invite codes */
+#endif
 
 #ifndef LAUNCHER_GAME_EXE
 #define LAUNCHER_GAME_EXE "game.exe"
@@ -55,6 +59,9 @@ typedef struct Row {
     int        *ival;                   /* ROW_INT / ROW_BOOL / ROW_CHOICE index */
     char       *text;                   /* ROW_TEXT */
     size_t      text_len;
+    const char *empty;                  /* ROW_TEXT: shown while the text is empty */
+    int         numeric;                /* ROW_TEXT: digits only */
+    int         readonly;               /* ROW_TEXT: shown, not typed into */
 } Row;
 
 static const char *const k_frame_caps[] = { "adaptive", "60", "30", "0", NULL };
@@ -67,6 +74,29 @@ static const char *const k_prompt_choices[] = { "auto", "keyboard", "controller"
 static const char *const k_prompt_labels[] = {
     "Automatic", "Keyboard and mouse", "Controller", NULL
 };
+/* keyboard_alone, 0 or 1. */
+static const char *const k_kb_choices[] = { "shared", "alone", NULL };
+static const char *const k_kb_labels[] = {
+    "Player 1, with the first controller", "Player 1 alone, controllers from player 2", NULL
+};
+
+#ifdef LAUNCHER_NETPLAY
+/* The Co-op tab: host or join, the addresses, the port. */
+static const char *const k_online_choices[] = { "host", "join", NULL };
+static const char *const k_online_labels[] = {
+    "Host: wait for player 2 to join", "Join: be player 2 in a friend's game", NULL
+};
+static int  g_online_mode;              /* 0 host, 1 join */
+static char g_online_port_text[8];
+static char g_local_addr[128];          /* this PC's on its networks */
+static char g_pub_text[96], g_lan_text[96];    /* what the host rows show, with the port */
+static char g_lan_help[256];
+static char g_invite_code[24];          /* hosting: this launch's, made as it opens */
+static volatile LONG g_pub_state;       /* the public address: 0 not asked, 1 asking, 2 found, 3 none */
+static char g_pub_addr[64];
+static const void *g_copied_row;        /* a row just copied, said for a moment */
+static ULONGLONG g_copied_at;
+#endif
 
 static RecompSettings g_settings;
 static int            g_frame_cap_index;   /* into k_frame_caps */
@@ -81,7 +111,7 @@ static int            g_weapon_fov_degrees;
 static int            g_brightness_pct;
 
 /* The pages that are lists of settings, each its own list. */
-enum { RT_VIDEO, RT_FRAMES, RT_GENERAL, RT_COUNT };
+enum { RT_VIDEO, RT_FRAMES, RT_GENERAL, RT_ONLINE, RT_COUNT };
 static Row  g_rows[RT_COUNT][12];
 static int  g_row_count[RT_COUNT];
 
@@ -246,6 +276,14 @@ static void build_rows(void)
     r++;
 #endif
 
+    r->label = "Keyboard and mouse";
+    r->help  = "Alone: a friend joining through Steam Remote Play or Parsec, or any"
+               " controller, plays player 2 and up while you play player 1 on keyboard"
+               " and mouse.";
+    r->kind  = ROW_CHOICE; r->choices = k_kb_choices; r->labels = k_kb_labels;
+    r->ival  = &g_settings.keyboard_alone;
+    r++;
+
 #ifdef LAUNCHER_PROMPTS
     /* recomp_add_launcher(... PROMPTS): the title project names its button
      * icons (recomp_prompts_icon). */
@@ -266,6 +304,208 @@ static void build_rows(void)
     r++;
 #endif
     g_row_count[RT_GENERAL] = (int)(r - g_rows[RT_GENERAL]);
+
+#ifdef LAUNCHER_NETPLAY
+    /* recomp_add_launcher(... NETPLAY): the title starts a session from
+     * RECOMP_NET (hle_net_session_begin), which Play sets from this tab. */
+    r = g_rows[RT_ONLINE];
+    r->label = "Play";
+    r->help  = "Co-op on two PCs, each player on their own screen. The host starts first and"
+               " waits; player 2 then joins. The host's saves are played; player 2's are"
+               " left alone.";
+    r->kind  = ROW_CHOICE; r->choices = k_online_choices; r->labels = k_online_labels;
+    r->ival  = &g_online_mode;
+    r++;
+
+    g_row_count[RT_ONLINE] = 1;         /* the rest by the mode: online_rows */
+#endif
+}
+
+#ifdef LAUNCHER_NETPLAY
+/* The public address, asked of a STUN server once, on a thread of its own:
+ * it can take a second or two (recomp_net_addr.h). */
+static DWORD WINAPI public_addr_thread(LPVOID unused)
+{
+    char a[64];
+    int ok = recomp_net_public_addr(a, sizeof a, 1500);
+
+    (void)unused;
+    if (ok)
+        memcpy(g_pub_addr, a, sizeof a);
+    InterlockedExchange(&g_pub_state, ok ? 2 : 3);
+    return 0;
+}
+
+/* The tab's rows after Play, by the mode: hosting, the addresses to give
+ * out -- the internet's (asked for the first time the rows are shown) and
+ * this network's -- each with the port, and a click copies one; joining,
+ * the host's address to type. Then the port. */
+static void online_rows(void)
+{
+    Row *r = &g_rows[RT_ONLINE][1];
+    int port = atoi(g_online_port_text), i;
+    char first[64];
+    const char *comma = strchr(g_local_addr, ',');
+
+    if (port < 1 || port > 65535)
+        port = 47800;
+    for (i = 1; i < 5; i++)
+        memset(&g_rows[RT_ONLINE][i], 0, sizeof(Row));
+    if (g_online_mode == 0) {
+        r->label = "Invite code";
+        r->help  = "Send player 2 this code: a click copies it. They choose Join and type it"
+                   " in -- no ports to open, for most connections. It is new each time.";
+        r->kind  = ROW_TEXT; r->text = g_invite_code; r->text_len = sizeof g_invite_code;
+        r->readonly = 1; r->empty = "Invites are turned off";
+        r++;
+
+        if (InterlockedCompareExchange(&g_pub_state, 1, 0) == 0)
+            CloseHandle(CreateThread(NULL, 0, public_addr_thread, NULL, 0, NULL));
+        if (g_pub_state == 2)
+            snprintf(g_pub_text, sizeof g_pub_text, "%s:%d", g_pub_addr, port);
+        else
+            g_pub_text[0] = '\0';
+        r->label = "Internet address";
+        r->help  = "Instead of the code: give player 2 this to join over the internet. The"
+                   " game asks your router to open the port; if it can't, forward the UDP port"
+                   " to this PC, or both join one VPN.";
+        r->kind  = ROW_TEXT; r->text = g_pub_text; r->text_len = sizeof g_pub_text;
+        r->readonly = 1;
+        r->empty = g_pub_state == 3 ? "Not found (offline?)" : "Finding...";
+        r++;
+
+        snprintf(first, sizeof first, "%.*s",
+                 (int)(comma ? (size_t)(comma - g_local_addr) : strlen(g_local_addr)),
+                 g_local_addr);
+        if (first[0])
+            snprintf(g_lan_text, sizeof g_lan_text, "%s:%d", first, port);
+        else
+            g_lan_text[0] = '\0';
+        r->label = "On this network";
+        snprintf(g_lan_help, sizeof g_lan_help, "Give player 2 this on the same network: a"
+                 " click copies it.%s%s", comma ? " This PC is also at " : "",
+                 comma ? comma + 2 : "");
+        r->help  = g_lan_help;
+        r->kind  = ROW_TEXT; r->text = g_lan_text; r->text_len = sizeof g_lan_text;
+        r->readonly = 1; r->empty = "Not on a network";
+        r++;
+    } else {
+        r->label = "Invite code or address";
+        r->help  = "The invite code the host sent (FP-XXXX-XXXX-XXXX), or their address,"
+                   " like 203.0.113.5. Type it; Ctrl+V pastes.";
+        r->kind  = ROW_TEXT; r->text = g_settings.online_address;
+        r->text_len = sizeof g_settings.online_address; r->empty = "Type it here";
+        r++;
+    }
+    r->label = "Port";
+    r->help  = "The UDP port the host waits on; both use the same. 47800 unless something"
+               " else on the host uses it.";
+    r->kind  = ROW_TEXT; r->text = g_online_port_text; r->text_len = sizeof g_online_port_text;
+    r->numeric = 1; r->empty = "Type it here";
+    r++;
+    g_row_count[RT_ONLINE] = (int)(r - g_rows[RT_ONLINE]);
+}
+
+static void copy_text(const char *text)
+{
+    size_t n = strlen(text) + 1;
+    HGLOBAL h;
+
+    if (!OpenClipboard(NULL))
+        return;
+    EmptyClipboard();
+    h = GlobalAlloc(GMEM_MOVEABLE, n);
+    if (h) {
+        memcpy(GlobalLock(h), text, n);
+        GlobalUnlock(h);
+        if (!SetClipboardData(CF_TEXT, h))
+            GlobalFree(h);
+    }
+    CloseClipboard();
+}
+
+/* A click on an address to give out, or Ctrl+C on one: to the clipboard. */
+static void row_copy(const Row *r)
+{
+    if (r->kind == ROW_TEXT && r->readonly && r->text && r->text[0]) {
+        copy_text(r->text);
+        g_copied_row = r;
+        g_copied_at = GetTickCount64();
+    }
+}
+
+/* RECOMP_NET for the game, from the tab; 0, with the player told why, when
+ * it cannot be made. */
+static int online_env(HWND owner)
+{
+    char spec[200];
+    int port = atoi(g_online_port_text);
+
+    if (port < 1 || port > 65535) {
+        MessageBoxA(owner, "The port is a number from 1 to 65535: 47800 unless something"
+                    " else on the host uses it.", "Co-op", MB_OK | MB_ICONWARNING);
+        return 0;
+    }
+    if (g_online_mode == 1 && !g_settings.online_address[0]) {
+        MessageBoxA(owner, "Type the host's invite code or address first.", "Co-op",
+                    MB_OK | MB_ICONWARNING);
+        return 0;
+    }
+    if (g_online_mode == 0) {
+        if (g_invite_code[0])
+            snprintf(spec, sizeof spec, "host:%d:%s", port, g_invite_code);
+        else
+            snprintf(spec, sizeof spec, "host:%d", port);
+    } else {
+        char code[24];
+        if (recomp_invite_parse(g_settings.online_address, code, sizeof code))
+            snprintf(spec, sizeof spec, "invite:%s", code);
+        else
+            snprintf(spec, sizeof spec, "join:%s:%d", g_settings.online_address, port);
+    }
+    SetEnvironmentVariableA("RECOMP_NET", spec);
+    return 1;
+}
+#endif
+
+/* Typing into a text row: a character, Backspace, or Ctrl+V; Ctrl+C on an
+ * address to give out copies it. */
+static void row_type(Row *r, unsigned ch)
+{
+    size_t n;
+
+#ifdef LAUNCHER_NETPLAY
+    if (ch == 3) {
+        row_copy(r);
+        return;
+    }
+#endif
+    if (r->kind != ROW_TEXT || !r->text || r->readonly)
+        return;
+    n = strlen(r->text);
+    if (ch == 8) {
+        if (n)
+            r->text[n - 1] = '\0';
+    } else if (ch == 22) {
+        if (OpenClipboard(NULL)) {
+            HANDLE h = GetClipboardData(CF_TEXT);
+            const char *t = h ? (const char *)GlobalLock(h) : NULL;
+
+            for (; t && *t; t++)
+                if (*t > ' ' && *t < 0x7F && (!r->numeric || (*t >= '0' && *t <= '9')) &&
+                    n + 1 < r->text_len) {
+                    r->text[n++] = *t;
+                    r->text[n] = '\0';
+                }
+            if (h)
+                GlobalUnlock(h);
+            CloseClipboard();
+        }
+    } else if (ch > ' ' && ch < 0x7F && (!r->numeric || (ch >= '0' && ch <= '9')) &&
+               n + 1 < r->text_len) {
+        r->text[n] = (char)ch;
+        r->text[n + 1] = '\0';
+    }
 }
 
 static void row_value(const Row *r, char *out, size_t n)
@@ -301,7 +541,12 @@ static void row_value(const Row *r, char *out, size_t n)
         snprintf(out, n, "%s", r->labels ? r->labels[*r->ival] : r->choices[*r->ival]);
         break;
     default:
-        snprintf(out, n, "%s", r->text && r->text[0] ? r->text : "Beside the game");
+        snprintf(out, n, "%s%s", r->text && r->text[0] ? r->text : r->empty ? r->empty : "",
+#ifdef LAUNCHER_NETPLAY
+                 (const void *)r == g_copied_row && GetTickCount64() - g_copied_at < 2000
+                     ? "      copied" :
+#endif
+                 "");
         break;
     }
 }
@@ -333,6 +578,8 @@ static int row_can(const Row *r, int delta)
     switch (r->kind) {
     case ROW_INT:
         return delta < 0 ? *r->ival > r->lo : *r->ival < r->hi;
+    case ROW_TEXT:
+        return 0;                       /* typed, not stepped */
     default:
         return 1;
     }
@@ -543,6 +790,10 @@ static void settings_load(void)
     g_weapon_fov_degrees = g_settings.weapon_fov > 0.0 ? (int)(g_settings.weapon_fov + 0.5)
                                                        : LAUNCHER_WEAPON_FOV;
 #endif
+#ifdef LAUNCHER_NETPLAY
+    snprintf(g_online_port_text, sizeof g_online_port_text, "%d",
+             g_settings.online_port > 0 ? g_settings.online_port : 47800);
+#endif
     g_frame_cap_index = 0;
     {
         int i;
@@ -611,6 +862,13 @@ static int settings_save(void)
     g_settings.wide_fill = g_wide_index == 2;
 #endif
     g_settings.brightness = g_brightness_pct / 100.0;
+#ifdef LAUNCHER_NETPLAY
+    {
+        int port = atoi(g_online_port_text);
+        if (port >= 1 && port <= 65535)
+            g_settings.online_port = port;
+    }
+#endif
 #ifdef LAUNCHER_FOV
     /* The game's own angle is written as 0, as the in-game menu does, so a
      * title whose own angle changes is not held at this one. */
@@ -738,9 +996,19 @@ static int pad_poll(int *dx, int *dy, int *accept, int *cancel, int *tab)
 
 /* ----------------------------------------------------------------- state */
 
-typedef enum { TAB_VIDEO, TAB_FRAMES, TAB_INPUT, TAB_GENERAL, TAB_ABOUT, TAB_COUNT } Tab;
+typedef enum {
+    TAB_VIDEO, TAB_FRAMES, TAB_INPUT, TAB_GENERAL,
+#ifdef LAUNCHER_NETPLAY
+    TAB_ONLINE,
+#endif
+    TAB_ABOUT, TAB_COUNT
+} Tab;
 static const char *const k_tab_names[TAB_COUNT] = {
-    "VIDEO", "FRAME RATE", "INPUT", "GENERAL", "ABOUT"
+    "VIDEO", "FRAME RATE", "INPUT", "GENERAL",
+#ifdef LAUNCHER_NETPLAY
+    "CO-OP",
+#endif
+    "ABOUT"
 };
 
 static Tab    g_tab;
@@ -754,7 +1022,9 @@ static HWND   g_hwnd;
 static ThemeRect tab_rect(int i)
 {
     ThemeRect r;
-    r.w = 130;
+    int room = (g_cw - 120 - (TAB_COUNT - 1) * 14) / TAB_COUNT;     /* all of them across */
+
+    r.w = room < 130 ? room : 130;
     r.h = 40;
     r.x = 60 + i * (r.w + 14);
     r.y = 92;
@@ -816,7 +1086,11 @@ static void set_tab(Tab t)
 static int row_tab(void)
 {
     return g_tab == TAB_VIDEO ? RT_VIDEO : g_tab == TAB_FRAMES ? RT_FRAMES
-         : g_tab == TAB_GENERAL ? RT_GENERAL : -1;
+         : g_tab == TAB_GENERAL ? RT_GENERAL
+#ifdef LAUNCHER_NETPLAY
+         : g_tab == TAB_ONLINE ? RT_ONLINE
+#endif
+         : -1;
 }
 
 static void rows_for_tab(void)
@@ -829,8 +1103,28 @@ static void rows_for_tab(void)
         g_sel = g_rows_on_tab ? g_rows_on_tab - 1 : 0;
 }
 
+/* What the big button does here: play, or on the Online tab host or join. */
+static const char *play_verb(void)
+{
+#ifdef LAUNCHER_NETPLAY
+    if (g_tab == TAB_ONLINE)
+        return g_online_mode ? "Join" : "Host";
+#endif
+    return "Play";
+}
+
 static void do_play(void)
 {
+#ifdef LAUNCHER_NETPLAY
+    /* RECOMP_NET from the Online tab, and from no other: the game is
+     * offline unless that is where Play was pressed. */
+    if (g_tab == TAB_ONLINE) {
+        if (!online_env(g_hwnd))
+            return;
+    } else {
+        SetEnvironmentVariableA("RECOMP_NET", NULL);
+    }
+#endif
     settings_save();
     bindings_save();
     if (launch_game())
@@ -990,7 +1284,7 @@ static void draw(void)
         ThemeRect t = tab_rect(i);
 
         theme_text(t, k_tab_names[i], 12, 700,
-                   i == g_tab ? THEME_GREEN : THEME_TEXT_DIM, THEME_CENTRE);
+                   i == g_tab ? THEME_ACCENT : THEME_TEXT_DIM, THEME_CENTRE);
     }
     {
         ThemeRect a = tab_rect(g_tab_from), b = tab_rect(g_tab);
@@ -999,6 +1293,9 @@ static void draw(void)
         theme_tab_underline(a, b, g_tab_t);
     }
 
+#ifdef LAUNCHER_NETPLAY
+    online_rows();
+#endif
     if (row_tab() >= 0) {
         Row *rows = g_rows[row_tab()];
         int count = g_row_count[row_tab()];
@@ -1015,9 +1312,15 @@ static void draw(void)
                        lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
 
             row_value(row, value, sizeof value);
+            /* Typed into: a caret after the text, and none of the "type it
+             * here" a moment ago. */
+            if (row->kind == ROW_TEXT && !row->readonly && lit > 0.5) {
+                snprintf(value, sizeof value, "%s%s", row->text ? row->text : "",
+                         g_pulse * 4.0 - (int)(g_pulse * 4.0) < 0.5 ? "_" : " ");
+            }
             vr = rr; vr.x += 300; vr.w = rr.w - 360;
             theme_text(vr, value, 13, 400,
-                       lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+                       lit > 0.5 ? THEME_ACCENT : THEME_TEXT_DIM, THEME_LEFT);
 
             ar = arrows_rect(rr);
             theme_arrows(ar, row_can(row, -1), row_can(row, 1), lit);
@@ -1040,10 +1343,10 @@ static void draw(void)
             h2.y -= 24; h2.h = 20;
             h2.x += 300; h2.w = 200;
             theme_text(h2, "CONTROLLER", 10, 700,
-                       g_bind_col == 0 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+                       g_bind_col == 0 ? THEME_ACCENT : THEME_TEXT_DIM, THEME_LEFT);
             h2.x += 210;
             theme_text(h2, "KEYBOARD / MOUSE", 10, 700,
-                       g_bind_col == 1 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+                       g_bind_col == 1 ? THEME_ACCENT : THEME_TEXT_DIM, THEME_LEFT);
         }
 
         for (i = 0; i < BIND_ROWS_VISIBLE; i++) {
@@ -1067,7 +1370,7 @@ static void draw(void)
                 theme_text(lr, "Editing", 12, 600,
                            lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
                 theme_text(cv, line, 12, 400,
-                           lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+                           lit > 0.5 ? THEME_ACCENT : THEME_TEXT_DIM, THEME_LEFT);
             } else if (k == BIND_ROW_DEVICE) {
                 if (bp->device == BIND_DEV_PAD) {
                     char name[64];
@@ -1085,36 +1388,36 @@ static void draw(void)
                 theme_text(lr, "Read from", 12, 600,
                            lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
                 theme_text(cv, line, 12, 400,
-                           lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+                           lit > 0.5 ? THEME_ACCENT : THEME_TEXT_DIM, THEME_LEFT);
             } else if (k == BIND_ROW_API) {
                 theme_text(lr, "Controllers", 12, 600,
                            lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
                 theme_text(cv, g_bind.pad_api == BIND_PAD_API_XINPUT
                                    ? "Xbox controllers only (XInput)"
                                    : "All controllers (SDL3)",
-                           12, 400, lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+                           12, 400, lit > 0.5 ? THEME_ACCENT : THEME_TEXT_DIM, THEME_LEFT);
             } else if (k == BIND_ROW_SENS) {
                 snprintf(line, sizeof line, "%.1f", bp->mouse.sensitivity);
                 theme_text(lr, "Mouse sensitivity", 12, 600,
                            lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
                 theme_text(cv, line, 12, 400,
-                           lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+                           lit > 0.5 ? THEME_ACCENT : THEME_TEXT_DIM, THEME_LEFT);
             } else if (k == BIND_ROW_YSCALE) {
                 snprintf(line, sizeof line, "%.1f x side to side", bp->mouse.y_scale);
                 theme_text(lr, "Mouse up and down speed", 12, 600,
                            lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
                 theme_text(cv, line, 12, 400,
-                           lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+                           lit > 0.5 ? THEME_ACCENT : THEME_TEXT_DIM, THEME_LEFT);
             } else if (k == BIND_ROW_INVERT) {
                 theme_text(lr, "Mouse up and down", 12, 600,
                            lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
                 theme_text(cv, bp->mouse.invert_y ? "Inverted" : "Normal", 12, 400,
-                           lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+                           lit > 0.5 ? THEME_ACCENT : THEME_TEXT_DIM, THEME_LEFT);
             } else if (k == BIND_ROW_RESET) {
                 theme_text(lr, "Reset this controller", 12, 600,
                            lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
                 theme_text(cv, "Back to the defaults", 12, 400,
-                           lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+                           lit > 0.5 ? THEME_ACCENT : THEME_TEXT_DIM, THEME_LEFT);
             } else {
                 int c = k - BIND_HEAD_ROWS;
                 int hidden = bind_hidden_count(bp, c);
@@ -1129,7 +1432,7 @@ static void draw(void)
                            (g_capturing && lit > 0.5 && g_bind_col == 0)
                                ? "press something..." : bind_source_label(bp->pad_src[c]),
                            12, 400,
-                           (lit > 0.5 && g_bind_col == 0) ? THEME_GREEN : THEME_TEXT_DIM,
+                           (lit > 0.5 && g_bind_col == 0) ? THEME_ACCENT : THEME_TEXT_DIM,
                            THEME_LEFT);
                 cv.x += 210;
                 /* "+2": this control answers to more than the one shown
@@ -1145,7 +1448,7 @@ static void draw(void)
                            (g_capturing && lit > 0.5 && g_bind_col == 1)
                                ? "press a key or click..." : key_label,
                            12, 400,
-                           (lit > 0.5 && g_bind_col == 1) ? THEME_GREEN : THEME_TEXT_DIM,
+                           (lit > 0.5 && g_bind_col == 1) ? THEME_ACCENT : THEME_TEXT_DIM,
                            THEME_LEFT);
             }
 
@@ -1249,10 +1552,15 @@ static void draw(void)
 
     /* The footer says how to drive it, and changes with what is plugged in. */
     r.x = 60; r.y = g_ch - 44; r.w = g_cw - 260; r.h = 24;
-    theme_text(r, g_pad_seen
-                  ? "A  Play      B  Quit      LB RB  Change tab      D-pad  Move"
-                  : "Enter  Play      Esc  Quit      Tab  Change tab      Arrows  Move",
-               11, 400, THEME_TEXT_DIM, THEME_LEFT);
+    {
+        char keys[160];
+
+        snprintf(keys, sizeof keys, g_pad_seen
+                 ? "A  %s      B  Quit      LB RB  Change tab      D-pad  Move"
+                 : "Enter  %s      Esc  Quit      Tab  Change tab      Arrows  Move",
+                 play_verb());
+        theme_text(r, keys, 11, 400, THEME_TEXT_DIM, THEME_LEFT);
+    }
 
     {   /* Play, always on screen, always the obvious thing to press. */
         ThemeRect b;
@@ -1260,8 +1568,14 @@ static void draw(void)
         b.w = 150; b.h = 42;
         b.x = g_cw - 60 - b.w;
         b.y = g_ch - 74;
+        char verb[16];
+        int k;
+
+        for (k = 0; play_verb()[k] && k < (int)sizeof verb - 1; k++)
+            verb[k] = (char)(play_verb()[k] & ~0x20);           /* upper case */
+        verb[k] = '\0';
         theme_panel(b, 0.85);
-        theme_text(b, "PLAY", 13, 700, THEME_TEXT, THEME_CENTRE);
+        theme_text(b, verb, 13, 700, THEME_TEXT, THEME_CENTRE);
     }
 }
 
@@ -1333,6 +1647,13 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         }
         InvalidateRect(h, NULL, FALSE);
         return 0;
+    case WM_CHAR:
+        /* Into the text row selected, if that is what is selected. */
+        if (row_tab() >= 0 && g_sel < g_row_count[row_tab()]) {
+            row_type(&g_rows[row_tab()][g_sel], (unsigned)wp);
+            InvalidateRect(h, NULL, FALSE);
+        }
+        return 0;
     case WM_LBUTTONDOWN: {
         int mx = LOWORD(lp), my = HIWORD(lp), i;
 
@@ -1382,6 +1703,9 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             /* Back or forward on the arrows; anywhere else on the row steps
              * it forward, which is how a toggle is clicked. */
             row_move(&g_rows[row_tab()][i], dir ? dir : 1);
+#ifdef LAUNCHER_NETPLAY
+            row_copy(&g_rows[row_tab()][i]);
+#endif
         }
         if (hit_play(mx, my))
             do_play();
@@ -1454,9 +1778,29 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
      * glows shows as a blur over all of it. */
     SetProcessDPIAware();
 
+#ifdef LAUNCHER_PALETTE_DARK
+    /* recomp_add_launcher(... PALETTE <dark> <mid> <ink>): the title's own
+     * colours instead of the Xbox green. */
+    {
+        ThemePalette pal;
+        theme_palette_from(&pal, LAUNCHER_PALETTE_DARK, LAUNCHER_PALETTE_MID,
+                           LAUNCHER_PALETTE_INK);
+        theme_set_palette(&pal);
+    }
+#endif
+
     read_title();
     settings_load();
     bindings_load();
+#ifdef LAUNCHER_NETPLAY
+    recomp_net_local_addrs(g_local_addr, sizeof g_local_addr);
+    {
+        /* RECOMP_NET_SIGNAL=0: no relay, so no code to give. */
+        const char *e = getenv("RECOMP_NET_SIGNAL");
+        if (!(e && strcmp(e, "0") == 0))
+            recomp_invite_new(g_invite_code, sizeof g_invite_code);
+    }
+#endif
     build_rows();
     rows_for_tab();
 

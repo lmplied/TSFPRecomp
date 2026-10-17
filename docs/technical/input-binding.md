@@ -359,6 +359,24 @@ The sticks have no keyboard default. Every comfortable key around WASD is
 already a button in that map, and guessing would have silently changed what
 existing runs do.
 
+### Players joining while the game runs
+
+A port a file does not name keeps its default, pad N for controller N, so a
+second pad plugged in mid-game is player 2 without any set-up: the pad list is
+read again four times a second (`recomp_pad.c`), and the title hears of the
+new pad through `XGetDeviceChanges` as the console would have told it
+(`hle_input.c`).
+
+`keyboard_alone` (settings file, `RECOMP_KEYBOARD_ALONE`, F1 General and the
+launcher's General page, off by default) is for a friend joining through
+Steam Remote Play Together or Parsec while you play on keyboard and mouse:
+their virtual pad is this machine's first, which is player 1's beside the
+keyboard, so the two of you would steer one player. On, player 1 reads no pad
+(when it has keys or the mouse bound) and every later player reads the pad
+before the one it names -- controllers start at player 2. Changed live, the
+title is told a pad arrived or left. `pad_of` in `input_bindings.c`;
+`recomp_pad_test_set` stands in for a pad in tests.
+
 ## The UI
 
 ```

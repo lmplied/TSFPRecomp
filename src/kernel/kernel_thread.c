@@ -190,6 +190,11 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         ms = (DWORD)(diff / 10000);
     }
 
+    /* Lockstep: a gated thread's sleep is the frame's end (kernel_bridge.c). Future
+     * Perfect's sound worker sleeps by waiting 16 ms on itself, which arrives here. */
+    if (xbox_LockstepGatePass(ms))
+        return STATUS_SUCCESS;
+
     if (Alertable) {
         DWORD result = SleepEx(ms, TRUE);
         if (result == WAIT_IO_COMPLETION)

@@ -25,15 +25,27 @@
 #include "audio_output.h"          /* mute in the background */
 #include "hle_xmv_play.h"          /* skip intro videos */
 #include "hle_prompts.h"           /* button prompts */
+#include "hle_netplay.h"           /* co-op: the Co-op page, and what a session fixes */
+#include "recomp_net_addr.h"        /* this PC's addresses, to give out */
+#include "recomp_invite.h"          /* invite codes */
 #include "../kernel/xbox_memory_layout.h"   /* the frame cap */
 
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>              /* the field of view across the screen */
 
-enum { TAB_DISPLAY, TAB_MOUSE, TAB_CONTROLS, TAB_GENERAL, TAB_COUNT };
-static const char *const k_tab_names[TAB_COUNT] = { "Display", "Mouse", "Controls", "General" };
+/* Co-op last, and only for a title that starts sessions (hle_net_supported). */
+enum { TAB_DISPLAY, TAB_MOUSE, TAB_CONTROLS, TAB_GENERAL, TAB_COOP, TAB_COUNT };
+static const char *const k_tab_names[TAB_COUNT] = {
+    "Display", "Mouse", "Controls", "General", "Co-op"
+};
+
+static int tabs_shown(void)
+{
+    return hle_net_supported() ? TAB_COUNT : TAB_COOP;
+}
 
 enum { D_RES, D_WIDE, D_FOV, D_WFOV, D_ANISO, D_FXAA, D_BRIGHT, D_CAP, D_FPS, D_FULL, D_VRR,
        D_INTERP, D_COUNT };
@@ -68,8 +80,12 @@ static int disp_kind(int row)
  * zoomed aim only for a title that aims by the mouse itself, a hold-or-toggle
  * row for each control the title reports a toggle for. */
 enum { MR_SENS, MR_YSCALE, MR_INVERT, MR_ZOOM, MR_HOLD, MR_RESET };
-enum { G_VOLUME, G_MUTE, G_PAUSE, G_PROMPTS, G_INTRO, G_COUNT };
+enum { G_VOLUME, G_MUTE, G_PAUSE, G_KBALONE, G_PROMPTS, G_INTRO, G_COUNT };
 enum { C_RESET = BIND_CONTROLS, C_COUNT };          /* then a reset row */
+/* The Co-op page's rows, by what they are: hosting, joining, or in a
+ * session (coop_rows). */
+enum { CR_MODE, CR_CODE, CR_PUBLIC, CR_LAN, CR_ADDR, CR_PORT, CR_GO, CR_WITH, CR_DELAY,
+       CR_LEAVE };
 
 /* The frame cap's stops, in xbox_Nv2aFlipGateSetMode's order, as the
  * settings file spells them. */
@@ -116,6 +132,19 @@ static struct {
     WORD pad_prev;
     int  repeat_dir;
     ULONGLONG repeat_at;
+
+    /* The Co-op page. The address joined is the settings file's
+     * (online_address); the port is typed as text and kept there too. */
+    unsigned chars[32];         /* typed, from the window thread */
+    int  nchars;
+    int  coop_join;             /* 0 host, 1 join */
+    char coop_port[8];
+    char coop_lan[128];         /* this PC's addresses on its networks */
+    char coop_code[24];         /* hosting: the invite code, made as the page first opens */
+    int  copied_kind;           /* the row just copied, for a moment */
+    ULONGLONG copied_at;
+    ULONGLONG confirm_at;       /* Enter once on Host / Join / Leave: once more to restart */
+    char coop_error[96];
 } m;
 
 static void ensure_lock(void)
@@ -147,6 +176,18 @@ int hle_menu_key(unsigned vk)
     EnterCriticalSection(&m.lock);
     if (m.nkeys < (int)(sizeof m.keys / sizeof m.keys[0]))
         m.keys[m.nkeys++] = vk;
+    LeaveCriticalSection(&m.lock);
+    return 1;
+}
+
+int hle_menu_char(unsigned ch)
+{
+    ensure_lock();
+    if (!m.open || m.tab != TAB_COOP)
+        return 0;
+    EnterCriticalSection(&m.lock);
+    if (m.nchars < (int)(sizeof m.chars / sizeof m.chars[0]))
+        m.chars[m.nchars++] = ch;
     LeaveCriticalSection(&m.lock);
     return 1;
 }
@@ -307,9 +348,25 @@ static void open_menu(void)
     m.set.wide_fill = xbox_D3D8WideFill();
     m.set.mute_unfocused = recomp_audio_output_mute_unfocused();
     m.set.pause_unfocused = recomp_bindings_pause_unfocused();
+    m.set.keyboard_alone = recomp_bindings_keyboard_alone();
     m.set.prompts = recomp_prompts_mode();
     m.set.volume = recomp_audio_output_volume();
     m.set_dirty = 0;
+
+    if (hle_net_supported()) {
+        snprintf(m.coop_port, sizeof m.coop_port, "%d",
+                 m.set.online_port > 0 ? m.set.online_port : 47800);
+        recomp_net_local_addrs(m.coop_lan, sizeof m.coop_lan);
+        if (!m.coop_code[0]) {
+            const char *e = getenv("RECOMP_NET_SIGNAL");     /* 0: no relay, no code */
+            if (!(e && strcmp(e, "0") == 0))
+                recomp_invite_new(m.coop_code, sizeof m.coop_code);
+        }
+        m.confirm_at = 0;
+        m.coop_error[0] = '\0';
+    }
+    if (m.tab >= tabs_shown())
+        m.tab = 0;
 
     bindings_load();
     m.mouse_port = recomp_bindings_mouse_port();
@@ -320,6 +377,7 @@ static void open_menu(void)
     m.editing = 0;
     EnterCriticalSection(&m.lock);
     m.nkeys = 0;
+    m.nchars = 0;
     m.wheel = 0;
     m.nptr = 0;
     LeaveCriticalSection(&m.lock);
@@ -356,14 +414,156 @@ static int all_released(WORD pad)
     return (pad & (RECOMP_PAD_A | RECOMP_PAD_B | RECOMP_PAD_START | RECOMP_PAD_BACK)) == 0;
 }
 
+/* --------------------------------------------------------------- co-op */
+
+/* The Co-op page's rows: in a session, whom with and a way out; else host
+ * (the addresses to give out) or join (the address to type), the port, and
+ * the button that starts the game again into co-op. */
+static int coop_rows(int *kind)
+{
+    int n = 0;
+
+    if (hle_net_active()) {
+        kind[n++] = CR_WITH;
+        kind[n++] = CR_DELAY;
+        kind[n++] = CR_LEAVE;
+        return n;
+    }
+    kind[n++] = CR_MODE;
+    if (!m.coop_join) {
+        if (m.coop_code[0])
+            kind[n++] = CR_CODE;
+        kind[n++] = CR_PUBLIC;
+        kind[n++] = CR_LAN;
+    } else {
+        kind[n++] = CR_ADDR;
+    }
+    kind[n++] = CR_PORT;
+    kind[n++] = CR_GO;
+    return n;
+}
+
+static int coop_kind(int row)
+{
+    int kind[8], n = coop_rows(kind);
+
+    return row >= 0 && row < n ? kind[row] : -1;
+}
+
+static int coop_port(void)
+{
+    int port = atoi(m.coop_port);
+
+    return port >= 1 && port <= 65535 ? port : 0;
+}
+
+/* The first of this PC's addresses on its networks, with the port. */
+static void coop_lan_first(char *out, size_t n)
+{
+    const char *comma = strchr(m.coop_lan, ',');
+    size_t len = comma ? (size_t)(comma - m.coop_lan) : strlen(m.coop_lan);
+
+    if (!len) {
+        out[0] = '\0';
+        return;
+    }
+    snprintf(out, n, "%.*s:%d", (int)len, m.coop_lan, coop_port() ? coop_port() : 47800);
+}
+
+/* Host, join or leave: the game starts again (both must start together).
+ * Enter once arms it, again within a few seconds does it -- anything not
+ * saved is lost. */
+static void coop_go(int kind)
+{
+    char spec[200];
+    ULONGLONG now = GetTickCount64();
+
+    m.coop_error[0] = '\0';
+    if (kind == CR_GO && !coop_port()) {
+        snprintf(m.coop_error, sizeof m.coop_error, "The port is a number from 1 to 65535.");
+        return;
+    }
+    if (kind == CR_GO && m.coop_join && !m.set.online_address[0]) {
+        snprintf(m.coop_error, sizeof m.coop_error,
+                 "Type the host's invite code or address first.");
+        return;
+    }
+    if (!m.confirm_at || now - m.confirm_at > 4000) {
+        m.confirm_at = now;
+        return;
+    }
+    m.confirm_at = 0;
+    if (kind == CR_GO) {
+        m.set.online_port = coop_port();
+        m.set_dirty = 1;
+        char code[24];
+        if (m.coop_join && recomp_invite_parse(m.set.online_address, code, sizeof code))
+            snprintf(spec, sizeof spec, "invite:%s", code);
+        else if (m.coop_join)
+            snprintf(spec, sizeof spec, "join:%s:%d", m.set.online_address, coop_port());
+        else if (m.coop_code[0])
+            snprintf(spec, sizeof spec, "host:%d:%s", coop_port(), m.coop_code);
+        else
+            snprintf(spec, sizeof spec, "host:%d", coop_port());
+    }
+    settings_save();
+    if (!hle_net_restart(kind == CR_GO ? spec : NULL))
+        snprintf(m.coop_error, sizeof m.coop_error, "The game could not be started again.");
+}
+
+/* A character typed on the Co-op page: into the address or the port. */
+static void coop_type(unsigned ch)
+{
+    int kind = coop_kind(m.sel[TAB_COOP]);
+    char *text = kind == CR_ADDR ? m.set.online_address : kind == CR_PORT ? m.coop_port : NULL;
+    size_t cap = kind == CR_ADDR ? sizeof m.set.online_address : sizeof m.coop_port, n;
+
+    if (!text)
+        return;
+    n = strlen(text);
+    if (ch == 8) {
+        if (n)
+            text[n - 1] = '\0';
+    } else if (ch == 22) {                                  /* Ctrl+V */
+        if (OpenClipboard(NULL)) {
+            HANDLE h = GetClipboardData(CF_TEXT);
+            const char *t = h ? (const char *)GlobalLock(h) : NULL;
+
+            for (; t && *t; t++)
+                if (*t > ' ' && *t < 0x7F && (kind != CR_PORT || (*t >= '0' && *t <= '9')) &&
+                    n + 1 < cap) {
+                    text[n++] = *t;
+                    text[n] = '\0';
+                }
+            if (h)
+                GlobalUnlock(h);
+            CloseClipboard();
+        }
+    } else if (ch > ' ' && ch < 0x7F && (kind != CR_PORT || (ch >= '0' && ch <= '9')) &&
+               n + 1 < cap) {
+        text[n] = (char)ch;
+        text[n + 1] = '\0';
+    } else {
+        return;
+    }
+    m.confirm_at = 0;
+    m.coop_error[0] = '\0';
+    if (kind == CR_PORT && coop_port())
+        m.set.online_port = coop_port();
+    m.set_dirty = 1;
+}
+
 /* --------------------------------------------------------------- moving */
 
 static int row_count(int tab)
 {
+    int kind[8];
+
     switch (tab) {
     case TAB_DISPLAY:  return disp_rows();
     case TAB_MOUSE:    return m.mouse_port >= 0 ? m.nmrow : 1;
     case TAB_GENERAL:  return G_COUNT;
+    case TAB_COOP:     return coop_rows(kind);
     default:           return C_COUNT;
     }
 }
@@ -372,6 +572,8 @@ static void move(int dy)
 {
     int n = row_count(m.tab), s = m.sel[m.tab] + dy;
 
+    m.confirm_at = 0;
+
     if (s < 0) s = n - 1;
     if (s >= n) s = 0;
     m.sel[m.tab] = s;
@@ -379,7 +581,8 @@ static void move(int dy)
 
 static void next_tab(int d)
 {
-    m.tab = (m.tab + d + TAB_COUNT) % TAB_COUNT;
+    m.confirm_at = 0;
+    m.tab = (m.tab + d + tabs_shown()) % tabs_shown();
     if (m.sel[m.tab] >= row_count(m.tab))
         m.sel[m.tab] = 0;
 }
@@ -539,8 +742,16 @@ static void change(int dir)
         case G_PAUSE:
             if (!recomp_bindings_pause_available())
                 return;
+            /* Online, both are fixed for the session (hle_netplay.c,
+             * pin_settings): the change is saved for the next game. */
             m.set.pause_unfocused = !m.set.pause_unfocused;
-            recomp_bindings_set_pause_unfocused(m.set.pause_unfocused);
+            if (!hle_net_active())
+                recomp_bindings_set_pause_unfocused(m.set.pause_unfocused);
+            break;
+        case G_KBALONE:
+            m.set.keyboard_alone = !m.set.keyboard_alone;
+            if (!hle_net_active())
+                recomp_bindings_set_keyboard_alone(m.set.keyboard_alone);
             break;
         case G_PROMPTS:
             if (!recomp_prompts_available())
@@ -553,6 +764,11 @@ static void change(int dir)
             break;
         }
         m.set_dirty = 1;
+    }
+    if (m.tab == TAB_COOP && coop_kind(row) == CR_MODE) {
+        m.coop_join = !m.coop_join;
+        m.confirm_at = 0;
+        m.coop_error[0] = '\0';
     }
 }
 
@@ -595,6 +811,33 @@ static void accept(void)
     }
     if (m.tab == TAB_GENERAL) {
         change(1);
+        return;
+    }
+    if (m.tab == TAB_COOP) {
+        int kind = coop_kind(row);
+        char addr[96], pub[64];
+
+        if (kind == CR_MODE) {
+            change(1);
+        } else if (kind == CR_CODE) {
+            hle_net_copy_text(m.coop_code);
+            m.copied_kind = kind;
+            m.copied_at = GetTickCount64();
+        } else if (kind == CR_PUBLIC && hle_net_public_addr(pub, sizeof pub) > 0) {
+            snprintf(addr, sizeof addr, "%s:%d", pub, coop_port() ? coop_port() : 47800);
+            hle_net_copy_text(addr);
+            m.copied_kind = kind;
+            m.copied_at = GetTickCount64();
+        } else if (kind == CR_LAN) {
+            coop_lan_first(addr, sizeof addr);
+            if (addr[0]) {
+                hle_net_copy_text(addr);
+                m.copied_kind = kind;
+                m.copied_at = GetTickCount64();
+            }
+        } else if (kind == CR_GO || kind == CR_LEAVE) {
+            coop_go(kind);
+        }
         return;
     }
     if (row < BIND_CONTROLS) {
@@ -670,9 +913,9 @@ static void build(D3D8Menu *menu)
 
     memset(menu, 0, sizeof *menu);
     snprintf(menu->title, sizeof menu->title, "Settings");
-    menu->tab_count = TAB_COUNT;
+    menu->tab_count = tabs_shown();
     menu->tab = m.tab;
-    for (i = 0; i < TAB_COUNT; i++)
+    for (i = 0; i < tabs_shown(); i++)
         snprintf(menu->tabs[i], sizeof menu->tabs[i], "%s", k_tab_names[i]);
     sel = m.sel[m.tab];
     menu->selected = sel;
@@ -833,6 +1076,130 @@ static void build(D3D8Menu *menu)
                 break;
             }
         }
+    } else if (m.tab == TAB_COOP) {
+        int kind[8], n = coop_rows(kind), port = coop_port() ? coop_port() : 47800;
+        int caret = (GetTickCount64() / 500) % 2 == 0;
+        int armed = m.confirm_at && GetTickCount64() - m.confirm_at <= 4000;
+        char pub[64], peer[64];
+        int found, delay = 0;
+        unsigned rtt = 0;
+
+        for (i = 0; i < n; i++) {
+            int lit = i == sel, copied = m.copied_kind == kind[i] &&
+                                         GetTickCount64() - m.copied_at < 2000;
+            switch (kind[i]) {
+            case CR_MODE:
+                row(menu, "Play", m.coop_join ? "Join a friend's game"
+                                              : "Host: wait for player 2 to join", 1);
+                break;
+            case CR_CODE:
+                snprintf(v, sizeof v, "%s%s", m.coop_code, copied ? "   copied" : "");
+                row(menu, "Invite code", v, 0);
+                break;
+            case CR_PUBLIC:
+                found = hle_net_public_addr(pub, sizeof pub);
+                if (found > 0)
+                    snprintf(v, sizeof v, "%s:%d%s", pub, port, copied ? "   copied" : "");
+                else
+                    snprintf(v, sizeof v, "%s", found < 0 ? "Not found (offline?)" : "Finding...");
+                row(menu, "Internet address", v, 0);
+                break;
+            case CR_LAN:
+                coop_lan_first(tmp, sizeof tmp);
+                snprintf(v, sizeof v, "%s%s", tmp[0] ? tmp : "Not on a network",
+                         copied ? "   copied" : "");
+                row(menu, "On this network", v, 0);
+                break;
+            case CR_ADDR:
+                snprintf(v, sizeof v, "%s%s", m.set.online_address,
+                         lit && caret ? "_" : m.set.online_address[0] ? "" : lit ? " " : "Type it here");
+                row(menu, "Invite code or address", v, 0);
+                break;
+            case CR_PORT:
+                snprintf(v, sizeof v, "%s%s", m.coop_port, lit && caret ? "_" : "");
+                row(menu, "Port", v, 0);
+                break;
+            case CR_GO:
+                row(menu, m.coop_join ? "Join co-op" : "Host co-op",
+                    armed ? "Press Enter again to restart the game now"
+                          : m.coop_join ? "Restart the game and join"
+                                        : "Restart the game and wait for player 2", 0);
+                break;
+            case CR_WITH:
+                hle_net_session_info(peer, sizeof peer, &delay, &rtt);
+                snprintf(v, sizeof v, hle_net_local_port() == 0 ? "Hosting; player 2 is at %s"
+                                                                : "Player 2; the host is at %s",
+                         peer);
+                row(menu, "Co-op", v, 0);
+                break;
+            case CR_DELAY:
+                hle_net_session_info(NULL, 0, &delay, &rtt);
+                snprintf(v, sizeof v, "%d frame%s  (%u ms there and back)", delay,
+                         delay == 1 ? "" : "s", rtt);
+                row(menu, "Input delay", v, 0);
+                break;
+            default:
+                row(menu, "Leave co-op", armed ? "Press Enter again to restart the game now"
+                                               : "Restart the game on its own", 0);
+                break;
+            }
+        }
+        switch (kind[sel < n ? sel : 0]) {
+        case CR_MODE:
+            snprintf(menu->help, sizeof menu->help,
+                     "Co-op on two PCs, each player on their own screen. The game starts again "
+                     "on both: the host first, then player 2 joins. The host's saves are played.");
+            break;
+        case CR_CODE:
+            snprintf(menu->help, sizeof menu->help,
+                     "Send player 2 this code; Enter or a click copies it. They choose Join and "
+                     "type it in -- no ports to open, for most connections.");
+            break;
+        case CR_PUBLIC:
+            snprintf(menu->help, sizeof menu->help,
+                     "Instead of the code: player 2 can join over the internet with this. "
+                     "Hosting asks your router to open the port; if it can't, forward UDP %d "
+                     "to this PC, or both join one VPN.", port);
+            break;
+        case CR_LAN:
+            snprintf(menu->help, sizeof menu->help,
+                     "On the same network, player 2 joins this; Enter or a click copies it.%s%s",
+                     strchr(m.coop_lan, ',') ? " This PC also has: " : "",
+                     strchr(m.coop_lan, ',') ? strchr(m.coop_lan, ',') + 2 : "");
+            break;
+        case CR_ADDR:
+            snprintf(menu->help, sizeof menu->help,
+                     "The invite code the host sent (FP-XXXX-XXXX-XXXX), or their address, like "
+                     "203.0.113.5:%d. Type it; Ctrl+V pastes, Backspace deletes.", port);
+            break;
+        case CR_PORT:
+            snprintf(menu->help, sizeof menu->help,
+                     "The UDP port the host waits on; both use the same. 47800 unless "
+                     "something else on the host uses it.");
+            break;
+        case CR_GO:
+            snprintf(menu->help, sizeof menu->help, "%s",
+                     m.coop_error[0] ? m.coop_error
+                     : m.coop_join ? "Starts the game again and joins the host. Anything not "
+                                     "saved is lost."
+                                   : "Starts the game again and waits for player 2. Anything "
+                                     "not saved is lost.");
+            break;
+        case CR_WITH:
+            snprintf(menu->help, sizeof menu->help,
+                     "This game is in co-op with another PC, each player on their own screen.");
+            break;
+        case CR_DELAY:
+            snprintf(menu->help, sizeof menu->help,
+                     "Frames between a press and the game seeing it, so that both PCs have both "
+                     "players' controls in time. Set from the round trip as co-op began.");
+            break;
+        default:
+            snprintf(menu->help, sizeof menu->help, "%s",
+                     m.coop_error[0] ? m.coop_error
+                     : "Starts the game again on its own. The other player is told you left.");
+            break;
+        }
     } else if (m.tab == TAB_GENERAL) {
         snprintf(v, sizeof v, "%d%%", m.set.volume);
         row(menu, "Volume", v, 1);
@@ -840,6 +1207,9 @@ static void build(D3D8Menu *menu)
         row(menu, "Pause in the background",
             recomp_bindings_pause_available() ? on_off(m.set.pause_unfocused)
                                               : "Not for this game", 1);
+        row(menu, "Keyboard and mouse",
+            m.set.keyboard_alone ? "Player 1 alone, controllers from player 2"
+                                 : "Player 1, with the first controller", 1);
         row(menu, "Button prompts",
             !recomp_prompts_available() ? "Not for this game"
             : m.set.prompts == RECOMP_PROMPTS_KEYBOARD ? "Keyboard and mouse"
@@ -855,6 +1225,9 @@ static void build(D3D8Menu *menu)
                 "screenshot to your Pictures folder.",
                 "Alt+Tab during play pauses the game, so it is waiting at the pause "
                 "menu when you come back.",
+                "Alone: a friend joining through Steam Remote Play or Parsec, or any "
+                "controller, plays player 2 and up while you play player 1 on keyboard "
+                "and mouse.",
                 "The game's button icons as the keys bound to them. Automatic follows "
                 "whichever you used last, keyboard and mouse or a controller.",
                 "Skip the logo videos before the title screen. Read when the game starts.",
@@ -906,7 +1279,8 @@ static void mouse_act(int kind, int x, int y)
         return;
     }
     if (hit == D3D8_MENU_HIT_TAB && kind == HLE_MENU_MOUSE_LEFT && index != m.tab &&
-        index >= 0 && index < TAB_COUNT) {
+        index >= 0 && index < tabs_shown()) {
+        m.confirm_at = 0;
         m.tab = index;
         if (m.sel[m.tab] >= row_count(m.tab))
             m.sel[m.tab] = 0;
@@ -947,8 +1321,8 @@ void hle_menu_frame(void)
 {
     RecompPadState pad;
     WORD btn = 0, pressed, dirs;
-    unsigned keys[32];
-    int nkeys, wheel, nptr, i, escape = 0;
+    unsigned keys[32], chars[32];
+    int nkeys, nchars, wheel, nptr, i, escape = 0;
     struct { int kind, x, y; } ptr[16];
     ULONGLONG now = GetTickCount64();
 
@@ -996,7 +1370,12 @@ void hle_menu_frame(void)
     nptr = m.nptr;
     memcpy(ptr, m.ptr, sizeof ptr);
     m.nptr = 0;
+    nchars = m.nchars;
+    memcpy(chars, m.chars, sizeof chars);
+    m.nchars = 0;
     LeaveCriticalSection(&m.lock);
+    for (i = 0; i < nchars && m.tab == TAB_COOP; i++)
+        coop_type(chars[i]);
 
     if (m.editing) {
         for (i = 0; i < nkeys; i++)

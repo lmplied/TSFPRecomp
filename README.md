@@ -61,6 +61,20 @@ respective owners. This project is not affiliated with or endorsed by them.
 - On-screen button prompts show your keys — "E Select", "F Back" — instead of
   the pad's A and B, and switch back when you pick up a controller.
 
+**Multiplayer**
+- Co-op on two PCs over a network or the internet: each player plays on their
+  own PC, full screen, with their own resolution, frame rate, mouse and
+  controls. Set up in the game's settings panel (F1, *Co-op*) or the
+  launcher's *Co-op* tab (see [Co-op on two PCs](#co-op-on-two-pcs)).
+- Split-screen works with a controller per player; a controller plugged in
+  while the game runs joins as the next player.
+- *Keyboard and mouse: player 1 alone* moves controllers to player 2 and up,
+  so a friend joining through Steam Remote Play Together or Parsec plays their
+  own player while you play on keyboard and mouse.
+- The *Xbox Live / System Link* menu reads *Online / LAN*. Behind them are
+  still the game's own Xbox Live and System Link screens, with no service to
+  connect to; co-op on two PCs is set up from F1 or the launcher instead.
+
 **Sound**
 - Fixed: lines of dialogue cutting into each other, looping and broken
   cutscene dialogue, and the noise on the System Link screen and at the start
@@ -70,7 +84,7 @@ respective owners. This project is not affiliated with or endorsed by them.
 **Quality of life**
 - In-game settings panel (F1, or Back+Start on a pad) with Display, Mouse,
   Controls and General pages, plus a launcher for setting up before the first
-  run.
+  run — both in Future Perfect's own blues.
 - The game pauses itself if you Alt+Tab away during play.
 - Skip the logo videos at start-up.
 - F12 saves a screenshot to `Pictures\TimeSplitters FP`.
@@ -217,6 +231,46 @@ game the mouse; Alt+Tab gives it back.
 | F12 | Screenshot |
 | Alt+Enter | Fullscreen / window |
 
+### Co-op on two PCs
+
+For two players, each on their own PC. Both need this same release and the
+same (USA) game. Set it up in the game (F1, then the *Co-op* page) or in the
+launcher's *Co-op* tab; the two work the same way.
+
+1. The host leaves *Play* on *Host* and sends player 2 the *Invite code*
+   (FP-XXXX-XXXX-XXXX). Click it to copy it; in the game, Enter on it does
+   too.
+2. The host chooses *Host co-op* (in the launcher, **Host**). The game starts
+   again and waits for player 2 in a small window, which shows the code again
+   with a *Copy code* button. The first time, Windows asks whether to let the
+   game through its firewall: allow it.
+3. Player 2 sets *Play* to *Join*, pastes the code into *Invite code or
+   address* (Ctrl+V), and chooses *Join co-op* (in the launcher, **Join**).
+4. Both games start together, from the host's saves, and go straight to the
+   main menu with both players in: 2 players, the host's profile for player
+   1, and a profile for player 2 (made the first time). Pick *Story Co-op*
+   or anything else on the host.
+
+To stop, choose *Leave co-op* on the F1 *Co-op* page: the game starts again on
+its own, and the other player is told.
+
+No ports to open, for most connections: with the code, the two games find
+each other through a free public relay (ntfy.sh), where everything they say
+is encrypted with the code, and then connect to each other directly. A few
+networks are too strict for that (some mobile and office ones), and the game
+says so. Then the host can give out an address instead, which the *Co-op*
+page also shows: their internet address, with UDP port 47800 forwarded on
+their router (the game asks the router to do it itself, by UPnP, and says
+whether it did), or their address on a VPN both have joined (ZeroTier,
+Tailscale, Radmin VPN). In the same house, *On this network* always works.
+
+To try it on one PC, run both copies there: the host plays on the keyboard
+and mouse, and player 2 on a controller.
+
+Player 2's own saves are left alone: the host's are copied to
+`%LOCALAPPDATA%\xboxrecomp\online` for the session. Progress is kept in the
+host's saves.
+
 ### Where things are kept
 
 - Settings: `%APPDATA%\xboxrecomp\titles\45410066.conf`
@@ -228,8 +282,9 @@ game the mouse; Alt+Tab gives it back.
 ## Known limitations
 
 - Only the USA release, and only on Windows.
-- Multiplayer beyond one screen — System Link, and play over the internet — is
-  not supported, and split-screen has not been tested with a mouse.
+- Co-op on two PCs has so far been tested with two copies on one PC, invite
+  codes included, but not yet between two houses. Online versus and the game's own LAN (System Link) mode
+  are not working yet. Split-screen works.
 - Front-end screens not yet seen with the mouse (Mapmaker, some Challenge and
   Extras pages) may still need the keys or a pad.
 - Button prompts cover A, B, X and Y. Other icons still show the pad's.

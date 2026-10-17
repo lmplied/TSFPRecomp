@@ -266,6 +266,19 @@ void xbox_Nv2aFlipGateSetIdle(xbox_FlipGateIdleFn fn);
  * Swap is held to the next vblank under them too. For a title project. */
 void xbox_Nv2aFlipGateSetTitlePaced(int on);
 
+/* RECOMP_LOCKSTEP_CLOCK=1 (kernel_bridge.c): the vblank clock delivers one
+ * vblank for each frame the title ends, told here from its Swap. FreeVblanks:
+ * those delivered while no frame ended (loading), where two machines in
+ * lockstep can part. */
+void xbox_LockstepFrameEnded(void);
+long xbox_LockstepFreeVblanks(void);
+int  xbox_LockstepClockOn(void);       /* RECOMP_LOCKSTEP_CLOCK, for a title project */
+long xbox_LockstepFrames(void);        /* the title's main-thread frames ended */
+/* A title's timer-driven worker, named by its start context, to run one pass
+ * a frame at the frame's end under the lockstep clock. Before the game starts. */
+void xbox_LockstepGateThread(uint32_t start_context);
+int  xbox_LockstepGatePass(unsigned long timeout_ms);   /* kernel_sync.c, at a timed wait */
+
 /* The setting by name ("adaptive", "60", "30", "off", or "custom" for one
  * RECOMP_FPS_CAP asked for that is not a stop on the cycle), and the next
  * one along. For a key the player presses while the title runs. */

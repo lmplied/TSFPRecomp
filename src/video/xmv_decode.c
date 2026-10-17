@@ -175,6 +175,10 @@ xmv_video_decoder *xmv_decoder_create(uint32_t width, uint32_t height,
     }
     memcpy(d->ctx->extradata, extradata, 4);
     d->ctx->extradata_size = 4;
+    /* The same pictures from every CPU: co-op's two machines write them into
+     * the title's memory (hle_xmv_play.c), and the two must stay alike. */
+    d->ctx->flags |= AV_CODEC_FLAG_BITEXACT;
+    d->ctx->thread_count = 1;
     if (ff.open2(d->ctx, codec, NULL) < 0) {
         fprintf(stderr, "[XMV] FFmpeg would not open WMV2 %ux%u\n", width, height);
         xmv_decoder_destroy(d);

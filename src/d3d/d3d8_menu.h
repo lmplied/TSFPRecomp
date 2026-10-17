@@ -19,7 +19,7 @@
 extern "C" {
 #endif
 
-#define D3D8_MENU_TABS 4
+#define D3D8_MENU_TABS 6
 #define D3D8_MENU_ROWS 32
 
 typedef struct D3D8MenuRow {
@@ -55,6 +55,12 @@ enum {
     D3D8_MENU_HIT_TAB, D3D8_MENU_HIT_ROW, D3D8_MENU_HIT_LEFT, D3D8_MENU_HIT_RIGHT
 };
 int xbox_D3D8MenuHit(int x, int y, int *index);
+
+/* The title's colours in place of the Xbox green, as 0xRRGGBB: the darks, a
+ * selected row, lines and text -- the three its launcher is given
+ * (recomp_add_launcher ... PALETTE), so the two look alike. Before the menu
+ * is first shown. */
+void xbox_D3D8MenuSetPalette(unsigned dark, unsigned mid, unsigned ink);
 
 /* d3d8_device.c, after the resolve: draw the menu, if one is showing, onto
  * the window's buffer of w by h. */

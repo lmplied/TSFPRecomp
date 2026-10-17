@@ -41,6 +41,7 @@
 #include "input_model.h"
 #include "input_host.h"
 #include "input_bindings.h"
+#include "hle_netplay.h"
 
 /* RECOMP_INPUT_LOG=1 -- see the read in XInputGetState below. */
 static int input_log_wanted(void)
@@ -102,7 +103,7 @@ static BOOL CALLBACK init(PINIT_ONCE once, PVOID param, PVOID *ctx)
     (void)once; (void)param; (void)ctx;
     InitializeCriticalSection(&g_lock);
     recomp_bindings_init();               /* logs the config file it read */
-    present = recomp_bindings_present_mask();
+    present = recomp_bindings_present_mask() | recomp_input_seq_ports() | hle_net_ports();
     recomp_input_reset(&g_model, present);
     for (port = 0u; port < RECOMP_INPUT_PORT_COUNT; port++)
         if (present & (1u << port))
@@ -136,7 +137,8 @@ static void unlock(void) { LeaveCriticalSection(&g_lock); }
  * title asks -- and Burnout 2 asks 13,172 times. */
 static void refresh_connected(void)
 {
-    uint32_t present = recomp_bindings_present_mask(), port;
+    uint32_t present = recomp_bindings_present_mask() | recomp_input_seq_ports() | hle_net_ports(),
+             port;
 
     for (port = 0u; port < RECOMP_INPUT_PORT_COUNT; port++) {
         bool now = (present & (1u << port)) != 0u;

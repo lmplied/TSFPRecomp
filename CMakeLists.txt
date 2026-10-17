@@ -79,6 +79,10 @@ add_subdirectory(src/platform)
 # comes before all three and depends on none of them.
 add_subdirectory(src/config)
 
+# This PC's addresses for co-op, local and public (STUN): the launcher and
+# the HLE both show them.
+add_subdirectory(src/net)
+
 # The launcher a title ships beside its game. Defines recomp_add_launcher
 # for a title's CMakeLists to call; builds nothing on its own.
 add_subdirectory(src/launcher)

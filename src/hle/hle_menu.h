@@ -23,6 +23,11 @@ extern "C" {
  * key (F1, or anything while it is open). */
 int  hle_menu_key(unsigned vk);
 
+/* The game window's thread, for each WM_CHAR while the menu is open: a
+ * character typed, for a row that takes text (the Co-op page's address and
+ * port). 1 when the menu took it. */
+int  hle_menu_char(unsigned ch);
+
 /* The game window's thread, for each WM_MOUSEWHEEL: a notch, to step
  * through the rows or to bind the wheel. */
 void hle_menu_wheel(int delta);

@@ -176,7 +176,8 @@ if(COMMAND recomp_add_launcher)
     # from the console's video flag (XGetVideoFlags, read in its device
     # set-up at 0x00023A91), so the launcher offers Widescreen alone.
     recomp_add_launcher(${PROJECT_NAME}_launcher ${PROJECT_NAME}.exe NATIVE_WIDESCREEN ANY_ASPECT
-                        FOV 55 WEAPON_FOV 45 PROMPTS PAUSE_UNFOCUSED SKIP_INTRO)
+                        FOV 55 WEAPON_FOV 45 PROMPTS PAUSE_UNFOCUSED SKIP_INTRO NETPLAY
+                        PALETTE 3B5382 5E8387 FFFFFF)
     # The same preset beside the launcher, for its reset.
     add_custom_command(TARGET ${PROJECT_NAME}_launcher POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different

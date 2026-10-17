@@ -106,6 +106,15 @@ int  recomp_bindings_pause_available(void);
 void recomp_bindings_set_pause_unfocused(int on);
 int  recomp_bindings_pause_unfocused(void);
 
+/* The keyboard and mouse as player 1 on their own (keyboard_alone,
+ * RECOMP_KEYBOARD_ALONE, off by default): the pads then start at player 2,
+ * so a friend joining through Steam Remote Play or Parsec -- whose pad is
+ * this machine's first -- plays player 2 instead of steering player 1 beside
+ * the keyboard. Off, player 1 reads the first pad and the keyboard both.
+ * set: from the menu, at once (the title sees a pad arrive or leave). */
+void recomp_bindings_set_keyboard_alone(int on);
+int  recomp_bindings_keyboard_alone(void);
+
 #ifdef __cplusplus
 }
 #endif
