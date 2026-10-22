@@ -256,9 +256,11 @@ its own, and the other player is told.
 
 No ports to open, for most connections: with the code, the two games find
 each other through a free public relay (ntfy.sh), where everything they say
-is encrypted with the code, and then connect to each other directly. A few
-networks are too strict for that (some mobile and office ones), and the game
-says so. Then the host can give out an address instead, which the *Co-op*
+is encrypted with the code, and then connect to each other directly. The
+launcher's *Co-op* tab says what your connection is: *Good* (or *Open*) means
+invite codes connect from it; *Strict* means they connect only to a friend
+whose connection is good, not to another strict one. When a join fails, the
+game says which side was strict. Then the host can give out an address instead, which the *Co-op*
 page also shows: their internet address, with UDP port 47800 forwarded on
 their router (the game asks the router to do it itself, by UPnP, and says
 whether it did), or their address on a VPN both have joined (ZeroTier,

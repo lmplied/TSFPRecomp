@@ -1166,6 +1166,71 @@ static int fp_pointer_test(float *x, float *y, unsigned *clicks, unsigned *held,
     return 1;
 }
 
+/* The pointer's walk in a session (fp_menu_mouse): to an item by presses
+ * of up and down, one at a time, each waited out until the selection moves;
+ * on arriving, what the click asked for. A list where up and down never
+ * reach the item (a grid: the name keyboard) is given up on. */
+static struct {
+    uint32_t widget, target;
+    int      click;             /* a click, not just pointing */
+    float    x;                 /* where, for a value's side */
+    uint32_t moved_from;        /* the selection when the last press went */
+    long     at;
+    int      presses;
+} g_fp_walk;
+
+static int fp_ui_index(uint32_t widget, uint32_t item);     /* with co-op's helpers, below */
+
+static void fp_walk_to(uint32_t widget, uint32_t target, int click, float x)
+{
+    if (g_fp_walk.target != target || g_fp_walk.widget != widget)
+        g_fp_walk.presses = 0;
+    g_fp_walk.widget = widget;
+    g_fp_walk.target = target;
+    g_fp_walk.click |= click;
+    g_fp_walk.x = x;
+}
+
+static void fp_walk(unsigned port, long now)
+{
+    uint32_t w = g_fp_walk.widget, t = g_fp_walk.target, sel;
+    int at, to;
+
+    if (!t)
+        return;
+    if (!FP_MEM32(w) || fp_ui_index(w, t) < 0) {
+        memset(&g_fp_walk, 0, sizeof g_fp_walk);    /* the list has gone */
+        return;
+    }
+    sel = FP_MEM32(w + 0x198u);
+    if (sel == t) {
+        if (g_fp_walk.click) {
+            const char *press = "a";
+            if (fp_ui_value(t) && !(FP_MEM32(t + 0x38u) && g_fp_walk.x >= FP_MEMF(t + 0x80u) - 32.0f))
+                press = g_fp_walk.x < (FP_MEMF(t + 0x78u) + FP_MEMF(t + 0x80u)) * 0.5f
+                      ? "dpad_left" : "dpad_right";
+            recomp_bindings_press(port, press, 80);
+        }
+        memset(&g_fp_walk, 0, sizeof g_fp_walk);
+        return;
+    }
+    /* A press goes out, crosses the input delay, and is seen: until the
+     * selection moves (or a while passes), no other. */
+    if (g_fp_walk.at && sel == g_fp_walk.moved_from && now - g_fp_walk.at < 400)
+        return;
+    if (g_fp_walk.at && now - g_fp_walk.at < 90)
+        return;
+    if (++g_fp_walk.presses > 12) {
+        memset(&g_fp_walk, 0, sizeof g_fp_walk);
+        return;
+    }
+    at = fp_ui_index(w, sel);
+    to = fp_ui_index(w, t);
+    recomp_bindings_press(port, at >= 0 && to < at ? "dpad_up" : "dpad_down", 50);
+    g_fp_walk.moved_from = sel;
+    g_fp_walk.at = now;
+}
+
 static void fp_menu_mouse(uint32_t root)
 {
     static float last_x = -1.0f, last_y = -1.0f;
@@ -1210,11 +1275,18 @@ static void fp_menu_mouse(uint32_t root)
         g_fp_cs.target = -1;
     }
     item = have ? fp_ui_hit(root, x, y, &widget, &lists) : 0;
-    /* Online, pointing does not select: that writes the game's menu state on
-     * one machine only. A click then picks only what is already selected. */
+    /* In a session, selecting by writing the game's menu state would do it on
+     * one machine only. Pointing at an item walks the selection there by
+     * presses instead -- up and down, as a pad would, which both machines
+     * see -- and a click there does what it does once it is reached. */
     if (hle_net_local_port() >= 0) {
-        if (item && FP_MEM32(widget + 0x198u) != item)
+        if (item && FP_MEM32(widget + 0x198u) != item) {
+            if (moved || (clicks & RECOMP_MOUSE_LEFT))
+                fp_walk_to(widget, item, (clicks & RECOMP_MOUSE_LEFT) != 0, x);
             item = 0;
+            clicks &= ~(unsigned)RECOMP_MOUSE_LEFT;
+        }
+        fp_walk((unsigned)port, now);
     } else if (item && (moved || (clicks & RECOMP_MOUSE_LEFT)) &&
                FP_MEM32(widget + 0x198u) != item) {
         fp_ui_select(widget, item);
@@ -1263,6 +1335,8 @@ static void fp_menu_mouse(uint32_t root)
 }
 
 /* -- Future Perfect: co-op, straight to the main menu -------------------- */
+
+extern unsigned long hle_lockstep_frame(void);
 
 /*
  * Between the game starting and its main menu come how many players and a
@@ -1367,6 +1441,24 @@ static const char *fp_coop_toward(uint32_t widget, uint32_t target)
     return to > at ? "dpad_down" : "dpad_up";
 }
 
+/* The frame the main menu (both players in) was last up: B and Back there
+ * go back to the player select, which co-op has no use for (fp_net_filter). */
+static unsigned long g_fp_main_menu_frame;
+
+/* In a session, this machine's controls before they go out: no B or Back
+ * on the main menu. Alt+Tab pressed Back there (Tab is Back), and the
+ * player select it led to is co-op's undoing -- fp_coop_auto would put it
+ * right, but only by going through it again. */
+static void fp_net_filter(RecompInputGamepad *g)
+{
+    unsigned long frame = hle_lockstep_frame();
+
+    if (g_fp_main_menu_frame && frame - g_fp_main_menu_frame <= 2u) {
+        g->analog_buttons[1] = 0;           /* B */
+        g->buttons &= (uint16_t)~0x0020u;   /* Back */
+    }
+}
+
 static void fp_coop_auto(uint32_t root)
 {
     static int enabled = -1, done;
@@ -1381,17 +1473,29 @@ static void fp_coop_auto(uint32_t root)
         const char *e = getenv("RECOMP_FP_COOP_AUTO");
         enabled = !(e && *e && strcmp(e, "0") == 0);
     }
-    if (!enabled || done || (me = hle_net_local_port()) < 0 || now < next)
+    if ((me = hle_net_local_port()) < 0)
         return;
     n = fp_ui_lists(root, lists, 8);
     for (i = 0; i < n; i++)
         if (fp_ui_find(lists[i], "Story Co-op")) {
-            done = 1;
-            fprintf(stderr, "[FP] co-op: both players are in, at the main menu (%u presses)\n",
-                    presses);
-            fflush(stderr);
+            g_fp_main_menu_frame = hle_lockstep_frame();
+            if (enabled && !done) {
+                done = 1;
+                fprintf(stderr, "[FP] co-op: both players are in, at the main menu (%u presses)\n",
+                        presses);
+                fflush(stderr);
+            }
             return;
         }
+    /* Back at the player count -- the attract movie ends there, or the
+     * players found a way -- and it is all to do again. */
+    for (i = 0; i < n && done; i++)
+        if (fp_ui_find(lists[i], "1 Player") && fp_ui_find(lists[i], "2 Player")) {
+            done = 0;
+            presses = 0;
+        }
+    if (!enabled || done || now < next)
+        return;
     for (i = 0; i < n && !press; i++) {
         uint32_t w = lists[i];
 
@@ -1866,6 +1970,7 @@ void fp_title_setup(void)
     xbox_LockstepGateThread(0x00030160u);
     hle_net_hash_range(0x82000000u, 0x01400000u);
     xbox_D3D8SetDrawFilter(fp_keep_draw);
+    hle_net_set_local_filter(fp_net_filter);
     /* Frame interpolation: the projection at c60-c63, then the model-view
      * (c64), the projection times it (c68, which most programs draw with)
      * and a second model-view (c72). Bones are indexed from c96 and are not

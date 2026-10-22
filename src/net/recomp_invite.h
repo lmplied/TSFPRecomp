@@ -70,6 +70,31 @@ const char *recomp_invite_service(void);
  * no server answered within about timeout_ms. */
 int recomp_net_stun_on(uintptr_t sock, char *ip, size_t n, unsigned *port, unsigned timeout_ms);
 
+/* What this connection does to a game's packets on their way out, from two
+ * STUN servers asked from one socket:
+ *   OPEN     this PC is on the internet itself: no router in the way
+ *   GOOD     both saw the same address and port: the router keeps one
+ *            mapping a socket, so an invite's direct link gets through
+ *   STRICT   they saw different ports: a new mapping for each destination
+ *            (symmetric NAT, common behind a provider's shared address, and
+ *            where no port can be forwarded). A direct link then works only
+ *            with an OPEN or GOOD connection on the other side.
+ *   UNKNOWN  only one answered; OFFLINE neither */
+enum { RECOMP_NAT_OFFLINE, RECOMP_NAT_UNKNOWN, RECOMP_NAT_OPEN, RECOMP_NAT_GOOD,
+       RECOMP_NAT_STRICT };
+typedef struct {
+    int      kind;              /* RECOMP_NAT_* */
+    char     ip[64];            /* the public address the first server saw */
+    unsigned port;
+    int      port_kept;         /* the public port is the socket's own */
+} RecompNat;
+
+/* On the caller's socket (bound, nobody else knowing it yet), or on one of
+ * its own. Blocks for at most about timeout_ms. */
+int recomp_net_nat_on(uintptr_t sock, RecompNat *out, unsigned timeout_ms);
+int recomp_net_nat_check(RecompNat *out, unsigned timeout_ms);
+const char *recomp_net_nat_name(int kind);       /* "open", "good", ... */
+
 #ifdef __cplusplus
 }
 #endif

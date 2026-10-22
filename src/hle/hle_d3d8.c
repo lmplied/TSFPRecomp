@@ -1968,6 +1968,7 @@ HLE_EXPORT(D3DDevice_Clear)
 {
     static int seen;
 #ifdef _WIN32
+    uint32_t count = HLE_ARG(0), rects_va = HLE_ARG(1);
     uint32_t flags = HLE_ARG(2), color = HLE_ARG(3);
     uint32_t z_bits = HLE_ARG(4), stencil = HLE_ARG(5);
 #endif
@@ -1984,8 +1985,12 @@ HLE_EXPORT(D3DDevice_Clear)
         if (g_shadow_clears < 4)
             fprintf(stderr, "[HLE-D3D8] shadow Clear: flags 0x%08X color 0x%08X "
                     "z %g stencil %u\n", flags, color, z, stencil);
+        /* With its rectangles, as the Xbox's D3DRECTs (four LONGs, the PC's
+         * layout): a clear of part of the target is that part's. */
         if (draw_kept())
-            host_Clear(g_shadow, 0, NULL, xbox_clear_flags_to_host(flags), color, z, stencil);
+            host_Clear(g_shadow, rects_va && count ? count : 0,
+                       rects_va && count ? (const D3DRECT *)HLE_PTR(rects_va) : NULL,
+                       xbox_clear_flags_to_host(flags), color, z, stencil);
         g_shadow_clears++;
         g_shadow_last_color = color;
         if (shadow_trace_on())

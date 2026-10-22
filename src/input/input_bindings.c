@@ -997,6 +997,15 @@ static int key_down(KeyCache *kc, int vk)
 #if defined(_WIN32)
     if (!g_key_state[vk])
         g_key_state[vk] = (GetAsyncKeyState(vk) & 0x8000) ? 2 : 1;
+    /* Windows' own: Alt+Tab, Alt+Enter, Alt+Esc, Alt+Space, Alt+F4. The key
+     * goes down while the window still has the focus, and these are keys a
+     * game binds -- Future Perfect's Tab is Back, its Enter A, its Esc Start
+     * -- so Alt+Tab on its main menu pressed Back and went to Change
+     * Players. With Alt held they are Windows', not the game's. */
+    if (g_key_state[vk] == 2 &&
+        (vk == VK_TAB || vk == VK_RETURN || vk == VK_ESCAPE || vk == VK_SPACE || vk == VK_F4) &&
+        key_down(kc, VK_MENU))
+        return 0;
     return g_key_state[vk] == 2;
 #else
     return 0;           /* no keyboard source off Windows yet */

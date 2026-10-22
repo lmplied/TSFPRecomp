@@ -923,10 +923,190 @@ static HRESULT __stdcall dev_EndScene(IDirect3DDevice8 *self)
     return S_OK;
 }
 
+/* ---- Clears one call cannot do ----
+ *
+ * An Xbox Clear can name rectangles, and the colour channels one at a time
+ * (D3DCLEAR_TARGET_R, _G, _B, _A); a host clear does the whole target, all
+ * four. So such a clear is drawn instead: a quad over each rectangle, of the
+ * clear colour, writing only the channels asked for, and the depth and
+ * stencil values with the test always passing. Future Perfect's match
+ * settings panel clears the alpha alone in its rectangle and then writes
+ * its text there into the alpha, to light the text through it; cleared as
+ * a whole target (or not at all), the panel lit up white.
+ *
+ * The channels come in the flags' bits 8-11 under D3DCLEAR_XBOX_CHANNELS
+ * (xbox_clear_flags_to_host); without that bit TARGET means all four. */
+#define D3DCLEAR_XBOX_CHANNELS 0x1000u
+
+static struct {
+    int             tried, failed;
+    RhiShader      *vs, *ps;
+    RhiBuffer      *cb;
+    RhiBlendState  *blend[16];      /* by the channels written */
+    RhiDepthState  *depth[4];       /* bit 0 depth, bit 1 stencil */
+    RhiRasterState *raster;
+} g_clr;
+
+static const char kClearShader[] =
+    "cbuffer Clear : register(b7) { float4 color; float4 zs; };\n"
+    "float4 vs_main(uint id : SV_VertexID) : SV_Position {\n"
+    "    float2 c = float2(id & 1, id >> 1);\n"
+    "    return float4(c.x * 2 - 1, 1 - c.y * 2, zs.x, 1);\n"
+    "}\n"
+    "float4 ps_main() : SV_Target { return color; }\n";
+
+static RhiShader *clear_shader(uint32_t stage, const char *entry, const char *target)
+{
+    RhiShaderSource src;
+    char err[1024];
+    RhiShader *s;
+
+    memset(&src, 0, sizeof src);
+    src.hlsl = kClearShader;
+    src.len = sizeof kClearShader - 1;
+    src.name = "xbox clear";
+    src.entry = entry;
+    src.target = target;
+    s = rhi_shader_create(stage, &src, err, sizeof err);
+    if (!s && err[0])
+        fprintf(stderr, "D3D8: the rectangle clear's shader: %s\n", err);
+    return s;
+}
+
+static int clear_ready(void)
+{
+    RhiBufferDesc bd;
+    RhiRasterDesc rd;
+    int i;
+
+    if (g_clr.tried)
+        return !g_clr.failed;
+    g_clr.tried = 1;
+    g_clr.failed = 1;
+    memset(&bd, 0, sizeof bd);
+    bd.size = 32;
+    bd.usage = RHI_USAGE_DYNAMIC;
+    bd.bind = RHI_BIND_UNIFORM;
+    bd.cpu_access = RHI_CPU_WRITE;
+    memset(&rd, 0, sizeof rd);
+    rd.fill = RHI_FILL_SOLID;
+    rd.cull = RHI_CULL_NONE;
+    rd.depth_clip = 1;
+    if (!(g_clr.cb = rhi_buffer_create(&bd, NULL)) ||
+        !(g_clr.vs = clear_shader(RHI_STAGE_VERTEX, "vs_main", "vs_4_0")) ||
+        !(g_clr.ps = clear_shader(RHI_STAGE_PIXEL, "ps_main", "ps_4_0")) ||
+        !(g_clr.raster = rhi_raster_state_create(&rd)))
+        return 0;
+    for (i = 0; i < 16; i++) {
+        RhiBlendDesc bl;
+        memset(&bl, 0, sizeof bl);
+        bl.write_mask = (uint32_t)i;
+        if (!(g_clr.blend[i] = rhi_blend_state_create(&bl)))
+            return 0;
+    }
+    for (i = 0; i < 4; i++) {
+        RhiDepthDesc dd;
+        memset(&dd, 0, sizeof dd);
+        dd.depth_enable = (i & 1) != 0;
+        dd.depth_write = (i & 1) != 0;
+        dd.depth_func = RHI_CMP_ALWAYS;
+        dd.stencil_enable = (i & 2) != 0;
+        dd.stencil_read_mask = dd.stencil_write_mask = 0xFF;
+        dd.front.fail = dd.front.depth_fail = RHI_STENCIL_REPLACE;
+        dd.front.pass = RHI_STENCIL_REPLACE;
+        dd.front.func = RHI_CMP_ALWAYS;
+        dd.back = dd.front;
+        if (!(g_clr.depth[i] = rhi_depth_state_create(&dd)))
+            return 0;
+    }
+    g_clr.failed = 0;
+    return 1;
+}
+
+/* The clear drawn: the channels in `channels` (RHI_WRITE_*), depth and
+ * stencil by `flags`, over each rectangle (the whole viewport for none). The
+ * rest of the device's state is the next draw's to set, as for the overlay;
+ * the render target and viewport are put back. */
+static void clear_drawn(DWORD count, const D3DRECT *rects, uint32_t channels, DWORD flags,
+                        D3DCOLOR color, float z, DWORD stencil)
+{
+    RhiOutputState saved;
+    float c[8], factor[4] = { 1, 1, 1, 1 }, sx = rt_scale_x(), sy = rt_scale_y();
+    int depth = ((flags & D3DCLEAR_ZBUFFER) ? 1 : 0) | ((flags & D3DCLEAR_STENCIL) ? 2 : 0);
+    D3DRECT whole;
+    void *mapped;
+    DWORD i;
+
+    if (!clear_ready() || (!channels && !depth))
+        return;
+    if (!channels && !(g_cur_ds && g_cur_ds->dsv))
+        return;                             /* depth alone, and none bound */
+    if (!count || !rects) {
+        whole.x1 = (LONG)g_device_state.viewport.X;
+        whole.y1 = (LONG)g_device_state.viewport.Y;
+        whole.x2 = whole.x1 + (LONG)g_device_state.viewport.Width;
+        whole.y2 = whole.y1 + (LONG)g_device_state.viewport.Height;
+        rects = &whole;
+        count = 1;
+    }
+    c[0] = ((color >> 16) & 0xFF) / 255.0f;
+    c[1] = ((color >>  8) & 0xFF) / 255.0f;
+    c[2] = ((color >>  0) & 0xFF) / 255.0f;
+    c[3] = ((color >> 24) & 0xFF) / 255.0f;
+    c[4] = z; c[5] = c[6] = c[7] = 0.0f;
+    if (!(mapped = rhi_buffer_map(g_clr.cb, RHI_MAP_WRITE_DISCARD)))
+        return;
+    memcpy(mapped, c, sizeof c);
+    rhi_buffer_unmap(g_clr.cb);
+
+    rhi_output_save(&saved);
+    {
+        /* The target and depth the device clears (dev_Clear's own). */
+        RhiView *rtv = g_cur_rt ? g_cur_rt->rtv : g_device_state.rhi_default_rtv;
+        RhiView *dsv = g_cur_ds ? g_cur_ds->dsv : NULL;
+        if (!dsv)
+            depth = 0;
+        rhi_set_render_target(rtv, dsv);
+    }
+    rhi_set_vertex_layout(NULL);
+    rhi_set_topology(RHI_TOPOLOGY_TRIANGLE_STRIP);
+    rhi_set_shader(RHI_STAGE_VERTEX, g_clr.vs);
+    rhi_set_shader(RHI_STAGE_PIXEL, g_clr.ps);
+    rhi_set_uniform_buffers(RHI_STAGE_VERTEX, 7, 1, &g_clr.cb);
+    rhi_set_uniform_buffers(RHI_STAGE_PIXEL, 7, 1, &g_clr.cb);
+    rhi_set_blend_state(g_clr.blend[channels & 15u], factor, 0xFFFFFFFF);
+    rhi_set_depth_state(g_clr.depth[depth], stencil & 0xFF);
+    rhi_set_raster_state(g_clr.raster);
+    for (i = 0; i < count; i++) {
+        RhiViewport vp;
+
+        if (rects[i].x2 <= rects[i].x1 || rects[i].y2 <= rects[i].y1)
+            continue;
+        vp.x = (float)rects[i].x1 * sx;
+        vp.y = (float)rects[i].y1 * sy;
+        vp.width = (float)(rects[i].x2 - rects[i].x1) * sx;
+        vp.height = (float)(rects[i].y2 - rects[i].y1) * sy;
+        vp.min_depth = 0.0f;
+        vp.max_depth = 1.0f;
+        rhi_set_viewports(1, &vp);
+        rhi_draw(4, 0);
+    }
+    rhi_output_restore(&saved);
+}
+
 static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil)
 {
-    (void)self; (void)Count; (void)pRects; (void)Stencil;
+    uint32_t channels = !(Flags & D3DCLEAR_TARGET) ? 0u
+                      : (Flags & D3DCLEAR_XBOX_CHANNELS) ? (Flags >> 8) & 15u : RHI_WRITE_ALL;
+
+    (void)self;
     g_d3d_clear_count++;
+
+    /* Rectangles, or some of the channels: drawn (above). */
+    if ((Count && pRects) || (channels && channels != RHI_WRITE_ALL)) {
+        clear_drawn(Count, pRects, channels, Flags, Color, Z, Stencil);
+        return S_OK;
+    }
 
     /* Clear the currently bound targets. With no depth surface bound there
      * is no depth to clear (SetRenderTarget). */

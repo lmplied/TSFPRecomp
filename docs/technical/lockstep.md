@@ -136,7 +136,8 @@ alone:
 |---|---|
 | Field of view, weapon field of view | the game's own on both (`fp_apply_fov`) |
 | Screen shape | 16:9 whatever the window's shape (`fp_aspect_follow`) |
-| Pointing at a menu item | does not select it (a click still presses A, which is input and goes over the network) |
+| Pointing at a menu item | walks the selection there by presses of up and down (`fp_walk`), which go over the network like any input; a click then presses A, or steps a value. Writing the menu's selection directly would do it on one machine only |
+| B and Back on the main menu | dropped from the controls before they go out (`fp_net_filter`): they lead to Change Players, which undoes co-op's setup; if the player count comes back anyway (after the attract movie), `fp_coop_auto` goes through it again |
 | Character select with the mouse | a click picks; walking the portraits is off for player 2, whose selection is not the one the walk reads |
 | Pause in the background | off: a pause pressed for one is a pause for both |
 | Keyboard and mouse alone | off: this machine's keyboard, mouse and first pad all play its player |
@@ -198,7 +199,13 @@ started), posts its own, and sends its JOIN to each of the host's addresses
 at once, while the host sends `PKT_PUNCH` to each of the joiner's. That
 opens each router to the other, and the first address a packet comes back
 from is the way (`invite_adopt`). If nothing gets through in 30 seconds the
-joiner says the networks are too strict, and an address is the way left.
+joiner says so, and why: each game asks two STUN servers from its socket
+(`recomp_net_nat_on`) and publishes what kind of connection it is. Both
+servers seeing the same port is a router that keeps one mapping per socket
+(*good*), which hole punching gets through; different ports is a new mapping
+per destination (*strict*, symmetric NAT), which meets only a good or open
+other side. Two strict sides need a relay, or a VPN. The launcher's Co-op tab
+shows the same check (*Your connection*).
 `RECOMP_NET_SIGNAL` names another ntfy server, or 0 for none;
 `RECOMP_NET_INVITE_PUBLIC_ONLY=1` offers only the STUN address, to test the
 way through a router from one PC (which only works where the router sends a

@@ -408,6 +408,14 @@ the port simply reports empty until it is plugged in.
 Capture compares against the pad state taken when the dialog opened, so a
 stick resting off centre or a trigger resting high does not bind itself.
 
+## Keys Windows keeps
+
+With Alt held, Tab, Enter, Esc, Space and F4 read as up: Alt+Tab, Alt+Enter
+(fullscreen), Alt+Esc, Alt+Space and Alt+F4 are Windows' own. The key goes
+down while the game's window still has the focus, and Future Perfect binds
+Tab to Back -- so Alt+Tab on its main menu pressed Back and went to Change
+Players.
+
 ## What the runtime does with it
 
 `recomp_bindings_init()` runs once, from whichever input path is reached

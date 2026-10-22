@@ -2,6 +2,7 @@
  * recomp_invite.c -- see recomp_invite.h.
  */
 #include "recomp_invite.h"
+#include "recomp_net_addr.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -472,23 +473,26 @@ int recomp_invite_listen(RecompInvite *inv, void (*got)(void *ctx, const char *t
 
 /* ------------------------------------------------------------- STUN */
 
-int recomp_net_stun_on(uintptr_t sock, char *ip, size_t n, unsigned *port, unsigned timeout_ms)
+static const char *const k_stun[][2] = {
+    { "stun.l.google.com", "19302" },
+    { "stun.cloudflare.com", "3478" },
+};
+
+/* One server's answer: the address and port it saw `s` at. Other packets
+ * arriving on the socket meanwhile are dropped. */
+static int stun_ask_on(SOCKET s, size_t server, char *ip, size_t n, unsigned *port,
+                       unsigned timeout_ms)
 {
-    static const char *const servers[][2] = {
-        { "stun.l.google.com", "19302" },
-        { "stun.cloudflare.com", "3478" },
-    };
-    SOCKET s = (SOCKET)sock;
+    struct addrinfo hints, *res = NULL;
     uint8_t req[20], resp[548];
     LARGE_INTEGER t;
+    ULONGLONG until;
     uint64_t x;
-    size_t k;
     unsigned i;
+    int ok = 0;
 
-    if (ip && n)
-        ip[0] = 0;
     QueryPerformanceCounter(&t);
-    x = (uint64_t)t.QuadPart ^ 0x9E3779B97F4A7C15ull;
+    x = (uint64_t)t.QuadPart ^ 0x9E3779B97F4A7C15ull ^ (uint64_t)server << 40;
     memset(req, 0, sizeof req);
     req[1] = 0x01;
     req[4] = 0x21; req[5] = 0x12; req[6] = 0xA4; req[7] = 0x42;
@@ -496,63 +500,126 @@ int recomp_net_stun_on(uintptr_t sock, char *ip, size_t n, unsigned *port, unsig
         x ^= x << 13; x ^= x >> 7; x ^= x << 17;
         req[i] = (uint8_t)(x >> 24);
     }
-    for (k = 0; k < sizeof servers / sizeof servers[0]; k++) {
-        struct addrinfo hints, *res = NULL;
-        ULONGLONG until;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(k_stun[server][0], k_stun[server][1], &hints, &res) != 0 || !res)
+        return 0;
+    sendto(s, (const char *)req, sizeof req, 0, res->ai_addr, (int)res->ai_addrlen);
+    until = GetTickCount64() + timeout_ms;
+    while (!ok && GetTickCount64() < until) {
+        fd_set set;
+        struct timeval tv = { 0, 100000 };
+        int got;
+        unsigned len, at;
 
-        memset(&hints, 0, sizeof hints);
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_DGRAM;
-        if (getaddrinfo(servers[k][0], servers[k][1], &hints, &res) != 0 || !res)
+        FD_ZERO(&set);
+        FD_SET(s, &set);
+        if (select(0, &set, NULL, NULL, &tv) <= 0)
             continue;
-        sendto(s, (const char *)req, sizeof req, 0, res->ai_addr, (int)res->ai_addrlen);
-        until = GetTickCount64() + timeout_ms / 2;
-        while (GetTickCount64() < until) {
-            fd_set set;
-            struct timeval tv = { 0, 100000 };
-            int got;
-            unsigned len, at;
-
-            FD_ZERO(&set);
-            FD_SET(s, &set);
-            if (select(0, &set, NULL, NULL, &tv) <= 0)
-                continue;
-            got = recv(s, (char *)resp, sizeof resp, 0);
-            if (got < 20 || resp[0] != 0x01 || resp[1] != 0x01 || memcmp(resp + 4, req + 4, 16))
-                continue;                       /* not the answer */
-            len = (unsigned)resp[2] << 8 | resp[3];
-            if (20u + len > (unsigned)got)
-                len = (unsigned)got - 20u;
-            for (at = 20; at + 4 <= 20u + len;) {
-                unsigned type = (unsigned)resp[at] << 8 | resp[at + 1];
-                unsigned alen = (unsigned)resp[at + 2] << 8 | resp[at + 3];
-                const uint8_t *v = resp + at + 4;
-                if (at + 4 + alen > 20u + len)
-                    break;
-                if (alen >= 8 && v[1] == 0x01 && (type == 0x0020 || type == 0x0001)) {
-                    uint32_t a = (uint32_t)v[4] << 24 | (uint32_t)v[5] << 16 |
-                                 (uint32_t)v[6] << 8 | v[7];
-                    unsigned p = (unsigned)v[2] << 8 | v[3];
-                    if (type == 0x0020) {
-                        a ^= 0x2112A442u;
-                        p ^= 0x2112u;
-                    }
-                    snprintf(ip, n, "%u.%u.%u.%u", a >> 24, (a >> 16) & 0xFFu,
-                             (a >> 8) & 0xFFu, a & 0xFFu);
-                    *port = p;
-                    if (type == 0x0020) {
-                        freeaddrinfo(res);
-                        return 1;
-                    }
+        got = recv(s, (char *)resp, sizeof resp, 0);
+        if (got < 20 || resp[0] != 0x01 || resp[1] != 0x01 || memcmp(resp + 4, req + 4, 16))
+            continue;                           /* not the answer */
+        len = (unsigned)resp[2] << 8 | resp[3];
+        if (20u + len > (unsigned)got)
+            len = (unsigned)got - 20u;
+        for (at = 20; at + 4 <= 20u + len;) {
+            unsigned type = (unsigned)resp[at] << 8 | resp[at + 1];
+            unsigned alen = (unsigned)resp[at + 2] << 8 | resp[at + 3];
+            const uint8_t *v = resp + at + 4;
+            if (at + 4 + alen > 20u + len)
+                break;
+            if (alen >= 8 && v[1] == 0x01 && (type == 0x0020 || (type == 0x0001 && !ok))) {
+                uint32_t a = (uint32_t)v[4] << 24 | (uint32_t)v[5] << 16 |
+                             (uint32_t)v[6] << 8 | v[7];
+                unsigned p = (unsigned)v[2] << 8 | v[3];
+                if (type == 0x0020) {
+                    a ^= 0x2112A442u;
+                    p ^= 0x2112u;
                 }
-                at += 4 + ((alen + 3u) & ~3u);
+                snprintf(ip, n, "%u.%u.%u.%u", a >> 24, (a >> 16) & 0xFFu,
+                         (a >> 8) & 0xFFu, a & 0xFFu);
+                *port = p;
+                ok = 1;
             }
-            freeaddrinfo(res);
-            return ip[0] != 0;
+            at += 4 + ((alen + 3u) & ~3u);
         }
-        freeaddrinfo(res);
     }
+    freeaddrinfo(res);
+    return ok;
+}
+
+int recomp_net_stun_on(uintptr_t sock, char *ip, size_t n, unsigned *port, unsigned timeout_ms)
+{
+    size_t k;
+
+    if (ip && n)
+        ip[0] = 0;
+    for (k = 0; k < sizeof k_stun / sizeof k_stun[0]; k++)
+        if (stun_ask_on((SOCKET)sock, k, ip, n, port, timeout_ms / 2))
+            return 1;
     return 0;
+}
+
+int recomp_net_nat_on(uintptr_t sock, RecompNat *out, unsigned timeout_ms)
+{
+    struct sockaddr_in me;
+    int len = sizeof me, i;
+    char ip2[64], lan[256], *p, *ctx = NULL;
+    unsigned port2 = 0, local = 0;
+    int second;
+
+    memset(out, 0, sizeof *out);
+    if (getsockname((SOCKET)sock, (struct sockaddr *)&me, &len) == 0)
+        local = ntohs(me.sin_port);
+    if (!stun_ask_on((SOCKET)sock, 0, out->ip, sizeof out->ip, &out->port, timeout_ms / 2)) {
+        out->kind = RECOMP_NAT_OFFLINE;
+        return 0;
+    }
+    second = stun_ask_on((SOCKET)sock, 1, ip2, sizeof ip2, &port2, timeout_ms / 2);
+    out->port_kept = out->port == local;
+    recomp_net_local_addrs(lan, sizeof lan);
+    for (p = strtok_s(lan, ", ", &ctx), i = 0; p && i < 16; p = strtok_s(NULL, ", ", &ctx), i++)
+        if (strcmp(p, out->ip) == 0)
+            out->kind = RECOMP_NAT_OPEN;
+    if (out->kind != RECOMP_NAT_OPEN)
+        out->kind = !second ? RECOMP_NAT_UNKNOWN
+                  : strcmp(ip2, out->ip) == 0 && port2 == out->port ? RECOMP_NAT_GOOD
+                  : RECOMP_NAT_STRICT;
+    return 1;
+}
+
+int recomp_net_nat_check(RecompNat *out, unsigned timeout_ms)
+{
+    WSADATA wsa;
+    SOCKET s;
+    struct sockaddr_in any;
+    int ok = 0;
+
+    memset(out, 0, sizeof *out);
+    out->kind = RECOMP_NAT_OFFLINE;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+        return 0;
+    s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    memset(&any, 0, sizeof any);
+    any.sin_family = AF_INET;
+    if (s != INVALID_SOCKET && bind(s, (const struct sockaddr *)&any, sizeof any) == 0)
+        ok = recomp_net_nat_on((uintptr_t)s, out, timeout_ms);
+    if (s != INVALID_SOCKET)
+        closesocket(s);
+    WSACleanup();
+    return ok;
+}
+
+const char *recomp_net_nat_name(int kind)
+{
+    switch (kind) {
+    case RECOMP_NAT_OPEN:    return "open";
+    case RECOMP_NAT_GOOD:    return "good";
+    case RECOMP_NAT_STRICT:  return "strict";
+    case RECOMP_NAT_UNKNOWN: return "unknown";
+    default:                 return "offline";
+    }
 }
 
 #else   /* not Windows */
@@ -578,5 +645,18 @@ int recomp_net_stun_on(uintptr_t sock, char *ip, size_t n, unsigned *port, unsig
     (void)sock; (void)ip; (void)n; (void)port; (void)timeout_ms;
     return 0;
 }
+int recomp_net_nat_on(uintptr_t sock, RecompNat *out, unsigned timeout_ms)
+{
+    (void)sock; (void)timeout_ms;
+    memset(out, 0, sizeof *out);
+    return 0;
+}
+int recomp_net_nat_check(RecompNat *out, unsigned timeout_ms)
+{
+    (void)timeout_ms;
+    memset(out, 0, sizeof *out);
+    return 0;
+}
+const char *recomp_net_nat_name(int kind) { (void)kind; return "offline"; }
 
 #endif

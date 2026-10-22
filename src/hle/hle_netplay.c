@@ -392,6 +392,7 @@ static struct {
     volatile LONG npeer;
     char          mine[400];
     int           published;
+    int           my_nat, peer_nat;       /* RECOMP_NAT_*: this connection's, and the other's */
 } g_invite;
 
 static int parse_cands(const char *list, struct sockaddr_in *out, int max)
@@ -441,12 +442,20 @@ static void gather_mine(void)
          p = strtok_s(NULL, ", ", &ctx))
         n += (size_t)snprintf(g_invite.mine + n, sizeof g_invite.mine - n, "%s%s:%u",
                               n ? "," : "", p, port);
-    if (recomp_net_stun_on((uintptr_t)g_net.sock, pub, sizeof pub, &pub_port, 2000) &&
-        n < sizeof g_invite.mine - 32)
-        n += (size_t)snprintf(g_invite.mine + n, sizeof g_invite.mine - n, "%s%s:%u",
-                              n ? "," : "", pub, pub_port);
-    fprintf(stderr, "[NET] invite: this game can be reached at %s\n",
-            g_invite.mine[0] ? g_invite.mine : "(nowhere found)");
+    {
+        /* Two STUN servers from this socket: the address to give out, and
+         * what kind of connection it is (recomp_invite.h). */
+        RecompNat nat;
+        if (recomp_net_nat_on((uintptr_t)g_net.sock, &nat, 3000) && nat.ip[0] &&
+            n < sizeof g_invite.mine - 32)
+            n += (size_t)snprintf(g_invite.mine + n, sizeof g_invite.mine - n, "%s%s:%u",
+                                  n ? "," : "", nat.ip, nat.port);
+        g_invite.my_nat = nat.kind;
+        (void)pub; (void)pub_port;
+    }
+    fprintf(stderr, "[NET] invite: this game can be reached at %s; the connection is %s\n",
+            g_invite.mine[0] ? g_invite.mine : "(nowhere found)",
+            recomp_net_nat_name(g_invite.my_nat));
     fflush(stderr);
 }
 
@@ -455,14 +464,19 @@ static void gather_mine(void)
 static void invite_heard(void *ctx, const char *text)
 {
     struct sockaddr_in c[MAX_CANDS];
-    char role, list[400];
+    char role, list[400], nat[16];
     unsigned build;
-    int n;
+    int n, kind;
 
     (void)ctx;
-    if (sscanf(text, "FPCOOP1 %c %x %399s", &role, &build, list) != 3 ||
+    nat[0] = 0;
+    if (sscanf(text, "FPCOOP1 %c %x %399s nat=%15s", &role, &build, list, nat) < 3 ||
         role != (g_net.host ? 'J' : 'H') || (n = parse_cands(list, c, MAX_CANDS)) == 0)
         return;
+    for (kind = RECOMP_NAT_STRICT; kind > RECOMP_NAT_OFFLINE; kind--)
+        if (strcmp(nat, recomp_net_nat_name(kind)) == 0)
+            break;
+    g_invite.peer_nat = kind;
     EnterCriticalSection(&g_net.lock);
     memcpy(g_invite.peer, c, (size_t)n * sizeof c[0]);
     InterlockedExchange(&g_invite.npeer, n);
@@ -476,8 +490,8 @@ static int invite_publish(uint32_t build)
 {
     char text[480];
 
-    snprintf(text, sizeof text, "FPCOOP1 %c %08X %s", g_net.host ? 'H' : 'J', build,
-             g_invite.mine[0] ? g_invite.mine : "0.0.0.0:0");
+    snprintf(text, sizeof text, "FPCOOP1 %c %08X %s nat=%s", g_net.host ? 'H' : 'J', build,
+             g_invite.mine[0] ? g_invite.mine : "0.0.0.0:0", recomp_net_nat_name(g_invite.my_nat));
     g_invite.published = recomp_invite_publish(g_invite.inv, text);
     return g_invite.published;
 }
@@ -1348,9 +1362,13 @@ static void host_waiting_text(char *text, size_t n, const char *lan)
         snprintf(g_status_copy, sizeof g_status_copy, "%s", g_invite.code);
         snprintf(text, n, "Waiting for player 2...\n\n"
                  "Invite code:  %s\n"
-                 "Player 2 chooses Join and types it in -- no ports to open.\n\n"
+                 "Player 2 chooses Join and types it in -- no ports to open.\n%s\n"
                  "Or by address: %s over the internet, %s on this network.",
-                 g_invite.code, found > 0 ? inet : "(finding it)", local);
+                 g_invite.code,
+                 g_invite.my_nat == RECOMP_NAT_STRICT
+                     ? "This connection is strict: a friend on a strict one too will not get "
+                       "through (a VPN will).\n" : "",
+                 found > 0 ? inet : "(finding it)", local);
         return;
     }
     snprintf(text, n, "%sHosting co-op on UDP port %u. Waiting for player 2...\n\n"
@@ -1537,12 +1555,29 @@ static int setup_join(uint32_t build, uint32_t game, const char *where)
             last_pub = now ? now : 1u;
         }
         if (!g_net.have_peer && g_invite.code[0] && now - start >= 30000u) {
+            char why[700];
+            int mine = g_invite.my_nat == RECOMP_NAT_STRICT;
+            int theirs = g_invite.peer_nat == RECOMP_NAT_STRICT;
+
+            snprintf(why, sizeof why, "The host's game was found, but nothing gets through "
+                     "between the two.\n\n%s\n\nWhat works instead: both join one VPN "
+                     "(ZeroTier, Tailscale, Radmin VPN) and use the host's address on it, or "
+                     "play through Steam Remote Play Together or Parsec.",
+                     mine && theirs ? "Both connections are strict (each gives the game a "
+                                      "new port for every other computer it talks to), and "
+                                      "two strict connections cannot open a direct link."
+                     : mine ? "This connection is strict (it gives the game a new port for "
+                              "every other computer it talks to), and the host's is not "
+                              "open enough to meet it."
+                     : theirs ? "The host's connection is strict (it gives the game a new "
+                                "port for every other computer it talks to), and this one "
+                                "is not open enough to meet it."
+                     : "Neither connection looks strict: a firewall may be blocking the game "
+                       "on one of the PCs. Allow it through Windows Firewall on both and "
+                       "try again.");
             free(saves);
             invite_close();
-            return setup_fail("The host's game was found, but nothing gets through between the "
-                              "two: one of the networks is too strict for a direct link. The "
-                              "host can forward their port and give you their address "
-                              "instead, or both can join one VPN (ZeroTier, Tailscale).");
+            return setup_fail(why);
         }
         if (!offered && !quiet_said && now - start >= 4000u) {
             quiet_said = 1;
@@ -1982,6 +2017,13 @@ static void wait_pump(ULONGLONG waiting_since)
     }
 }
 
+static void (*g_local_filter)(RecompInputGamepad *);
+
+void hle_net_set_local_filter(void (*filter)(RecompInputGamepad *controls))
+{
+    g_local_filter = filter;
+}
+
 void hle_net_frame_end(unsigned long frame)
 {
     RecompInputGamepad local;
@@ -1996,6 +2038,8 @@ void hle_net_frame_end(unsigned long frame)
     /* This machine's controls, for `delay` frames on. */
     target = next + (uint32_t)g_net.delay;
     recomp_input_host_sample_local(g_net.input_port, &local);
+    if (g_local_filter)
+        g_local_filter(&local);
     EnterCriticalSection(&g_net.lock);
     to_net(&local, &g_net.mine[target % RING]);
     g_net.mine[target % RING].aim_x = g_net.pending_aim[0];
@@ -2072,6 +2116,7 @@ void hle_net_hash_range(uint32_t va, uint32_t size) { (void)va; (void)size; }
 const char *hle_net_notice(void) { return NULL; }
 int  hle_net_supported(void) { return 0; }
 int  hle_net_local_input_port(void) { return 0; }
+void hle_net_set_local_filter(void (*filter)(RecompInputGamepad *controls)) { (void)filter; }
 int  hle_net_restart(const char *spec) { (void)spec; return 0; }
 int  hle_net_public_addr(char *out, size_t n) { if (out && n) out[0] = '\0'; return -1; }
 int  hle_net_session_info(char *peer, size_t n, int *delay, unsigned *rtt_ms)

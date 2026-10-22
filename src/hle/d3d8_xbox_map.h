@@ -35,12 +35,19 @@ enum {
  * after the 3D background, its in-game hint screens after the scene), and
  * passing that on as a whole-target clear left both black but for the text.
  * Keeping the colour and leaving alpha uncleared is the lesser error. */
+/* The colour channels the Xbox clears one by one -- D3DCLEAR_TARGET_R 0x10,
+ * _G 0x20, _B 0x40, _A 0x80 -- go to the host device in bits 8-11 under
+ * 0x1000 when they are not all four (d3d8_device.c, dev_Clear): an alpha
+ * clear alone, which Future Perfect's match settings make, was dropped. */
 static __inline DWORD xbox_clear_flags_to_host(uint32_t xbox_flags)
 {
     DWORD host = 0;
 
-    if (xbox_flags & 0x70)
+    if (xbox_flags & 0xF0) {
         host |= D3DCLEAR_TARGET;
+        if ((xbox_flags & 0xF0) != 0xF0)
+            host |= 0x1000u | (((xbox_flags >> 4) & 0xFu) << 8);
+    }
     if (xbox_flags & 0x01)
         host |= D3DCLEAR_ZBUFFER;
     if (xbox_flags & 0x02)

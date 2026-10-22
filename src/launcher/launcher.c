@@ -92,6 +92,10 @@ static char g_local_addr[128];          /* this PC's on its networks */
 static char g_pub_text[96], g_lan_text[96];    /* what the host rows show, with the port */
 static char g_lan_help[256];
 static char g_invite_code[24];          /* hosting: this launch's, made as it opens */
+static int  g_online_shown;             /* the tab is up: only then are the servers asked */
+static volatile LONG g_nat_state;       /* the connection check: 0 not run, 1 running, 2 done */
+static char g_nat_text[96];
+static const char *g_nat_help;
 static volatile LONG g_pub_state;       /* the public address: 0 not asked, 1 asking, 2 found, 3 none */
 static char g_pub_addr[64];
 static const void *g_copied_row;        /* a row just copied, said for a moment */
@@ -336,10 +340,50 @@ static DWORD WINAPI public_addr_thread(LPVOID unused)
     return 0;
 }
 
+/* What kind of connection this is (recomp_invite.h), asked once the tab is
+ * first shown: whether an invite's direct link can get through it. */
+static DWORD WINAPI nat_thread(LPVOID unused)
+{
+    RecompNat n;
+
+    (void)unused;
+    recomp_net_nat_check(&n, 3000);
+    switch (n.kind) {
+    case RECOMP_NAT_OPEN:
+        snprintf(g_nat_text, sizeof g_nat_text, "Open: nothing in the way");
+        g_nat_help = "This PC is on the internet directly. Invite codes connect, and so does"
+                     " the address with no port to forward.";
+        break;
+    case RECOMP_NAT_GOOD:
+        snprintf(g_nat_text, sizeof g_nat_text, "Good for invite codes");
+        g_nat_help = "Your router keeps one port for the game whoever it talks to, which is"
+                     " what an invite's direct link needs. No port forwarding required.";
+        break;
+    case RECOMP_NAT_STRICT:
+        snprintf(g_nat_text, sizeof g_nat_text, "Strict: invites need a friend on a good one");
+        g_nat_help = "Your connection gives the game a new port for every computer it talks"
+                     " to. An invite still connects to a friend whose connection is open or"
+                     " good, not to another strict one: for that, a VPN (ZeroTier, Tailscale)"
+                     " or Parsec / Remote Play Together.";
+        break;
+    case RECOMP_NAT_UNKNOWN:
+        snprintf(g_nat_text, sizeof g_nat_text, "Could not tell (one server answered)");
+        g_nat_help = "Only one of the two servers asked answered. Invite codes may still work.";
+        break;
+    default:
+        snprintf(g_nat_text, sizeof g_nat_text, "No answer: offline, or UDP blocked");
+        g_nat_help = "Neither server answered. Without the internet, co-op works on the same"
+                     " network only, by the address shown when hosting.";
+        break;
+    }
+    InterlockedExchange(&g_nat_state, 2);
+    return 0;
+}
+
 /* The tab's rows after Play, by the mode: hosting, the addresses to give
  * out -- the internet's (asked for the first time the rows are shown) and
  * this network's -- each with the port, and a click copies one; joining,
- * the host's address to type. Then the port. */
+ * the host's address to type. Then the port, and the connection's kind. */
 static void online_rows(void)
 {
     Row *r = &g_rows[RT_ONLINE][1];
@@ -349,8 +393,10 @@ static void online_rows(void)
 
     if (port < 1 || port > 65535)
         port = 47800;
-    for (i = 1; i < 5; i++)
+    for (i = 1; i < 6; i++)
         memset(&g_rows[RT_ONLINE][i], 0, sizeof(Row));
+    if (g_online_shown && InterlockedCompareExchange(&g_nat_state, 1, 0) == 0)
+        CloseHandle(CreateThread(NULL, 0, nat_thread, NULL, 0, NULL));
     if (g_online_mode == 0) {
         r->label = "Invite code";
         r->help  = "Send player 2 this code: a click copies it. They choose Join and type it"
@@ -359,7 +405,7 @@ static void online_rows(void)
         r->readonly = 1; r->empty = "Invites are turned off";
         r++;
 
-        if (InterlockedCompareExchange(&g_pub_state, 1, 0) == 0)
+        if (g_online_shown && InterlockedCompareExchange(&g_pub_state, 1, 0) == 0)
             CloseHandle(CreateThread(NULL, 0, public_addr_thread, NULL, 0, NULL));
         if (g_pub_state == 2)
             snprintf(g_pub_text, sizeof g_pub_text, "%s:%d", g_pub_addr, port);
@@ -403,6 +449,13 @@ static void online_rows(void)
     r->kind  = ROW_TEXT; r->text = g_online_port_text; r->text_len = sizeof g_online_port_text;
     r->numeric = 1; r->empty = "Type it here";
     r++;
+
+    r->label = "Your connection";
+    r->help  = g_nat_state == 2 && g_nat_help ? g_nat_help
+             : "Checking what kind of connection this is, for invite codes.";
+    r->kind  = ROW_TEXT; r->text = g_nat_state == 2 ? g_nat_text : NULL;
+    r->text_len = sizeof g_nat_text; r->readonly = 1; r->empty = "Checking...";
+    r++;
     g_row_count[RT_ONLINE] = (int)(r - g_rows[RT_ONLINE]);
 }
 
@@ -427,7 +480,7 @@ static void copy_text(const char *text)
 /* A click on an address to give out, or Ctrl+C on one: to the clipboard. */
 static void row_copy(const Row *r)
 {
-    if (r->kind == ROW_TEXT && r->readonly && r->text && r->text[0]) {
+    if (r->kind == ROW_TEXT && r->readonly && r->text && r->text[0] && r->text != g_nat_text) {
         copy_text(r->text);
         g_copied_row = r;
         g_copied_at = GetTickCount64();
@@ -1294,6 +1347,7 @@ static void draw(void)
     }
 
 #ifdef LAUNCHER_NETPLAY
+    g_online_shown |= g_tab == TAB_ONLINE;
     online_rows();
 #endif
     if (row_tab() >= 0) {

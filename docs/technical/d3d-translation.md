@@ -456,6 +456,20 @@ The Xbox D3D8 includes a NV2A push buffer interface for direct GPU command submi
 - Push buffer creation functions are stubbed to return success.
 - Any function that spin-waits on GPU registers (`while (MEM32(0xFD00XXXX) & flag)`) must be stubbed entirely, not just the register read. Allocating the page via VEH prevents the crash but the loop spins forever on zero.
 
+### Clear: rectangles and single channels
+
+An Xbox `Clear` can name rectangles, and colour channels one at a time
+(`D3DCLEAR_TARGET_R` 0x10, `_G` 0x20, `_B` 0x40, `_A` 0x80; `D3DCLEAR_TARGET`
+is 0xF0). A host clear does the whole target, all four channels. The HLE passes
+the rectangles through, and a partial channel set in bits 8-11 of the host
+flags under 0x1000 (`xbox_clear_flags_to_host`); `dev_Clear` then draws the
+clear as a quad per rectangle, of the clear colour, writing only those
+channels, and depth and stencil with the test always passing. A full clear
+still goes through the host's own. Future Perfect's System Link match
+settings depend on it: the panel clears its alpha alone, writes the text into
+the alpha, and lights the text through it -- with the alpha clear dropped,
+the whole panel lit up white.
+
 ### Tiled Memory
 
 Xbox D3D8 supports tiled render targets for the NV2A's tile-based rendering. These are stubbed -- D3D11 handles render targets internally.

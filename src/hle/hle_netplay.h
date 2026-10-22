@@ -96,6 +96,12 @@ int  hle_net_port_aim(unsigned port, float *dx, float *dy);
  * mouse handling takes the mouse only when it is bound to this port. */
 int hle_net_local_input_port(void);
 
+/* A title's say over this machine's controls in a session, before they go
+ * out: what it takes away, neither machine sees. It must decide from the
+ * game's state (the same on both) -- Future Perfect drops B and Back on its
+ * main menu, where they would leave co-op for the player select. */
+void hle_net_set_local_filter(void (*filter)(RecompInputGamepad *controls));
+
 /* This machine's player's game port in a session, or -1 outside one. */
 int hle_net_local_port(void);
 
